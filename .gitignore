@@ -1,0 +1,53 @@
+# Visual Studio local workspace/cache files
+.vs/
+*.suo
+*.user
+*.vcxproj.user
+
+# CMake build output
+out/
+build/
+cmake-build-*/
+
+# CMake user-local settings. Keep CMakePresets.json committed;
+# this file is for machine-specific presets only.
+CMakeUserPresets.json
+
+# Ninja / CMake generated files that may appear outside build folders
+.ninja_deps
+.ninja_log
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+Testing/
+
+# Compiled binaries and debug symbols
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.res
+*.manifest
+
+# VLC runtime files copied next to the executable during local builds.
+# The VLC SDK/runtime should be installed separately, not committed.
+/plugins/
+/libvlc.dll
+/libvlccore.dll
+/third_party/vlc*/
+/external/vlc*/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.cache
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store

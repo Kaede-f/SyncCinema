@@ -1,0 +1,73 @@
+﻿{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "windows-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "installDir": "${sourceDir}/out/install/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "cl.exe",
+                "CMAKE_CXX_COMPILER": "cl.exe"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "x64-debug",
+            "displayName": "x64 Debug",
+            "inherits": "windows-base",
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "x64-vlc-debug",
+            "displayName": "x64 Debug with libVLC",
+            "inherits": "x64-debug",
+            "cacheVariables": {
+                "USE_LIBVLC": "ON",
+                "VLC_INCLUDE_DIR": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64/sdk/include",
+                "VLC_LIBRARY": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64/sdk/lib/libvlc.lib",
+                "VLC_CORE_LIBRARY": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64/sdk/lib/libvlccore.lib",
+                "VLC_RUNTIME_DIR": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64"
+            }
+        },
+        {
+            "name": "x64-release",
+            "displayName": "x64 Release",
+            "inherits": "x64-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "x86-debug",
+            "displayName": "x86 Debug",
+            "inherits": "windows-base",
+            "architecture": {
+                "value": "x86",
+                "strategy": "external"
+            },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "x86-release",
+            "displayName": "x86 Release",
+            "inherits": "x86-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        }
+    ]
+}
