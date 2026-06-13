@@ -41,6 +41,12 @@ add_executable (SyncCinema
   "TcpServer.cpp"
   "TcpClient.h"
   "TcpClient.cpp"
+  "Room.h"
+  "Room.cpp"
+  "SyncServer.h"
+  "SyncServer.cpp"
+  "Client.h"
+  "Client.cpp"
 )
 
 # Link Windows socket library.

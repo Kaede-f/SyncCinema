@@ -5,32 +5,29 @@
 #include <iostream>
 #include <string>
 
-#include "TcpClient.h"
-#include "TcpServer.h"
+#include "Client.h"
+#include "SyncServer.h"
 
-void printBanner()
+namespace
 {
-    std::cout << "====================================\n";
-    std::cout << "        SyncCinema Project\n";
-    std::cout << "====================================\n\n";
-}
+    void printBanner()
+    {
+        std::cout << "====================================\n";
+        std::cout << "        SyncCinema Project\n";
+        std::cout << "====================================\n\n";
+    }
 
-void printModeHelp()
-{
-    std::cout << "SyncCinema usage:\n";
-    std::cout << "  SyncCinema.exe --server \"D:\\videos\\test.mp4\"\n";
-    std::cout << "  SyncCinema.exe --client \"D:\\videos\\test.mp4\"\n";
-    std::cout << "  SyncCinema.exe --help\n";
-}
-
-void runServer(const std::string& videoPath)
-{
-    runTcpServer(videoPath);
-}
-
-void runClient(const std::string& videoPath)
-{
-    runTcpClient(videoPath);
+    void printModeHelp()
+    {
+        std::cout << "SyncCinema usage:\n";
+        std::cout << "  SyncCinema.exe --server\n";
+        std::cout << "  SyncCinema.exe --client \"D:\\videos\\test.mp4\"\n";
+        std::cout << "  SyncCinema.exe --help\n";
+        std::cout << "\n";
+        std::cout << "New broadcast architecture:\n";
+        std::cout << "  server only coordinates clients and does not open a video file.\n";
+        std::cout << "  every client opens the same local video file and receives broadcast commands.\n";
+    }
 }
 
 int main(int argc, char* argv[])
@@ -52,31 +49,28 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    if (mode != "--server" && mode != "--client")
-    {
-        std::cout << "Unknown mode: " << mode << "\n";
-        printModeHelp();
-        return 0;
-    }
-
-    if (argc < 3)
-    {
-        std::cout << "Missing video path.\n";
-        printModeHelp();
-        return 0;
-    }
-
-    std::string videoPath = argv[2];
-
     if (mode == "--server")
     {
-        runServer(videoPath);
-    }
-    else
-    {
-        runClient(videoPath);
+        runSyncServer();
+        return 0;
     }
 
+    if (mode == "--client")
+    {
+        if (argc < 3)
+        {
+            std::cout << "Missing video path for client.\n";
+            printModeHelp();
+            return 0;
+        }
+
+        std::string videoPath = argv[2];
+        runClient(videoPath);
+        return 0;
+    }
+
+    std::cout << "Unknown mode: " << mode << "\n";
+    printModeHelp();
     return 0;
 }
 
