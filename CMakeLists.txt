@@ -27,32 +27,52 @@ set(VLC_LIBRARY "" CACHE FILEPATH "Path to libvlc.lib")
 set(VLC_CORE_LIBRARY "" CACHE FILEPATH "Optional path to libvlccore.lib")
 set(VLC_RUNTIME_DIR "" CACHE PATH "Optional VLC runtime directory containing libvlc.dll, libvlccore.dll, and plugins")
 
-# Add source to this project's executable.
-add_executable (SyncCinema
-  "SyncCinema.cpp"
-  "SyncCinema.h"
+# Linux cloud deployment only needs the broadcast server. Keep this target small
+# so client/player/libVLC code is not required to build the server.
+add_executable(SyncCinemaServer
+  "SyncServerMain.cpp"
   "Protocol.h"
   "Protocol.cpp"
-  "PlayerController.h"
-  "PlayerController.cpp"
-  "MockPlayer.h"
-  "MockPlayer.cpp"
-  "TcpServer.h"
-  "TcpServer.cpp"
-  "TcpClient.h"
-  "TcpClient.cpp"
   "Room.h"
   "Room.cpp"
   "SyncServer.h"
   "SyncServer.cpp"
-  "Client.h"
-  "Client.cpp"
+  "NetSocket.h"
+  "NetSocket.cpp"
 )
 
-# Link Windows socket library.
-target_link_libraries(SyncCinema PRIVATE ws2_32)
+if (WIN32)
+  target_link_libraries(SyncCinemaServer PRIVATE ws2_32)
 
-if (USE_LIBVLC)
+  # Add source to this project's original Windows executable.
+  add_executable (SyncCinema
+    "SyncCinema.cpp"
+    "SyncCinema.h"
+    "Protocol.h"
+    "Protocol.cpp"
+    "PlayerController.h"
+    "PlayerController.cpp"
+    "MockPlayer.h"
+    "MockPlayer.cpp"
+    "TcpServer.h"
+    "TcpServer.cpp"
+    "TcpClient.h"
+    "TcpClient.cpp"
+    "Room.h"
+    "Room.cpp"
+    "SyncServer.h"
+    "SyncServer.cpp"
+    "NetSocket.h"
+    "NetSocket.cpp"
+    "Client.h"
+    "Client.cpp"
+  )
+
+  # Link Windows socket library.
+  target_link_libraries(SyncCinema PRIVATE ws2_32)
+endif()
+
+if (USE_LIBVLC AND TARGET SyncCinema)
   if (NOT VLC_INCLUDE_DIR OR NOT VLC_LIBRARY)
     message(FATAL_ERROR "USE_LIBVLC is ON, but VLC_INCLUDE_DIR and VLC_LIBRARY are not configured.")
   endif()
@@ -85,12 +105,15 @@ if (USE_LIBVLC)
   endif()
 endif()
 
-if (MSVC)
+if (MSVC AND TARGET SyncCinema)
   target_compile_options(SyncCinema PRIVATE /utf-8)
 endif()
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET SyncCinema PROPERTY CXX_STANDARD 20)
+  set_property(TARGET SyncCinemaServer PROPERTY CXX_STANDARD 20)
+  if (TARGET SyncCinema)
+    set_property(TARGET SyncCinema PROPERTY CXX_STANDARD 20)
+  endif()
 endif()
 
 # TODO: Add tests and install targets if needed.

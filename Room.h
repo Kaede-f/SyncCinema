@@ -3,8 +3,8 @@
 #include <chrono>
 #include <mutex>
 #include <vector>
-#include <winsock2.h>
 
+#include "NetSocket.h"
 #include "Protocol.h"
 
 // Room 表示一个同步观影房间。
@@ -19,12 +19,12 @@
 class Room
 {
 public:
-    void addClient(SOCKET clientSocket);
-    void removeClient(SOCKET clientSocket);
+    void addClient(SocketHandle clientSocket);
+    void removeClient(SocketHandle clientSocket);
 
     // senderSocket 是发起命令的 client。
     // 广播时会跳过它，避免发送方重复执行自己的命令。
-    bool broadcastControlMessage(SOCKET senderSocket, const SyncMessage& message);
+    bool broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message);
 
     SyncState getState() const;
     std::size_t getClientCount() const;
@@ -38,7 +38,7 @@ private:
     // clients_、state_、lastStateUpdateTime_ 会被多个 client 线程同时访问，
     // 所以所有读写都必须用 mutex_ 保护。
     mutable std::mutex mutex_;
-    std::vector<SOCKET> clients_;
+    std::vector<SocketHandle> clients_;
     SyncState state_;
     Clock::time_point lastStateUpdateTime_ = Clock::now();
 };

@@ -3,17 +3,16 @@
 #include <iostream>
 #include <string>
 #include <thread>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 
 #include "Protocol.h"
+#include "NetSocket.h"
 #include "Room.h"
 
 namespace
 {
     constexpr unsigned short kServerPort = 9000;
 
-    void processLine(SOCKET clientSocket, Room& room, const std::string& line)
+    void processLine(SocketHandle clientSocket, Room& room, const std::string& line)
     {
         if (line.empty())
         {
@@ -34,7 +33,7 @@ namespace
         room.broadcastControlMessage(clientSocket, message);
     }
 
-    void handleClient(SOCKET clientSocket, Room& room)
+    void handleClient(SocketHandle clientSocket, Room& room)
     {
         std::string receiveBuffer;
         char buffer[512]{};
@@ -75,33 +74,26 @@ namespace
             }
             else
             {
-                std::cout << "recv failed: " << WSAGetLastError() << "\n";
+                std::cout << "recv failed: " << getSocketError() << "\n";
                 break;
             }
         }
 
         room.removeClient(clientSocket);
-        closesocket(clientSocket);
+        closeSocket(clientSocket);
         std::cout << "client removed. online clients: " << room.getClientCount() << "\n";
     }
 }
 
 void runSyncServer()
 {
-    WSADATA wsaData;
+    if (!initializeSockets()) return;
 
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0)
+    SocketHandle listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSocket == kInvalidSocket)
     {
-        std::cout << "WSAStartup failed: " << result << "\n";
-        return;
-    }
-
-    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSocket == INVALID_SOCKET)
-    {
-        std::cout << "socket failed: " << WSAGetLastError() << "\n";
-        WSACleanup();
+        std::cout << "socket failed: " << getSocketError() << "\n";
+        cleanupSockets();
         return;
     }
 
@@ -110,26 +102,26 @@ void runSyncServer()
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port = htons(kServerPort);
 
-    result = bind(
+    int result = bind(
         listenSocket,
         reinterpret_cast<sockaddr*>(&serverAddr),
         sizeof(serverAddr)
     );
 
-    if (result == SOCKET_ERROR)
+    if (result == kSocketError)
     {
-        std::cout << "bind failed: " << WSAGetLastError() << "\n";
-        closesocket(listenSocket);
-        WSACleanup();
+        std::cout << "bind failed: " << getSocketError() << "\n";
+        closeSocket(listenSocket);
+        cleanupSockets();
         return;
     }
 
     result = listen(listenSocket, SOMAXCONN);
-    if (result == SOCKET_ERROR)
+    if (result == kSocketError)
     {
-        std::cout << "listen failed: " << WSAGetLastError() << "\n";
-        closesocket(listenSocket);
-        WSACleanup();
+        std::cout << "listen failed: " << getSocketError() << "\n";
+        closeSocket(listenSocket);
+        cleanupSockets();
         return;
     }
 
@@ -143,10 +135,10 @@ void runSyncServer()
     {
         std::cout << "Waiting for client...\n";
 
-        SOCKET clientSocket = accept(listenSocket, nullptr, nullptr);
-        if (clientSocket == INVALID_SOCKET)
+        SocketHandle clientSocket = accept(listenSocket, nullptr, nullptr);
+        if (clientSocket == kInvalidSocket)
         {
-            std::cout << "accept failed: " << WSAGetLastError() << "\n";
+            std::cout << "accept failed: " << getSocketError() << "\n";
             break;
         }
 
@@ -159,7 +151,7 @@ void runSyncServer()
         clientThread.detach();
     }
 
-    closesocket(listenSocket);
-    WSACleanup();
+    closeSocket(listenSocket);
+    cleanupSockets();
 }
 

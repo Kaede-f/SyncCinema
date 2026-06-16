@@ -7,7 +7,7 @@
 
 namespace
 {
-    bool sendAll(SOCKET socket, const std::string& data)
+    bool sendAll(SocketHandle socket, const std::string& data)
     {
         int totalSent = 0;
         const int totalSize = static_cast<int>(data.size());
@@ -21,9 +21,9 @@ namespace
                 0
             );
 
-            if (bytesSent == SOCKET_ERROR)
+            if (bytesSent == kSocketError)
             {
-                std::cout << "broadcast send failed: " << WSAGetLastError() << "\n";
+                std::cout << "broadcast send failed: " << getSocketError() << "\n";
                 return false;
             }
 
@@ -40,13 +40,13 @@ namespace
     }
 }
 
-void Room::addClient(SOCKET clientSocket)
+void Room::addClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     clients_.push_back(clientSocket);
 }
 
-void Room::removeClient(SOCKET clientSocket)
+void Room::removeClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -54,7 +54,7 @@ void Room::removeClient(SOCKET clientSocket)
     clients_.erase(newEnd, clients_.end());
 }
 
-bool Room::broadcastControlMessage(SOCKET senderSocket, const SyncMessage& message)
+bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message)
 {
     std::string tcpMessage = messageToString(message);
     if (tcpMessage == "UNKNOWN\n")
@@ -63,7 +63,7 @@ bool Room::broadcastControlMessage(SOCKET senderSocket, const SyncMessage& messa
         return false;
     }
 
-    std::vector<SOCKET> targets;
+    std::vector<SocketHandle> targets;
     SyncState stateSnapshot;
 
     {
@@ -75,7 +75,7 @@ bool Room::broadcastControlMessage(SOCKET senderSocket, const SyncMessage& messa
         applyControlMessageLocked(message, now);
         stateSnapshot = getEstimatedStateLocked(now);
 
-        for (SOCKET clientSocket : clients_)
+        for (SocketHandle clientSocket : clients_)
         {
             if (clientSocket != senderSocket)
             {
@@ -88,7 +88,7 @@ bool Room::broadcastControlMessage(SOCKET senderSocket, const SyncMessage& messa
     std::cout << "broadcasting to " << targets.size() << " client(s): " << tcpMessage;
 
     bool allSucceeded = true;
-    for (SOCKET target : targets)
+    for (SocketHandle target : targets)
     {
         if (!sendAll(target, tcpMessage))
         {
