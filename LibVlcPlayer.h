@@ -14,7 +14,7 @@ public:
     LibVlcPlayer();
     ~LibVlcPlayer() override;
 
-    bool openMedia(const std::string& path) override;
+    bool openMedia(const std::string& mediaSource) override;
     bool play() override;
     bool pause() override;
     bool seek(int seconds) override;
@@ -22,9 +22,9 @@ public:
 
 private:
     void releaseCurrentMediaPlayer();
+    libvlc_media_t* createMediaFromSource(const std::string& mediaSource);
 
     libvlc_instance_t* vlcInstance_ = nullptr;
     libvlc_media_player_t* mediaPlayer_ = nullptr;
     std::string mediaPath_;
 };
-

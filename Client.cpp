@@ -23,7 +23,6 @@ using ActivePlayer = ConsoleMockPlayer;
 
 namespace
 {
-    constexpr const char* kServerIp = "127.0.0.1";
     constexpr unsigned short kServerPort = 9000;
 
     void printClientHelp()
@@ -134,20 +133,20 @@ namespace
         return true;
     }
 
-    bool connectToServer(SOCKET clientSocket)
+    bool connectToServer(SOCKET clientSocket, const std::string& serverIp)
     {
         sockaddr_in serverAddr{};
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(kServerPort);
 
-        int result = inet_pton(AF_INET, kServerIp, &serverAddr.sin_addr);
+        int result = inet_pton(AF_INET, serverIp.c_str(), &serverAddr.sin_addr);
         if (result <= 0)
         {
-            std::cout << "inet_pton failed for server ip: " << kServerIp << "\n";
+            std::cout << "inet_pton failed for server ip: " << serverIp << "\n";
             return false;
         }
 
-        std::cout << "Connecting to " << kServerIp << ":" << kServerPort << "...\n";
+        std::cout << "Connecting to " << serverIp << ":" << kServerPort << "...\n";
 
         result = connect(
             clientSocket,
@@ -338,12 +337,12 @@ namespace
     }
 }
 
-void runClient(const std::string& videoPath)
+void runClient(const std::string& mediaSource, const std::string& serverIp)
 {
     ActivePlayer player;
-    if (!player.openMedia(videoPath))
+    if (!player.openMedia(mediaSource))
     {
-        std::cout << "client failed to open media: " << videoPath << "\n";
+        std::cout << "client failed to open media: " << mediaSource << "\n";
         return;
     }
 
@@ -364,7 +363,7 @@ void runClient(const std::string& videoPath)
         return;
     }
 
-    if (!connectToServer(clientSocket))
+    if (!connectToServer(clientSocket, serverIp))
     {
         closesocket(clientSocket);
         WSACleanup();

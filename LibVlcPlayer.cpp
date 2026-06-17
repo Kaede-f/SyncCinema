@@ -1,6 +1,24 @@
 #include "LibVlcPlayer.h"
 
+#include <algorithm>
 #include <iostream>
+#include <string>
+
+namespace
+{
+    bool isNetworkMediaSource(const std::string& mediaSource)
+    {
+        return mediaSource.starts_with("http://") || mediaSource.starts_with("https://");
+    }
+
+    std::string normalizeLocalPathForLibVlc(std::string path)
+    {
+#ifdef _WIN32
+        std::replace(path.begin(), path.end(), '/', '\\');
+#endif
+        return path;
+    }
+}
 
 LibVlcPlayer::LibVlcPlayer()
 {
@@ -24,7 +42,7 @@ LibVlcPlayer::~LibVlcPlayer()
     }
 }
 
-bool LibVlcPlayer::openMedia(const std::string& path)
+bool LibVlcPlayer::openMedia(const std::string& mediaSource)
 {
     if (vlcInstance_ == nullptr)
     {
@@ -34,11 +52,10 @@ bool LibVlcPlayer::openMedia(const std::string& path)
 
     releaseCurrentMediaPlayer();
 
-    // libvlc_media_new_path 只告诉 VLC 要播放哪个本地文件，不会通过网络传输视频内容。
-    libvlc_media_t* media = libvlc_media_new_path(vlcInstance_, path.c_str());
+    libvlc_media_t* media = createMediaFromSource(mediaSource);
     if (media == nullptr)
     {
-        std::cout << "[LibVLC] failed to create media: " << path << "\n";
+        std::cout << "[LibVLC] failed to create media: " << mediaSource << "\n";
         return false;
     }
 
@@ -51,7 +68,7 @@ bool LibVlcPlayer::openMedia(const std::string& path)
         return false;
     }
 
-    mediaPath_ = path;
+    mediaPath_ = mediaSource;
     std::cout << "[LibVLC] open: " << mediaPath_ << "\n";
     return true;
 }
@@ -139,3 +156,13 @@ void LibVlcPlayer::releaseCurrentMediaPlayer()
     }
 }
 
+libvlc_media_t* LibVlcPlayer::createMediaFromSource(const std::string& mediaSource)
+{
+    if (isNetworkMediaSource(mediaSource))
+    {
+        return libvlc_media_new_location(vlcInstance_, mediaSource.c_str());
+    }
+
+    std::string localPath = normalizeLocalPathForLibVlc(mediaSource);
+    return libvlc_media_new_path(vlcInstance_, localPath.c_str());
+}
