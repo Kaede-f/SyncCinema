@@ -46,6 +46,7 @@ Testing/
 *.log
 *.tmp
 *.cache
+*.zip
 
 # OS/editor noise
 Thumbs.db

@@ -105,8 +105,11 @@ if (USE_LIBVLC AND TARGET SyncCinema)
   endif()
 endif()
 
-if (MSVC AND TARGET SyncCinema)
-  target_compile_options(SyncCinema PRIVATE /utf-8)
+if (MSVC)
+  target_compile_options(SyncCinemaServer PRIVATE /utf-8)
+  if (TARGET SyncCinema)
+    target_compile_options(SyncCinema PRIVATE /utf-8)
+  endif()
 endif()
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
