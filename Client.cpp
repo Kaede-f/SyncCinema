@@ -6,7 +6,9 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <format>
 #include <thread>
+#include <chrono>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -339,12 +341,27 @@ namespace
 
 void runClient(const std::string& mediaSource, const std::string& serverIp)
 {
+    // 记录播放器初始化的时长
+    auto playInitStart = Clock::now();
+
     ActivePlayer player;
+
+    auto playInitEnd = Clock::now();
+    auto playInitMs = std::chrono::duration_cast<std::chrono::milliseconds>(playInitEnd - playInitStart).count();
+    std::cout << std::format("[metric] player_init_ms={}\n", playInitMs);
+
+    // 记录打开媒体的时长
+    auto openMediaStart = Clock::now();
+
     if (!player.openMedia(mediaSource))
     {
         std::cout << "client failed to open media: " << mediaSource << "\n";
         return;
     }
+
+    auto openMediaEnd = Clock::now();
+    auto openMediaMs = std::chrono::duration_cast<std::chrono::milliseconds>(openMediaEnd - openMediaStart).count();
+    std::cout << std::format("[metric] open_media_ms={} source={}\n", openMediaMs, mediaSource);
 
     WSADATA wsaData;
 
@@ -363,12 +380,19 @@ void runClient(const std::string& mediaSource, const std::string& serverIp)
         return;
     }
 
+    // 记录连接服务器的时长
+    auto connectServerStart = Clock::now();
+
     if (!connectToServer(clientSocket, serverIp))
     {
         closesocket(clientSocket);
         WSACleanup();
         return;
     }
+
+    auto connectServerEnd = Clock::now();
+    auto connectServerMs = std::chrono::duration_cast<std::chrono::milliseconds>(connectServerEnd - connectServerStart).count();
+    std::cout << std::format("[metric] connect_server_ms={} server={}\n", connectServerMs, serverIp);
 
     SyncState localState;
     std::mutex playerMutex;
