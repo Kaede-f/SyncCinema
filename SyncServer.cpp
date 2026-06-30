@@ -7,33 +7,59 @@
 #include "Protocol.h"
 #include "NetSocket.h"
 #include "Room.h"
+#include "SyncMetrics.h"
 
 namespace
 {
     constexpr unsigned short kServerPort = 9000;
 
-    void processLine(SocketHandle clientSocket, Room& room, const std::string& line)
+    void processLine(
+        SocketHandle clientSocket,
+        int clientId,
+        Room& room,
+        SyncMetricsCollector& metrics,
+        const std::string& line)
     {
         if (line.empty())
         {
             return;
         }
 
-        std::cout << "server received: " << line << "\n";
-
         SyncMessage message = stringToMessage(line);
         if (message.type == MessageType::Unknown)
         {
-            std::cout << "server ignored unknown message\n";
+            std::cout << "server ignored unknown message: " << line << "\n";
             return;
         }
+        else if (message.type == MessageType::Report)
+        {
+            SyncState roomState = room.getState();
+            SyncMetricSample sample;
+            sample.clientId = clientId;
+            sample.clientPositionMs = message.positionMilliseconds;
+            sample.roomPositionMs = roomState.positionMilliseconds;
+            sample.clientState = message.playbackState;
+            sample.roomState = roomState.state;
 
-        // server 不再控制本地播放器。
-        // 新架构里 server 是“房间协调者”：更新房间状态，然后把控制命令广播给其他 client。
-        room.broadcastControlMessage(clientSocket, message);
+            metrics.recordProgressReport(sample);
+            return;
+        }
+        else
+        {
+            std::cout << "server received control: " << line << "\n";
+
+            // server 不再控制本地播放器。
+            // 新架构里 server 是“房间协调者”：更新房间状态，然后把控制命令广播给其他 client。
+            room.broadcastControlMessage(clientSocket, message);
+        }
+
     }
 
-    void handleClient(SocketHandle clientSocket, Room& room)
+    void handleClient(
+        SocketHandle clientSocket,
+        int clientId,
+        Room& room,
+        SyncMetricsCollector& metrics)
     {
         std::string receiveBuffer;
         char buffer[512]{};
@@ -64,7 +90,7 @@ namespace
                         line.pop_back();
                     }
 
-                    processLine(clientSocket, room, line);
+                    processLine(clientSocket, clientId, room, metrics, line);
                 }
             }
             else if (bytesReceived == 0)
@@ -80,6 +106,7 @@ namespace
         }
 
         room.removeClient(clientSocket);
+        metrics.removeClient(clientId);
         closeSocket(clientSocket);
         std::cout << "client removed. online clients: " << room.getClientCount() << "\n";
     }
@@ -126,6 +153,7 @@ void runSyncServer()
     }
 
     Room room;
+    SyncMetricsCollector metrics;
 
     std::cout << "SyncServer listening on port " << kServerPort << "...\n";
     std::cout << "Server role: accept clients and broadcast playback commands.\n";
@@ -142,12 +170,19 @@ void runSyncServer()
             break;
         }
 
-        room.addClient(clientSocket);
-        std::cout << "client connected. online clients: " << room.getClientCount() << "\n";
+        int clientId = room.addClient(clientSocket);
+        std::cout << "client #" << clientId
+            << " connected. online clients: " << room.getClientCount() << "\n";
 
         // 一个 client 一个线程：每个线程只负责读自己的 clientSocket。
         // room 通过 mutex 保护共享的 client 列表和播放状态。
-        std::thread clientThread(handleClient, clientSocket, std::ref(room));
+        std::thread clientThread(
+            handleClient,
+            clientSocket,
+            clientId,
+            std::ref(room),
+            std::ref(metrics)
+        );
         clientThread.detach();
     }
 

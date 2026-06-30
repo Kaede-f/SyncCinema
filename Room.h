@@ -19,7 +19,7 @@
 class Room
 {
 public:
-    void addClient(SocketHandle clientSocket);
+    int addClient(SocketHandle clientSocket);
     void removeClient(SocketHandle clientSocket);
 
     // senderSocket 是发起命令的 client。
@@ -41,5 +41,6 @@ private:
     std::vector<SocketHandle> clients_;
     SyncState state_;
     Clock::time_point lastStateUpdateTime_ = Clock::now();
+    int nextClientId_ = 1;
 };
 

@@ -13,10 +13,11 @@ public:
     bool play() override;
     bool pause() override;
     bool seek(int seconds) override;
+    long long getPositionMilliseconds() const override;
     int getPositionSeconds() const override;
 
 private:
     std::string mediaPath_;
     int positionSeconds_ = 0;
+    long long positionMilliseconds_ = 0;
 };
-

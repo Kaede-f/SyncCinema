@@ -40,10 +40,14 @@ namespace
     }
 }
 
-void Room::addClient(SocketHandle clientSocket)
+int Room::addClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     clients_.push_back(clientSocket);
+
+    int clientId = nextClientId_;
+    ++nextClientId_;
+    return clientId;
 }
 
 void Room::removeClient(SocketHandle clientSocket)
@@ -117,13 +121,16 @@ SyncState Room::getEstimatedStateLocked(Clock::time_point now) const
 
     if (estimatedState.state == PlaybackState::Playing)
     {
-        auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+        auto elapsedMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - lastStateUpdateTime_
         ).count();
 
-        if (elapsedSeconds > 0)
+        if (elapsedMilliseconds > 0)
         {
-            estimatedState.positionSeconds += static_cast<int>(elapsedSeconds);
+            estimatedState.positionMilliseconds += elapsedMilliseconds;
+            estimatedState.positionSeconds = static_cast<int>(
+                estimatedState.positionMilliseconds / 1000
+            );
         }
     }
 
@@ -148,10 +155,12 @@ void Room::applyControlMessageLocked(const SyncMessage& message, Clock::time_poi
 
     case MessageType::Seek:
         currentState.positionSeconds = message.positionSeconds;
+        currentState.positionMilliseconds = message.positionMilliseconds;
         // SEEK 只改变位置，不改变 Playing/Paused。
         // 如果 seek 前正在播放，那么 seek 后仍然从新位置继续播放。
         break;
 
+    case MessageType::Report:
     case MessageType::Unknown:
         break;
     }

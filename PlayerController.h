@@ -16,10 +16,13 @@ public:
     virtual bool play() = 0;
     virtual bool pause() = 0;
     virtual bool seek(int seconds) = 0;
+
+    // 毫秒级进度用于同步观测和后续同步算法。
+    // 秒级进度适合命令行展示；毫秒级进度才能看出真实同步偏差。
+    virtual long long getPositionMilliseconds() const = 0;
     virtual int getPositionSeconds() const = 0;
 };
 
 // 把协议消息应用到播放器。
 // 这个函数让 TCP 代码不需要到处写 MessageType::Play / Pause / Seek 的分支。
 bool applyMessageToPlayer(const SyncMessage& message, PlayerController& player);
-

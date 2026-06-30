@@ -26,6 +26,8 @@ using ActivePlayer = ConsoleMockPlayer;
 namespace
 {
     constexpr unsigned short kServerPort = 9000;
+    constexpr auto kProgressReportInterval = std::chrono::seconds(1);
+    using Clock = std::chrono::steady_clock;
 
     void printClientHelp()
     {
@@ -96,6 +98,7 @@ namespace
 
             message.type = MessageType::Seek;
             message.positionSeconds = seconds;
+            message.positionMilliseconds = static_cast<long long>(seconds) * 1000;
             return true;
         }
 
@@ -184,8 +187,12 @@ namespace
         }
 
         applyMessageToState(message, localState);
+        long long playerPositionMs = player.getPositionMilliseconds();
+        localState.positionMilliseconds = playerPositionMs;
+        localState.positionSeconds = static_cast<int>(playerPositionMs / 1000);
+
         std::cout << sourceLabel << " applied. " << syncStateToString(localState)
-            << ", playerPosition=" << player.getPositionSeconds() << " seconds\n";
+            << ", playerPositionMs=" << playerPositionMs << "\n";
         return true;
     }
 
@@ -194,6 +201,7 @@ namespace
         PlayerController& player,
         SyncState& localState,
         std::mutex& playerMutex,
+        std::mutex& sendMutex,
         std::atomic_bool& running)
     {
         std::string line;
@@ -230,7 +238,7 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(playerMutex);
                 std::cout << "local status: " << syncStateToString(localState)
-                    << ", playerPosition=" << player.getPositionSeconds() << " seconds\n";
+                    << ", playerPositionMs=" << player.getPositionMilliseconds() << "\n";
                 continue;
             }
 
@@ -257,7 +265,13 @@ namespace
             }
 
             std::string tcpMessage = messageToString(message);
-            if (!sendAll(clientSocket, tcpMessage))
+            bool sent = false;
+            {
+                std::lock_guard<std::mutex> lock(sendMutex);
+                sent = sendAll(clientSocket, tcpMessage);
+            }
+
+            if (!sent)
             {
                 running = false;
                 shutdown(clientSocket, SD_BOTH);
@@ -337,6 +351,48 @@ namespace
             }
         }
     }
+
+    // client 定期上报线程
+    void reportPlaybackProgress(
+        SOCKET clientSocket,
+        PlayerController& player,
+        SyncState& localState,
+        std::mutex& playerMutex,
+        std::mutex& sendMutex,
+        std::atomic_bool& running
+    )
+    {
+        SyncMessage message;
+        message.type = MessageType::Report;
+
+        while (running)
+        {
+            {
+                std::lock_guard<std::mutex> guard(playerMutex);
+                message.positionMilliseconds = player.getPositionMilliseconds();
+                message.positionSeconds = static_cast<int>(message.positionMilliseconds / 1000);
+                message.playbackState = localState.state;
+            }
+
+            std::string tcpMessage = messageToString(message);
+
+            bool sent = false;
+            {
+                std::lock_guard<std::mutex> lock(sendMutex);
+                sent = sendAll(clientSocket, tcpMessage);
+            }
+
+            if (!sent)
+            {
+                running = false;
+                shutdown(clientSocket, SD_BOTH);
+                break;
+            }
+
+            // 上报一次休息一秒
+            std::this_thread::sleep_for(kProgressReportInterval);
+        }
+    }
 }
 
 void runClient(const std::string& mediaSource, const std::string& serverIp)
@@ -396,6 +452,7 @@ void runClient(const std::string& mediaSource, const std::string& serverIp)
 
     SyncState localState;
     std::mutex playerMutex;
+    std::mutex sendMutex;
     std::atomic_bool running{ true };
 
     // 注意这里使用 std::ref。
@@ -407,6 +464,7 @@ void runClient(const std::string& mediaSource, const std::string& serverIp)
         std::ref(player),
         std::ref(localState),
         std::ref(playerMutex),
+        std::ref(sendMutex),
         std::ref(running)
     );
 
@@ -419,8 +477,19 @@ void runClient(const std::string& mediaSource, const std::string& serverIp)
         std::ref(running)
     );
 
+    std::thread progressReportThread(
+        reportPlaybackProgress,
+        clientSocket,
+        std::ref(player),
+        std::ref(localState),
+        std::ref(playerMutex),
+        std::ref(sendMutex),
+        std::ref(running)
+    );
+
     localThread.join();
     broadcastThread.join();
+    progressReportThread.join();
 
     closesocket(clientSocket);
     WSACleanup();

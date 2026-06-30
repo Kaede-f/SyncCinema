@@ -130,7 +130,7 @@ bool LibVlcPlayer::seek(int seconds)
     return true;
 }
 
-int LibVlcPlayer::getPositionSeconds() const
+long long LibVlcPlayer::getPositionMilliseconds() const
 {
     if (mediaPlayer_ == nullptr)
     {
@@ -143,7 +143,12 @@ int LibVlcPlayer::getPositionSeconds() const
         return 0;
     }
 
-    return static_cast<int>(milliseconds / 1000);
+    return static_cast<long long>(milliseconds);
+}
+
+int LibVlcPlayer::getPositionSeconds() const
+{
+    return static_cast<int>(getPositionMilliseconds() / 1000);
 }
 
 void LibVlcPlayer::releaseCurrentMediaPlayer()

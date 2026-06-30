@@ -3,6 +3,32 @@
 #include <sstream>
 #include <string>
 
+namespace
+{
+    bool stringToPlaybackState(const std::string& text, PlaybackState& state)
+    {
+        if (text == "Playing")
+        {
+            state = PlaybackState::Playing;
+            return true;
+        }
+
+        if (text == "Paused")
+        {
+            state = PlaybackState::Paused;
+            return true;
+        }
+
+        if (text == "Stopped")
+        {
+            state = PlaybackState::Stopped;
+            return true;
+        }
+
+        return false;
+    }
+}
+
 std::string stateToString(PlaybackState state)
 {
     switch (state)
@@ -28,6 +54,8 @@ std::string messageTypeToString(MessageType type)
         return "PAUSE";
     case MessageType::Seek:
         return "SEEK";
+    case MessageType::Report:
+        return "REPORT";
     default:
         return "UNKNOWN";
     }
@@ -43,6 +71,9 @@ std::string messageToString(const SyncMessage& message)
         return "PAUSE\n";
     case MessageType::Seek:
         return "SEEK " + std::to_string(message.positionSeconds) + "\n";
+    case MessageType::Report:
+        return "REPORT " + std::to_string(message.positionMilliseconds) +
+            " " + stateToString(message.playbackState) + "\n";
     default:
         return "UNKNOWN\n";
     }
@@ -95,6 +126,30 @@ SyncMessage stringToMessage(const std::string& tcpString)
 
         message.type = MessageType::Seek;
         message.positionSeconds = seconds;
+        message.positionMilliseconds = static_cast<long long>(seconds) * 1000;
+        return message;
+    }
+
+    if (command == "REPORT")
+    {
+        long long milliseconds = 0;
+        std::string stateText;
+        std::string extra;
+        PlaybackState playbackState = PlaybackState::Stopped;
+
+        if (!(iss >> milliseconds) ||
+            milliseconds < 0 ||
+            !(iss >> stateText) ||
+            !stringToPlaybackState(stateText, playbackState) ||
+            (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = MessageType::Report;
+        message.positionMilliseconds = milliseconds;
+        message.positionSeconds = static_cast<int>(milliseconds / 1000);
+        message.playbackState = playbackState;
         return message;
     }
 
@@ -113,6 +168,9 @@ void applyMessageToState(const SyncMessage& message, SyncState& state)
         break;
     case MessageType::Seek:
         state.positionSeconds = message.positionSeconds;
+        state.positionMilliseconds = message.positionMilliseconds;
+        break;
+    case MessageType::Report:
         break;
     case MessageType::Unknown:
         break;
@@ -122,7 +180,8 @@ void applyMessageToState(const SyncMessage& message, SyncState& state)
 std::string syncStateToString(const SyncState& state)
 {
     return "state=" + stateToString(state.state) +
-        ", position=" + std::to_string(state.positionSeconds) + " seconds";
+        ", position=" + std::to_string(state.positionSeconds) + " seconds" +
+        ", positionMs=" + std::to_string(state.positionMilliseconds);
 }
 
 std::string stateResponseToString(const SyncState& state)
@@ -130,4 +189,3 @@ std::string stateResponseToString(const SyncState& state)
     return "STATE " + stateToString(state.state) +
         " " + std::to_string(state.positionSeconds) + "\n";
 }
-

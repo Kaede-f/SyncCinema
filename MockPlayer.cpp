@@ -6,6 +6,7 @@ bool ConsoleMockPlayer::openMedia(const std::string& path)
 {
     mediaPath_ = path;
     positionSeconds_ = 0;
+    positionMilliseconds_ = 0;
     std::cout << "[MockPlayer] open: " << mediaPath_ << "\n";
     return true;
 }
@@ -31,12 +32,17 @@ bool ConsoleMockPlayer::seek(int seconds)
     }
 
     positionSeconds_ = seconds;
+    positionMilliseconds_ = static_cast<long long>(seconds) * 1000;
     std::cout << "[MockPlayer] seek to " << positionSeconds_ << "\n";
     return true;
+}
+
+long long ConsoleMockPlayer::getPositionMilliseconds() const
+{
+    return positionMilliseconds_;
 }
 
 int ConsoleMockPlayer::getPositionSeconds() const
 {
     return positionSeconds_;
 }
-

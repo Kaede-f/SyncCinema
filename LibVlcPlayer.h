@@ -18,6 +18,7 @@ public:
     bool play() override;
     bool pause() override;
     bool seek(int seconds) override;
+    long long getPositionMilliseconds() const override;
     int getPositionSeconds() const override;
 
 private:
