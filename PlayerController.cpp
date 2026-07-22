@@ -13,6 +13,8 @@ bool applyMessageToPlayer(const SyncMessage& message, PlayerController& player)
     case MessageType::Seek:
         return player.seek(message.positionSeconds);
     case MessageType::Report:
+    case MessageType::Ping:
+    case MessageType::Pong:
         return false;
     case MessageType::Unknown:
         return false;

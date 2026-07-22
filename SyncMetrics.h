@@ -24,12 +24,14 @@ struct SyncMetricSample
 class SyncMetricsCollector
 {
 public:
+    using Clock = std::chrono::steady_clock;
+
+    void recordPingSent(int clientId, int sequenceNumber, Clock::time_point sentAt);
+    void recordPongReceived(int clientId, int sequenceNumber, Clock::time_point receivedAt);
     void recordProgressReport(const SyncMetricSample& sample);
     void removeClient(int clientId);
 
 private:
-    using Clock = std::chrono::steady_clock;
-
     struct ClientStats
     {
         long long sampleCount = 0;
@@ -40,8 +42,16 @@ private:
         bool hasDiff = false;
         bool hasLastReportTime = false;
         Clock::time_point lastReportTime{};
+
+        long long rttSampleCount = 0;
+        long long latestRttMs = -1;
+        long long minRttMs = -1;
+        long long maxRttMs = -1;
+        long long totalRttMs = 0;
+        std::unordered_map<int, Clock::time_point> pendingPings;
     };
 
     std::mutex mutex_;
+    std::mutex logMutex_; // 保护指标日志输出
     std::unordered_map<int, ClientStats> statsByClient_;
 };

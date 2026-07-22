@@ -56,6 +56,10 @@ std::string messageTypeToString(MessageType type)
         return "SEEK";
     case MessageType::Report:
         return "REPORT";
+    case MessageType::Ping:
+        return "PING";
+    case MessageType::Pong:
+        return "PONG";
     default:
         return "UNKNOWN";
     }
@@ -74,6 +78,10 @@ std::string messageToString(const SyncMessage& message)
     case MessageType::Report:
         return "REPORT " + std::to_string(message.positionMilliseconds) +
             " " + stateToString(message.playbackState) + "\n";
+    case MessageType::Ping:
+        return "PING " + std::to_string(message.sequenceNumber) + "\n";
+    case MessageType::Pong:
+        return "PONG " + std::to_string(message.sequenceNumber) + "\n";
     default:
         return "UNKNOWN\n";
     }
@@ -153,6 +161,21 @@ SyncMessage stringToMessage(const std::string& tcpString)
         return message;
     }
 
+    if (command == "PING" || command == "PONG")
+    {
+        int sequenceNumber = 0;
+        std::string extra;
+
+        if (!(iss >> sequenceNumber) || sequenceNumber <= 0 || (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = command == "PING" ? MessageType::Ping : MessageType::Pong;
+        message.sequenceNumber = sequenceNumber;
+        return message;
+    }
+
     return message;
 }
 
@@ -171,6 +194,8 @@ void applyMessageToState(const SyncMessage& message, SyncState& state)
         state.positionMilliseconds = message.positionMilliseconds;
         break;
     case MessageType::Report:
+    case MessageType::Ping:
+    case MessageType::Pong:
         break;
     case MessageType::Unknown:
         break;

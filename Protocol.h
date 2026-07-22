@@ -31,6 +31,8 @@ enum class MessageType
     Pause,
     Seek,
     Report,
+    Ping,
+    Pong,
     Unknown
 };
 
@@ -44,6 +46,7 @@ struct SyncMessage
     int positionSeconds = 0;
     long long positionMilliseconds = 0;
     PlaybackState playbackState = PlaybackState::Stopped;
+    int sequenceNumber = 0; // PING/PONG 使用，用来把一次请求和一次响应配对。
 };
 
 std::string stateToString(PlaybackState state);

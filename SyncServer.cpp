@@ -3,6 +3,8 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <atomic>
 
 #include "Protocol.h"
 #include "NetSocket.h"
@@ -12,6 +14,9 @@
 namespace
 {
     constexpr unsigned short kServerPort = 9000;
+    constexpr auto kHeartbeatInterval = std::chrono::milliseconds(1000);
+
+    using Clock = std::chrono::steady_clock;
 
     void processLine(
         SocketHandle clientSocket,
@@ -31,7 +36,21 @@ namespace
             std::cout << "server ignored unknown message: " << line << "\n";
             return;
         }
-        else if (message.type == MessageType::Report)
+
+        if (message.type == MessageType::Pong)
+        {
+            metrics.recordPongReceived(clientId, message.sequenceNumber, Clock::now());
+            return;
+        }
+
+        if (message.type == MessageType::Ping)
+        {
+            // 当前协议中 PING 只由 server 主动发出，client 只需要回 PONG。
+            // 如果这里收到 PING，说明对端发来了当前 server 不支持的方向，直接忽略。
+            return;
+        }
+
+        if (message.type == MessageType::Report)
         {
             SyncState roomState = room.getState();
             SyncMetricSample sample;
@@ -44,15 +63,12 @@ namespace
             metrics.recordProgressReport(sample);
             return;
         }
-        else
-        {
-            std::cout << "server received control: " << line << "\n";
 
-            // server 不再控制本地播放器。
-            // 新架构里 server 是“房间协调者”：更新房间状态，然后把控制命令广播给其他 client。
-            room.broadcastControlMessage(clientSocket, message);
-        }
+        std::cout << "server received control: " << line << "\n";
 
+        // server 不再控制本地播放器。
+        // 新架构里 server 是“房间协调者”：更新房间状态，然后把控制命令广播给其他 client。
+        room.broadcastControlMessage(clientSocket, message);
     }
 
     void handleClient(
@@ -110,6 +126,37 @@ namespace
         closeSocket(clientSocket);
         std::cout << "client removed. online clients: " << room.getClientCount() << "\n";
     }
+
+    void heartbeatLoop(Room& room, SyncMetricsCollector& metrics, std::atomic_bool& running)
+    {
+        int nextSeq = 1;
+
+        while (running)
+        {
+            std::vector<ClientConnection> clients = room.getClientSnapshot();
+            if (!clients.empty())
+            {
+                SyncMessage ping;
+                ping.type = MessageType::Ping;
+                ping.sequenceNumber = nextSeq++;
+
+                for (const ClientConnection& client : clients)
+                {
+                    // 先登记 pending，再发送 PING。
+                    // 这样即使 client 很快回 PONG，server 也一定能找到对应的发送时间。
+                    Clock::time_point sentAt = Clock::now();
+                    metrics.recordPingSent(client.id, ping.sequenceNumber, sentAt);
+
+                    if (!room.sendMessageToClient(client.socket, ping))
+                    {
+                        std::cout << "heartbeat send failed for client #" << client.id << "\n";
+                    }
+                }
+            }
+
+            std::this_thread::sleep_for(kHeartbeatInterval);
+        }
+    }
 }
 
 void runSyncServer()
@@ -154,10 +201,18 @@ void runSyncServer()
 
     Room room;
     SyncMetricsCollector metrics;
+    std::atomic_bool serverRunning{ true };
 
     std::cout << "SyncServer listening on port " << kServerPort << "...\n";
     std::cout << "Server role: accept clients and broadcast playback commands.\n";
     std::cout << "Press Ctrl+C to stop the server.\n";
+
+    std::thread heartbeatThread(
+        heartbeatLoop,
+        std::ref(room),
+        std::ref(metrics),
+        std::ref(serverRunning)
+    );
 
     while (true)
     {
@@ -171,8 +226,7 @@ void runSyncServer()
         }
 
         int clientId = room.addClient(clientSocket);
-        std::cout << "client #" << clientId
-            << " connected. online clients: " << room.getClientCount() << "\n";
+        std::cout << "client #" << clientId << " connected. online clients: " << room.getClientCount() << "\n";
 
         // 一个 client 一个线程：每个线程只负责读自己的 clientSocket。
         // room 通过 mutex 保护共享的 client 列表和播放状态。
@@ -184,6 +238,12 @@ void runSyncServer()
             std::ref(metrics)
         );
         clientThread.detach();
+    }
+
+    serverRunning = false;
+    if (heartbeatThread.joinable())
+    {
+        heartbeatThread.join();
     }
 
     closeSocket(listenSocket);

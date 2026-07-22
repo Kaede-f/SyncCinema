@@ -7,6 +7,12 @@
 #include "NetSocket.h"
 #include "Protocol.h"
 
+struct ClientConnection
+{
+    int id = 0;
+    SocketHandle socket = kInvalidSocket;
+};
+
 // Room 表示一个同步观影房间。
 //
 // 新架构里 server 不再打开视频文件，所以 server 不能直接向播放器询问“现在播到第几秒”。
@@ -25,20 +31,24 @@ public:
     // senderSocket 是发起命令的 client。
     // 广播时会跳过它，避免发送方重复执行自己的命令。
     bool broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message);
+    bool sendMessageToClient(SocketHandle clientSocket, const SyncMessage& message);
 
     SyncState getState() const;
     std::size_t getClientCount() const;
+    std::vector<ClientConnection> getClientSnapshot() const;
 
 private:
     using Clock = std::chrono::steady_clock;
 
     SyncState getEstimatedStateLocked(Clock::time_point now) const;
     void applyControlMessageLocked(const SyncMessage& message, Clock::time_point now);
+    bool sendRawMessage(SocketHandle clientSocket, const std::string& tcpMessage);
 
     // clients_、state_、lastStateUpdateTime_ 会被多个 client 线程同时访问，
     // 所以所有读写都必须用 mutex_ 保护。
     mutable std::mutex mutex_;
-    std::vector<SocketHandle> clients_;
+    mutable std::mutex sendMutex_;
+    std::vector<ClientConnection> clients_;
     SyncState state_;
     Clock::time_point lastStateUpdateTime_ = Clock::now();
     int nextClientId_ = 1;

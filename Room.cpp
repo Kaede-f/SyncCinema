@@ -43,10 +43,10 @@ namespace
 int Room::addClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    clients_.push_back(clientSocket);
 
     int clientId = nextClientId_;
     ++nextClientId_;
+    clients_.push_back(ClientConnection{ clientId, clientSocket });
     return clientId;
 }
 
@@ -54,7 +54,14 @@ void Room::removeClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto newEnd = std::remove(clients_.begin(), clients_.end(), clientSocket);
+    auto newEnd = std::remove_if(
+        clients_.begin(),
+        clients_.end(),
+        [clientSocket](const ClientConnection& client)
+        {
+            return client.socket == clientSocket;
+        }
+    );
     clients_.erase(newEnd, clients_.end());
 }
 
@@ -67,7 +74,7 @@ bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage&
         return false;
     }
 
-    std::vector<SocketHandle> targets;
+    std::vector<ClientConnection> targets;
     SyncState stateSnapshot;
 
     {
@@ -79,11 +86,11 @@ bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage&
         applyControlMessageLocked(message, now);
         stateSnapshot = getEstimatedStateLocked(now);
 
-        for (SocketHandle clientSocket : clients_)
+        for (const ClientConnection& client : clients_)
         {
-            if (clientSocket != senderSocket)
+            if (client.socket != senderSocket)
             {
-                targets.push_back(clientSocket);
+                targets.push_back(client);
             }
         }
     }
@@ -92,15 +99,26 @@ bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage&
     std::cout << "broadcasting to " << targets.size() << " client(s): " << tcpMessage;
 
     bool allSucceeded = true;
-    for (SocketHandle target : targets)
+    for (const ClientConnection& target : targets)
     {
-        if (!sendAll(target, tcpMessage))
+        if (!sendRawMessage(target.socket, tcpMessage))
         {
             allSucceeded = false;
         }
     }
 
     return allSucceeded;
+}
+
+bool Room::sendMessageToClient(SocketHandle clientSocket, const SyncMessage& message)
+{
+    std::string tcpMessage = messageToString(message);
+    if (tcpMessage == "UNKNOWN\n")
+    {
+        return false;
+    }
+
+    return sendRawMessage(clientSocket, tcpMessage);
 }
 
 SyncState Room::getState() const
@@ -113,6 +131,21 @@ std::size_t Room::getClientCount() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return clients_.size();
+}
+
+std::vector<ClientConnection> Room::getClientSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return clients_;
+}
+
+bool Room::sendRawMessage(SocketHandle clientSocket, const std::string& tcpMessage)
+{
+    // server 侧有多个线程可能同时给同一个 client 发消息：
+    // 例如一个 client 发 PLAY 触发广播，同时 heartbeat 线程也在发 PING。
+    // TCP 是字节流，如果没有发送锁，"PLAY\n" 和 "PING 12\n" 可能在字节层交错。
+    std::lock_guard<std::mutex> lock(sendMutex_);
+    return sendAll(clientSocket, tcpMessage);
 }
 
 SyncState Room::getEstimatedStateLocked(Clock::time_point now) const
@@ -161,6 +194,8 @@ void Room::applyControlMessageLocked(const SyncMessage& message, Clock::time_poi
         break;
 
     case MessageType::Report:
+    case MessageType::Ping:
+    case MessageType::Pong:
     case MessageType::Unknown:
         break;
     }

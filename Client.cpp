@@ -287,6 +287,7 @@ namespace
         PlayerController& player,
         SyncState& localState,
         std::mutex& playerMutex,
+        std::mutex& sendMutex,
         std::atomic_bool& running)
     {
         std::string receiveBuffer;
@@ -321,15 +322,47 @@ namespace
                         continue;
                     }
 
-                    std::cout << "received broadcast: " << line << "\n";
-
                     SyncMessage message = stringToMessage(line);
                     if (message.type == MessageType::Unknown)
                     {
-                        std::cout << "ignored unknown broadcast message\n";
+                        std::cout << "ignored unknown broadcast message: " << line << "\n";
                         continue;
                     }
 
+                    if (message.type == MessageType::Ping)
+                    {
+                        SyncMessage pong;
+                        pong.type = MessageType::Pong;
+                        pong.sequenceNumber = message.sequenceNumber;
+
+                        // broadcast thread 和 progress report thread 会共享同一个 socket。
+                        // 这里也必须使用 sendMutex，否则 "PONG 13\n" 和 "REPORT ...\n"
+                        // 可能在 TCP 字节流中拼到一起，server 就会看到脏消息。
+                        std::string tcpMessage = messageToString(pong);
+                        bool sent = false;
+                        {
+                            std::lock_guard<std::mutex> lock(sendMutex);
+                            sent = sendAll(clientSocket, tcpMessage);
+                        }
+
+                        if (!sent)
+                        {
+                            running = false;
+                            shutdown(clientSocket, SD_BOTH);
+                            break;
+                        }
+
+                        continue;
+                    }
+
+                    if (message.type == MessageType::Pong || message.type == MessageType::Report)
+                    {
+                        // 正常情况下 client 不会从 server 收到 PONG/REPORT。
+                        // 如果未来协议扩展到双向状态同步，这里再单独处理。
+                        continue;
+                    }
+
+                    std::cout << "received broadcast: " << line << "\n";
                     applyControlMessage(message, player, localState, playerMutex, "remote");
                 }
             }
@@ -474,6 +507,7 @@ void runClient(const std::string& mediaSource, const std::string& serverIp)
         std::ref(player),
         std::ref(localState),
         std::ref(playerMutex),
+        std::ref(sendMutex),
         std::ref(running)
     );
 
