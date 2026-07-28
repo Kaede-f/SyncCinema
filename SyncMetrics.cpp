@@ -2,10 +2,30 @@
 
 #include <algorithm>
 #include <iostream>
+#include <vector>
 
 namespace
 {
     constexpr std::size_t kMaxPendingPingsPerClient = 64;
+    constexpr auto kMaxPairReportAge = std::chrono::milliseconds(2500);
+
+    using MetricsClock = SyncMetricsCollector::Clock;
+
+    struct PairProgressMetric
+    {
+        int triggerClientId = 0;
+        int clientAId = 0;
+        int clientBId = 0;
+        PlaybackState playbackState = PlaybackState::Stopped;
+        long long projectedClientAPositionMs = 0;
+        long long projectedClientBPositionMs = 0;
+        long long pairDiffMs = 0;
+        long long pairAbsDiffMs = 0;
+        long long reportAgeAMs = 0;
+        long long reportAgeBMs = 0;
+        long long estimatedOneWayDelayAMs = 0;
+        long long estimatedOneWayDelayBMs = 0;
+    };
 
     long long absLongLong(long long value)
     {
@@ -25,6 +45,36 @@ namespace
         }
 
         return "drift";
+    }
+
+    long long elapsedMilliseconds(
+        MetricsClock::time_point earlier,
+        MetricsClock::time_point later)
+    {
+        long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            later - earlier
+        ).count();
+        return std::max(0LL, elapsed);
+    }
+
+    long long projectPositionToServerTime(
+        long long reportedPositionMs,
+        PlaybackState playbackState,
+        MetricsClock::time_point reportReceivedAt,
+        MetricsClock::time_point targetTime,
+        long long estimatedOneWayDelayMs)
+    {
+        if (playbackState != PlaybackState::Playing)
+        {
+            return reportedPositionMs;
+        }
+
+        // REPORT 中的位置是在 client 发送前采样的。
+        // server 收到它时，播放器理论上已经继续播放了约 one_way_ms；
+        // 对较早收到的另一份上报，还要加上它从到达到当前比较时刻的经过时间。
+        return reportedPositionMs +
+            std::max(0LL, estimatedOneWayDelayMs) +
+            elapsedMilliseconds(reportReceivedAt, targetTime);
     }
 }
 
@@ -133,6 +183,7 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
     long long minRttMs = -1;
     long long avgRttMs = -1;
     long long rttSampleCount = 0;
+    std::vector<PairProgressMetric> pairMetrics;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -183,6 +234,92 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
         {
             estimatedOneWayDelayMs = stats.minRttMs / 2;
         }
+
+        stats.hasLatestProgressReport = true;
+        stats.latestPositionMs = sample.clientPositionMs;
+        stats.latestPlaybackState = sample.clientState;
+        stats.latestReportReceivedAt = now;
+
+        const long long currentProjectedPositionMs = projectPositionToServerTime(
+            sample.clientPositionMs,
+            sample.clientState,
+            now,
+            now,
+            estimatedOneWayDelayMs
+        );
+
+        for (const auto& [otherClientId, otherStats] : statsByClient_)
+        {
+            if (otherClientId == sample.clientId || !otherStats.hasLatestProgressReport)
+            {
+                continue;
+            }
+
+            long long otherReportAgeMs = elapsedMilliseconds(
+                otherStats.latestReportReceivedAt,
+                now
+            );
+
+            // REPORT 默认每秒发送一次。超过 2.5 秒仍未更新通常表示网络阻塞、
+            // client 卡顿或正在退出；陈旧样本不应参与“当前同步程度”的判断。
+            if (otherReportAgeMs > kMaxPairReportAge.count())
+            {
+                continue;
+            }
+
+            // Playing 与 Paused 的位置推进规则不同，直接比较会失去物理意义。
+            // 状态不一致本身会在 progress_report 的 client_state/room_state 中体现。
+            if (otherStats.latestPlaybackState != sample.clientState)
+            {
+                continue;
+            }
+
+            long long otherOneWayDelayMs = otherStats.minRttMs >= 0
+                ? otherStats.minRttMs / 2
+                : 0;
+            long long otherProjectedPositionMs = projectPositionToServerTime(
+                otherStats.latestPositionMs,
+                otherStats.latestPlaybackState,
+                otherStats.latestReportReceivedAt,
+                now,
+                otherOneWayDelayMs
+            );
+
+            PairProgressMetric pairMetric;
+            pairMetric.triggerClientId = sample.clientId;
+            pairMetric.playbackState = sample.clientState;
+
+            // client_a/client_b 始终按 id 排序，使 pair_diff_ms 的正负含义稳定：
+            // pair_diff_ms > 0 表示 client_a 比 client_b 更靠前。
+            if (sample.clientId < otherClientId)
+            {
+                pairMetric.clientAId = sample.clientId;
+                pairMetric.clientBId = otherClientId;
+                pairMetric.projectedClientAPositionMs = currentProjectedPositionMs;
+                pairMetric.projectedClientBPositionMs = otherProjectedPositionMs;
+                pairMetric.reportAgeAMs = 0;
+                pairMetric.reportAgeBMs = otherReportAgeMs;
+                pairMetric.estimatedOneWayDelayAMs = estimatedOneWayDelayMs;
+                pairMetric.estimatedOneWayDelayBMs = otherOneWayDelayMs;
+            }
+            else
+            {
+                pairMetric.clientAId = otherClientId;
+                pairMetric.clientBId = sample.clientId;
+                pairMetric.projectedClientAPositionMs = otherProjectedPositionMs;
+                pairMetric.projectedClientBPositionMs = currentProjectedPositionMs;
+                pairMetric.reportAgeAMs = otherReportAgeMs;
+                pairMetric.reportAgeBMs = 0;
+                pairMetric.estimatedOneWayDelayAMs = otherOneWayDelayMs;
+                pairMetric.estimatedOneWayDelayBMs = estimatedOneWayDelayMs;
+            }
+
+            pairMetric.pairDiffMs =
+                pairMetric.projectedClientAPositionMs -
+                pairMetric.projectedClientBPositionMs;
+            pairMetric.pairAbsDiffMs = absLongLong(pairMetric.pairDiffMs);
+            pairMetrics.push_back(pairMetric);
+        }
     }
 
     if (sample.clientState == PlaybackState::Playing)
@@ -224,6 +361,25 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             << " report_interval_ms=" << reportIntervalMs
             << " quality=" << syncQualityFromDiff(compensatedAbsDiffMs)
             << "\n";
+
+        for (const PairProgressMetric& pairMetric : pairMetrics)
+        {
+            std::cout << "[metric] type=pair_progress"
+                << " trigger_client=" << pairMetric.triggerClientId
+                << " client_a=" << pairMetric.clientAId
+                << " client_b=" << pairMetric.clientBId
+                << " state=" << stateToString(pairMetric.playbackState)
+                << " projected_a_ms=" << pairMetric.projectedClientAPositionMs
+                << " projected_b_ms=" << pairMetric.projectedClientBPositionMs
+                << " pair_diff_ms=" << pairMetric.pairDiffMs
+                << " pair_abs_diff_ms=" << pairMetric.pairAbsDiffMs
+                << " report_age_a_ms=" << pairMetric.reportAgeAMs
+                << " report_age_b_ms=" << pairMetric.reportAgeBMs
+                << " one_way_a_ms=" << pairMetric.estimatedOneWayDelayAMs
+                << " one_way_b_ms=" << pairMetric.estimatedOneWayDelayBMs
+                << " quality=" << syncQualityFromDiff(pairMetric.pairAbsDiffMs)
+                << "\n";
+        }
     }
 }
 

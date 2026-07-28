@@ -9,7 +9,6 @@
 // 单次进度上报样本。
 // clientPositionMs 来自某个 client 的真实播放器进度；
 // roomPositionMs 来自 server 维护的房间权威进度。
-// 两者相减就是当前最重要的同步观测指标。
 struct SyncMetricSample
 {
     int clientId = 0;
@@ -20,7 +19,13 @@ struct SyncMetricSample
 };
 
 // SyncMetricsCollector 只做日志分析，不做自动纠偏。
-// 这样可以先用事实数据判断同步问题，再决定后续算法策略。
+//
+// 当前同时观察两类偏差：
+//   1. client 与 Room 理论进度的偏差，用于发现播放器整体落后于房间时钟；
+//   2. client 与 client 的相对偏差，这是判断两位观众是否真正同步的核心指标。
+//
+// 把“测量”和“控制”分开，可以避免尚未验证指标是否可靠时就自动 seek，
+// 从而把测量误差放大成用户可见的播放跳动。
 class SyncMetricsCollector
 {
 public:
@@ -42,6 +47,14 @@ private:
         bool hasDiff = false;
         bool hasLastReportTime = false;
         Clock::time_point lastReportTime{};
+
+        // 保存该 client 最近一次进度上报。
+        // 当另一个 client 上报时，会把两份上报投影到同一个 server 时刻再比较，
+        // 避免因为两份 REPORT 到达时间不同而制造虚假的进度差。
+        bool hasLatestProgressReport = false;
+        long long latestPositionMs = 0;
+        PlaybackState latestPlaybackState = PlaybackState::Stopped;
+        Clock::time_point latestReportReceivedAt{};
 
         long long rttSampleCount = 0;
         long long latestRttMs = -1;
