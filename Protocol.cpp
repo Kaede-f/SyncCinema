@@ -1,10 +1,23 @@
 #include "Protocol.h"
 
+#include <limits>
 #include <sstream>
 #include <string>
 
 namespace
 {
+    bool isValidPositionMilliseconds(long long milliseconds)
+    {
+        if (milliseconds < 0)
+        {
+            return false;
+        }
+
+        // SyncState 同时保留 int 秒数，解析阶段就拒绝无法安全转换的超大位置，
+        // 避免后续 static_cast<int> 产生实现相关的截断结果。
+        return milliseconds / 1000 <= (std::numeric_limits<int>::max)();
+    }
+
     bool stringToPlaybackState(const std::string& text, PlaybackState& state)
     {
         if (text == "Playing")
@@ -60,9 +73,18 @@ std::string messageTypeToString(MessageType type)
         return "PING";
     case MessageType::Pong:
         return "PONG";
+    case MessageType::Snapshot:
+        return "SNAPSHOT";
     default:
         return "UNKNOWN";
     }
+}
+
+bool isPlaybackControlMessage(MessageType type)
+{
+    return type == MessageType::Play ||
+        type == MessageType::Pause ||
+        type == MessageType::Seek;
 }
 
 std::string messageToString(const SyncMessage& message)
@@ -82,6 +104,10 @@ std::string messageToString(const SyncMessage& message)
         return "PING " + std::to_string(message.sequenceNumber) + "\n";
     case MessageType::Pong:
         return "PONG " + std::to_string(message.sequenceNumber) + "\n";
+    case MessageType::Snapshot:
+        return "SNAPSHOT " + std::to_string(message.controlEpoch) +
+            " " + stateToString(message.playbackState) +
+            " " + std::to_string(message.positionMilliseconds) + "\n";
     default:
         return "UNKNOWN\n";
     }
@@ -146,7 +172,7 @@ SyncMessage stringToMessage(const std::string& tcpString)
         PlaybackState playbackState = PlaybackState::Stopped;
 
         if (!(iss >> milliseconds) ||
-            milliseconds < 0 ||
+            !isValidPositionMilliseconds(milliseconds) ||
             !(iss >> stateText) ||
             !stringToPlaybackState(stateText, playbackState) ||
             (iss >> extra))
@@ -176,6 +202,33 @@ SyncMessage stringToMessage(const std::string& tcpString)
         return message;
     }
 
+    if (command == "SNAPSHOT")
+    {
+        long long controlEpoch = 0;
+        long long positionMilliseconds = 0;
+        std::string stateText;
+        std::string extra;
+        PlaybackState playbackState = PlaybackState::Stopped;
+
+        if (!(iss >> controlEpoch) ||
+            controlEpoch < 0 ||
+            !(iss >> stateText) ||
+            !stringToPlaybackState(stateText, playbackState) ||
+            !(iss >> positionMilliseconds) ||
+            !isValidPositionMilliseconds(positionMilliseconds) ||
+            (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = MessageType::Snapshot;
+        message.controlEpoch = controlEpoch;
+        message.playbackState = playbackState;
+        message.positionMilliseconds = positionMilliseconds;
+        message.positionSeconds = static_cast<int>(positionMilliseconds / 1000);
+        return message;
+    }
+
     return message;
 }
 
@@ -196,6 +249,11 @@ void applyMessageToState(const SyncMessage& message, SyncState& state)
     case MessageType::Report:
     case MessageType::Ping:
     case MessageType::Pong:
+        break;
+    case MessageType::Snapshot:
+        state.state = message.playbackState;
+        state.positionMilliseconds = message.positionMilliseconds;
+        state.positionSeconds = static_cast<int>(message.positionMilliseconds / 1000);
         break;
     case MessageType::Unknown:
         break;

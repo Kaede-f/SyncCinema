@@ -13,6 +13,8 @@ public:
     bool play() override;
     bool pause() override;
     bool seek(int seconds) override;
+    bool seekMilliseconds(long long milliseconds) override;
+    bool isSeekable() const override;
     long long getPositionMilliseconds() const override;
     int getPositionSeconds() const override;
 

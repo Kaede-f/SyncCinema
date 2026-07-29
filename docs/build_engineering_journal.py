@@ -270,9 +270,9 @@ def add_title_block(doc):
 
     metadata = [
         ("当前开发分支", "feature/sync-metrics"),
-        ("当前已发布提交", "2c1bf4f - pairwise playback skew analysis"),
-        ("本次阶段", "公网指标验证、控制 epoch 与稳健偏差窗口"),
-        ("维护日期", "2026-07-28"),
+        ("当前已发布提交", "4944cf8 - control epochs and robust skew windows"),
+        ("本次阶段", "晚加入房间快照、控制版本与毫秒级播放器对齐"),
+        ("维护日期", "2026-07-29"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
     table = doc.add_table(rows=1, cols=2)
@@ -384,6 +384,7 @@ def add_commit_history_table(doc):
         ("c7caec9", "progress drift analysis", "上报真实播放器进度并比较 Room 理论进度"),
         ("02f6aba", "heartbeat RTT measurements", "以 PING/PONG 可靠测量每个 client 的 RTT"),
         ("2c1bf4f", "pairwise playback skew analysis", "把两端上报投影到同一时刻，直接测量客户端间偏差"),
+        ("4944cf8", "control epochs and robust skew windows", "隔离控制周期并以中位数/P95 过滤单点抖动"),
     ]
 
     table = doc.add_table(rows=1, cols=3)
@@ -481,6 +482,61 @@ def add_epoch_changed_files_table(doc):
             "Engineering Journal",
             "补录公网验证证据、算法选择、回归结果和面试表达。",
             "保证代码推进与知识交接同步完成。",
+        ),
+    ]
+
+    table = doc.add_table(rows=1, cols=3)
+    set_table_geometry(table, [2200, 3580, 3580])
+    headers = ("文件/模块", "核心修改", "工程价值")
+    for index, header in enumerate(headers):
+        cell = table.rows[0].cells[index]
+        set_cell_shading(cell, COLOR_LIGHT_BLUE)
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+        run = paragraph.add_run(header)
+        set_run_font(run, size=9, bold=True, color=COLOR_DARK_BLUE)
+    mark_repeat_table_header(table.rows[0])
+
+    for module, change, value in rows:
+        cells = table.add_row().cells
+        for index, text in enumerate((module, change, value)):
+            paragraph = cells[index].paragraphs[0]
+            set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+            run = paragraph.add_run(text)
+            set_run_font(
+                run,
+                name=FONT_CODE if index == 0 else FONT_BODY,
+                size=8.6 if index == 0 else 9,
+            )
+
+
+def add_snapshot_changed_files_table(doc):
+    rows = [
+        (
+            "Protocol.h/.cpp",
+            "新增 SNAPSHOT 消息、controlEpoch、严格解析与控制消息分类。",
+            "把晚加入状态变成可测试、可演进的正式协议，而不是临时字符串。",
+        ),
+        (
+            "Room.h/.cpp",
+            "新增原子 RoomSnapshot；每条有效控制命令递增唯一 epoch。",
+            "状态、位置和版本在同一把锁下读取，不会拼出撕裂快照。",
+        ),
+        (
+            "SyncServer.cpp",
+            "注册 client、读取快照和发送快照与控制命令共用顺序锁。",
+            "新 client 不会在加入与初始化之间漏掉 PLAY、PAUSE 或 SEEK。",
+        ),
+        (
+            "Client / PlayerController",
+            "新增 5 秒握手、PING 兼容、缓冲保留、seekable 等待和毫秒级 seek。",
+            "真实 libVLC 准备完成后再按快照精确定位，避免整秒取整误差。",
+        ),
+        (
+            "CMake / core tests",
+            "新增无第三方测试目标，覆盖协议、Room epoch 和伪造快照拒绝。",
+            "Windows 与 Linux 都能快速锁住核心行为。",
         ),
     ]
 
@@ -750,17 +806,120 @@ def build_document():
     add_callout(
         doc,
         "当前状态",
-        "本阶段代码已经实现并完成本地构建与功能回归，但按提交节奏要求暂未提交或部署。"
-        "云服务器当前仍运行已发布的 2c1bf4f 版本，便于清晰区分已发布基线与本地候选版本。",
+        "本阶段已作为 4944cf8 发布到 GitHub。当前文档后续章节记录的新快照功能仍是本地候选，"
+        "尚未提交或部署，便于清晰区分已发布基线与下一次提交。",
     )
 
-    doc.add_heading("4.7 尚未完成", level=2)
+    doc.add_heading("4.7 该提交留下的边界", level=2)
     add_bullet(doc, "窗口指标目前只用于日志分析，尚未自动下发校正命令。")
-    add_bullet(doc, "新 client 的晚加入状态快照仍未实现，这是进入自动纠偏前更确定、优先级更高的功能缺口。")
+    add_bullet(doc, "4944cf8 尚未处理晚加入 client；该确定性缺陷由下一章的本地候选版本解决。")
     add_bullet(doc, "当前 P95 使用最近 12 个样本的 nearest-rank 算法，样本较少时粒度有限。")
     add_bullet(doc, "暂停和播放共用 2 秒稳定期，后续可按命令类型和播放器事件细化。")
 
-    doc.add_heading("5. 面试表达模板", level=1)
+    doc.add_heading("5. 本地阶段：晚加入快照与房间版本", level=1)
+    doc.add_heading("5.1 问题与正确性目标", level=2)
+    add_body(
+        doc,
+        "旧版本 client 连接成功后总是从 Stopped、0 秒开始。若房间已经播放到 80 秒，"
+        "它只有等别人再次发送 SEEK 才能追上；这不是网络抖动，而是协议缺少初始化状态。"
+        "本阶段先解决这个确定性缺陷，再讨论自动纠偏。",
+    )
+    add_callout(
+        doc,
+        "正确性目标",
+        "新 client 必须得到同一时刻的房间状态、毫秒位置和控制版本；"
+        "在它加入广播列表与完成初始化之间，不能静默漏掉任何 PLAY、PAUSE 或 SEEK。",
+    )
+
+    doc.add_heading("5.2 SNAPSHOT 协议与唯一 epoch", level=2)
+    add_code_block(
+        doc,
+        [
+            "SNAPSHOT <control_epoch> <Playing|Paused|Stopped> <position_ms>",
+            "",
+            "example:",
+            "SNAPSHOT 7 Playing 123456",
+        ],
+    )
+    add_body(
+        doc,
+        "Room 成为 controlEpoch 的唯一生产者：每接受一条 PLAY、PAUSE 或 SEEK，epoch 递增一次。"
+        "Room::getSnapshot() 在同一把 mutex 下同时读取推算后的 SyncState 和 controlEpoch，"
+        "避免把新位置与旧版本拼成一份逻辑上不存在的快照。Metrics 只消费 Room 给出的 epoch，"
+        "不再维护第二套独立计数器。",
+    )
+    add_bullet(doc, "SNAPSHOT 是 server 到 client 的单向初始化消息，client 伪造快照不会改变 Room。")
+    add_bullet(doc, "解析器拒绝负 epoch、负位置、非法状态、缺失字段、额外字段和无法安全转换的超大位置。")
+    add_bullet(doc, "PLAY/PAUSE/SEEK 的判定集中在 isPlaybackControlMessage()，server、Room 和 metrics 共用一套规则。")
+
+    doc.add_heading("5.3 如何保证加入顺序", level=2)
+    add_code_block(
+        doc,
+        [
+            "accept client",
+            "  -> lock controlCommandMutex",
+            "  -> Room::addClient",
+            "  -> Room::getSnapshot",
+            "  -> send SNAPSHOT",
+            "  -> unlock",
+            "  -> start client receive thread",
+        ],
+    )
+    add_body(
+        doc,
+        "注册、读取快照和发送快照与普通控制命令使用同一把 controlCommandMutex。"
+        "因此其他 client 的控制命令只能完整地发生在该流程之前或之后，不能插在中间。"
+        "heartbeat 线程仍可能先发出 PING，所以 client 的握手状态机允许在 SNAPSHOT 前响应 PING；"
+        "同一次 recv 多读到的后续字节会保留并交给广播线程，TCP 顺序不会被丢弃。",
+    )
+    add_bullet(doc, "client 最多等待 5 秒；连接旧 server 或协议异常时明确失败，不会永久卡在 recv。")
+    add_bullet(doc, "SNAPSHOT 发送失败时，server 会移除连接并关闭 socket，不启动半初始化 client 线程。")
+    add_bullet(doc, "快照发送完成后到达的新控制消息会按同一 TCP 连接顺序排在快照后面。")
+
+    doc.add_heading("5.4 真实播放器如何应用快照", level=2)
+    add_body(
+        doc,
+        "openMedia() 成功只代表媒体对象创建完成，网络媒体和真实解码器此时未必可以 seek。"
+        "对于非 Stopped+0 的快照，client 先启动播放器，最多等待 15 秒直到 isSeekable()，"
+        "再调用 seekMilliseconds()。若快照状态是 Paused 或 Stopped，则定位后暂停；"
+        "若是 Playing，则补上从收到快照到实际 seek 的本地经过时间。",
+    )
+    add_callout(
+        doc,
+        "精度修正",
+        "最初实现把 position_ms 四舍五入成整秒后调用 seek(int)，天然引入最多约 500 ms 误差。"
+        "复核时扩展 PlayerController::seekMilliseconds()，libVLC 直接使用原生毫秒时间单位，"
+        "MockPlayer 同步保留毫秒状态。",
+    )
+    add_bullet(doc, "Stopped+0 不启动解码器，避免一个空房间的新连接无意义地弹出播放器窗口。")
+    add_bullet(doc, "播放器准备期间 playerMutex 保证同一个 PlayerController 不被其他线程并发控制。")
+    add_bullet(doc, "成功后输出 initial_sync 指标，包含 epoch、快照位置、目标位置和应用耗时。")
+
+    doc.add_heading("5.5 核心修改", level=2)
+    add_snapshot_changed_files_table(doc)
+
+    doc.add_heading("5.6 验证证据", level=2)
+    add_numbered(doc, "Windows x64 Debug with libVLC 与 MockPlayer 两个配置均完整构建通过。")
+    add_numbered(doc, "Windows CTest 在两个配置下均为 1/1 通过；WSL Ubuntu 22.04 server 与核心测试构建通过，CTest 1/1 通过。")
+    add_numbered(doc, "TCP 晚加入回归：A 发送 SEEK 42 + PLAY 后，B 收到 SNAPSHOT 2 Playing 42359；B 暂停后，C 收到 SNAPSHOT 3 Paused 42360。")
+    add_numbered(doc, "MockPlayer 晚加入运行得到 epoch=2、Playing、47086 ms，并正确执行 play 与毫秒 seek。")
+    add_numbered(doc, "真实 libVLC 本地文件测试收到 epoch=2、Playing、79863 ms，播放器位置与快照目标均为 79863 ms。")
+    add_callout(
+        doc,
+        "构建诊断",
+        "验证时发现目录名虽然是 x64-vlc-debug，旧 CMakeCache 中 USE_LIBVLC 实际为 OFF。"
+        "重新执行 cmake --preset x64-vlc-debug 后确认开关为 ON，再完成真实 libVLC 测试。"
+        "这说明构建目录名称不是事实来源，缓存变量和运行日志才是。",
+    )
+
+    doc.add_heading("5.7 当前局限", level=2)
+    add_bullet(doc, "新 client 在首份快照到达前还没有 RTT 样本，初始单向网络传播时间尚未补偿。")
+    add_bullet(doc, "该协议升级要求 client/server 同步更新；新 client 连接旧 server 会在 5 秒后主动失败。")
+    add_bullet(doc, "普通广播命令尚未携带 epoch，断线重连、去重和过期命令过滤还需要版本化控制信封。")
+    add_bullet(doc, "libVLC 冷启动在一次真实测试中约为 16.7 秒，这是产品启动体验问题，不是本阶段快照算法的误差。")
+    add_bullet(doc, "本阶段只完成状态初始化，不根据 pair 窗口自动控制播放器。")
+
+    doc.add_heading("6. 面试表达模板", level=1)
     add_body(
         doc,
         "第一段可以这样说明指标演进：最初我用服务器 Room 的理论时钟评估每个客户端，"
@@ -779,8 +938,20 @@ def build_document():
         "控制后设置 2 秒稳定期，再用最近 12 个样本的中位数评估典型偏差、P95 观察尾部风险，"
         "同时统计连续严重异常。这样未来的校正策略会基于趋势，而不是被播放器异步行为或一次网络抖动误触发。"
     )
+    add_body(
+        doc,
+        "第三段可以这样说明晚加入：自动纠偏前我先处理了一个确定性更强的问题，"
+        "即新客户端加入正在播放的房间时会停在 0 秒。我让 Room 统一维护 controlEpoch，"
+        "新增 SNAPSHOT 消息携带状态、毫秒位置和版本；server 用控制顺序锁把注册、取快照和发送变成一个有序步骤。"
+        "client 侧实现带超时的握手，能在快照前响应心跳并保留多读字节；真实播放器等待 seekable 后按毫秒定位。"
+        "同时用 Windows/Linux 核心测试、脚本双客户端和真实 libVLC 三层验证，确保协议、并发顺序和播放器行为都成立。"
+    )
 
-    doc.add_heading("6. 后续学习重点", level=1)
+    doc.add_heading("7. 后续学习重点", level=1)
+    add_numbered(doc, "SyncServer 的 accept 初始化临界区：为什么 addClient、getSnapshot、send 必须与控制命令共用顺序锁。")
+    add_numbered(doc, "Client::receiveInitialSnapshot：select 超时、PING 兼容和 TCP 多读缓冲如何组成握手状态机。")
+    add_numbered(doc, "Client::applyInitialSnapshot：播放器准备、毫秒 seek 和 Playing 状态经过时间补偿。")
+    add_numbered(doc, "Room::getSnapshot：如何在同一把锁下形成 state+epoch 的一致快照。")
     add_numbered(doc, "SyncMetricsCollector::recordProgressReport：共享状态、快照、时间投影和日志输出如何分层。")
     add_numbered(doc, "projectPositionToServerTime：为什么 Playing 才能按经过时间推进。")
     add_numbered(doc, "SyncMetricsCollector::beginControlEpoch：为什么 RTT 保留，而播放偏差必须按控制周期重置。")
@@ -790,19 +961,21 @@ def build_document():
     add_numbered(doc, "SyncMetricsCollector::recordPongReceived：为什么 RTT 可以只用 server 自己的时钟计算。")
     add_numbered(doc, "Client.cpp 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
 
-    doc.add_heading("7. 后续工程路线", level=1)
-    add_numbered(doc, "在合理提交间隔后提交并部署 epoch/window 候选版本，再用两台真实设备复测 PLAY、PAUSE 与 SEEK。")
-    add_numbered(doc, "实现新 client 的状态快照与加入同步，先消除“晚加入后停在 0 秒”的确定性缺陷。")
-    add_numbered(doc, "设计只读校正建议日志：根据 window_ready、中位数、P95 和连续异常输出 would_correct，但仍不实际控制。")
-    add_numbered(doc, "验证建议策略后，再加入带阈值、冷却和迟滞的自动 seek；小偏差优先观察，暂不贸然引入倍速控制。")
+    doc.add_heading("8. 后续工程路线", level=1)
+    add_numbered(doc, "在合理提交间隔后提交晚加入快照候选，并部署到云端，用两台真实设备验证播放中加入、暂停中加入和 SEEK 后加入。")
+    add_numbered(doc, "设计只读校正决策引擎：根据 window_ready、中位数、P95、连续异常、状态和 epoch 输出 would_correct，但不实际控制。")
+    add_numbered(doc, "为普通控制广播加入 epoch/命令 id，完善重连后的过期消息过滤和幂等语义。")
+    add_numbered(doc, "验证建议策略后，再加入带阈值、冷却和迟滞的硬 seek；小偏差优先观察，暂不贸然引入倍速控制。")
+    add_numbered(doc, "进一步同步 server/client 时钟并支持未来执行时间，让两端在约定时刻执行控制，降低广播到达差。")
     add_numbered(doc, "把网络与同步核心从 CLI 交互中进一步解耦，再接入 Qt 界面、聊天和弹幕。")
     add_numbered(doc, "补齐 systemd 服务、配置文件、日志轮转、自动构建测试和发布包。")
 
     add_callout(
         doc,
         "下一阶段入口",
-        "先保持当前候选代码不提交，复核文档与本地回归证据。下一次工程阶段优先实现晚加入同步，"
-        "随后再让稳健窗口输出“只建议、不执行”的校正决策；不要直接根据 client-to-Room 或单条 pair_diff 触发 seek。",
+        "当前快照候选已经完成本地实现与验证，按提交节奏要求停在未提交状态。下一阶段先让稳健窗口输出"
+        "“只建议、不执行”的校正决策，并把原因、阈值、方向和冷却状态写入日志；"
+        "不要直接根据 client-to-Room 或单条 pair_diff 触发 seek。",
     )
 
     doc.save(OUTPUT_PATH)

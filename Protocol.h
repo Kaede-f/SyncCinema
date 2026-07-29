@@ -33,6 +33,7 @@ enum class MessageType
     Report,
     Ping,
     Pong,
+    Snapshot,
     Unknown
 };
 
@@ -40,6 +41,7 @@ enum class MessageType
 // Seek uses positionSeconds as the target time.
 // Report uses positionMilliseconds as the client's current playback position,
 // and playbackState as the client's local playback state.
+// Snapshot is sent by the server when a client joins an existing room.
 struct SyncMessage
 {
     MessageType type = MessageType::Unknown;
@@ -47,10 +49,15 @@ struct SyncMessage
     long long positionMilliseconds = 0;
     PlaybackState playbackState = PlaybackState::Stopped;
     int sequenceNumber = 0; // PING/PONG 使用，用来把一次请求和一次响应配对。
+    long long controlEpoch = 0; // SNAPSHOT 使用：表示房间已经处理过多少次控制命令。
 };
 
 std::string stateToString(PlaybackState state);
 std::string messageTypeToString(MessageType type);
+
+// 只有 PLAY / PAUSE / SEEK 会改变房间的权威播放状态。
+// 把这个判断集中在协议层，避免 server、Room 和 metrics 各自维护一份不同规则。
+bool isPlaybackControlMessage(MessageType type);
 
 // Serialize a structured command into one TCP line.
 // The trailing '\n' is the message boundary.

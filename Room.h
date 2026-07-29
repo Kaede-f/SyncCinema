@@ -13,6 +13,15 @@ struct ClientConnection
     SocketHandle socket = kInvalidSocket;
 };
 
+// 房间快照把“当前播放状态”和“它属于哪个控制周期”放在一起返回。
+// 如果分别读取 state 和 epoch，两个 client 线程可能在两次读取之间插入一条控制命令，
+// 从而得到互相不匹配的数据。一个结构体快照可以避免这种撕裂读取。
+struct RoomSnapshot
+{
+    SyncState state;
+    long long controlEpoch = 0;
+};
+
 // Room 表示一个同步观影房间。
 //
 // 新架构里 server 不再打开视频文件，所以 server 不能直接向播放器询问“现在播到第几秒”。
@@ -34,6 +43,7 @@ public:
     bool sendMessageToClient(SocketHandle clientSocket, const SyncMessage& message);
 
     SyncState getState() const;
+    RoomSnapshot getSnapshot() const;
     std::size_t getClientCount() const;
     std::vector<ClientConnection> getClientSnapshot() const;
 
@@ -51,6 +61,7 @@ private:
     std::vector<ClientConnection> clients_;
     SyncState state_;
     Clock::time_point lastStateUpdateTime_ = Clock::now();
+    long long controlEpoch_ = 0;
     int nextClientId_ = 1;
 };
 

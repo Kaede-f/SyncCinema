@@ -31,10 +31,26 @@ bool ConsoleMockPlayer::seek(int seconds)
         return false;
     }
 
-    positionSeconds_ = seconds;
-    positionMilliseconds_ = static_cast<long long>(seconds) * 1000;
-    std::cout << "[MockPlayer] seek to " << positionSeconds_ << "\n";
+    return seekMilliseconds(static_cast<long long>(seconds) * 1000);
+}
+
+bool ConsoleMockPlayer::seekMilliseconds(long long milliseconds)
+{
+    if (milliseconds < 0)
+    {
+        std::cout << "[MockPlayer] seek failed: milliseconds must be non-negative\n";
+        return false;
+    }
+
+    positionMilliseconds_ = milliseconds;
+    positionSeconds_ = static_cast<int>(milliseconds / 1000);
+    std::cout << "[MockPlayer] seek to " << positionMilliseconds_ << " ms\n";
     return true;
+}
+
+bool ConsoleMockPlayer::isSeekable() const
+{
+    return !mediaPath_.empty();
 }
 
 long long ConsoleMockPlayer::getPositionMilliseconds() const

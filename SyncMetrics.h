@@ -38,7 +38,8 @@ public:
 
     // 每次 PLAY / PAUSE / SEEK 都开启新的测量周期。
     // RTT 描述网络链路，可以跨周期保留；播放偏差属于某次控制后的结果，必须重新统计。
-    void beginControlEpoch(const SyncMessage& controlMessage);
+    // controlEpoch 由 Room 生成，metrics 只消费它，避免出现两套版本号各自递增。
+    void beginControlEpoch(long long controlEpoch, const SyncMessage& controlMessage);
 
     void recordProgressReport(const SyncMetricSample& sample);
     void removeClient(int clientId);

@@ -17,6 +17,14 @@ public:
     virtual bool pause() = 0;
     virtual bool seek(int seconds) = 0;
 
+    // 房间快照和同步校正都使用毫秒精度。
+    // 单独保留 seek(int seconds) 是为了兼容命令行的 seek <seconds> 交互。
+    virtual bool seekMilliseconds(long long milliseconds) = 0;
+
+    // 网络媒体刚开始缓冲时可能暂时不能 seek。
+    // client 在应用晚加入快照前查询这个能力，避免把“API 已调用”误当成“播放器已准备好”。
+    virtual bool isSeekable() const = 0;
+
     // 毫秒级进度用于同步观测和后续同步算法。
     // 秒级进度适合命令行展示；毫秒级进度才能看出真实同步偏差。
     virtual long long getPositionMilliseconds() const = 0;

@@ -123,4 +123,38 @@ if (CMAKE_VERSION VERSION_GREATER 3.12)
   endif()
 endif()
 
-# TODO: Add tests and install targets if needed.
+# Cross-platform protocol and Room regression tests.
+include(CTest)
+
+if (BUILD_TESTING)
+  find_package(Threads REQUIRED)
+
+  # 核心协议/房间测试不依赖 libVLC，也不创建真实网络连接。
+  # 因此 Windows 和 Linux 都能快速运行，用来锁住跨平台协议行为。
+  add_executable(SyncCinemaCoreTests
+    "tests/SyncCinemaCoreTests.cpp"
+    "Protocol.h"
+    "Protocol.cpp"
+    "Room.h"
+    "Room.cpp"
+    "NetSocket.h"
+    "NetSocket.cpp"
+  )
+
+  target_include_directories(SyncCinemaCoreTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(SyncCinemaCoreTests PRIVATE Threads::Threads)
+
+  if (WIN32)
+    target_link_libraries(SyncCinemaCoreTests PRIVATE ws2_32)
+  endif()
+
+  if (MSVC)
+    target_compile_options(SyncCinemaCoreTests PRIVATE /utf-8)
+  endif()
+
+  if (CMAKE_VERSION VERSION_GREATER 3.12)
+    set_property(TARGET SyncCinemaCoreTests PROPERTY CXX_STANDARD 20)
+  endif()
+
+  add_test(NAME SyncCinemaCoreTests COMMAND SyncCinemaCoreTests)
+endif()

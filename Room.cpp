@@ -67,12 +67,13 @@ void Room::removeClient(SocketHandle clientSocket)
 
 bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message)
 {
-    std::string tcpMessage = messageToString(message);
-    if (tcpMessage == "UNKNOWN\n")
+    if (!isPlaybackControlMessage(message.type))
     {
-        std::cout << "broadcast refused: unknown command\n";
+        std::cout << "broadcast refused: message is not a playback control\n";
         return false;
     }
+
+    std::string tcpMessage = messageToString(message);
 
     std::vector<ClientConnection> targets;
     SyncState stateSnapshot;
@@ -84,6 +85,7 @@ bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage&
 
         Clock::time_point now = Clock::now();
         applyControlMessageLocked(message, now);
+        ++controlEpoch_;
         stateSnapshot = getEstimatedStateLocked(now);
 
         for (const ClientConnection& client : clients_)
@@ -125,6 +127,16 @@ SyncState Room::getState() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return getEstimatedStateLocked(Clock::now());
+}
+
+RoomSnapshot Room::getSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    RoomSnapshot snapshot;
+    snapshot.state = getEstimatedStateLocked(Clock::now());
+    snapshot.controlEpoch = controlEpoch_;
+    return snapshot;
 }
 
 std::size_t Room::getClientCount() const
@@ -196,6 +208,7 @@ void Room::applyControlMessageLocked(const SyncMessage& message, Clock::time_poi
     case MessageType::Report:
     case MessageType::Ping:
     case MessageType::Pong:
+    case MessageType::Snapshot:
     case MessageType::Unknown:
         break;
     }

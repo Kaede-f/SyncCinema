@@ -19,6 +19,17 @@ namespace
 
     using Clock = std::chrono::steady_clock;
 
+    SyncMessage makeSnapshotMessage(const RoomSnapshot& snapshot)
+    {
+        SyncMessage message;
+        message.type = MessageType::Snapshot;
+        message.controlEpoch = snapshot.controlEpoch;
+        message.playbackState = snapshot.state.state;
+        message.positionSeconds = snapshot.state.positionSeconds;
+        message.positionMilliseconds = snapshot.state.positionMilliseconds;
+        return message;
+    }
+
     void processLine(
         SocketHandle clientSocket,
         int clientId,
@@ -52,6 +63,14 @@ namespace
             return;
         }
 
+        if (message.type == MessageType::Snapshot)
+        {
+            // SNAPSHOT 是 server -> client 的单向消息。
+            // client 伪造快照不能改变房间权威状态。
+            std::cout << "server ignored client snapshot message\n";
+            return;
+        }
+
         if (message.type == MessageType::Report)
         {
             // 控制命令会同时修改 Room 状态并开启新的 metrics epoch。
@@ -80,7 +99,8 @@ namespace
         // metrics epoch 顺序完全一致，后续同步算法才有稳定的“先后”语义。
         std::lock_guard<std::mutex> controlLock(controlCommandMutex);
         room.broadcastControlMessage(clientSocket, message);
-        metrics.beginControlEpoch(message);
+        RoomSnapshot snapshot = room.getSnapshot();
+        metrics.beginControlEpoch(snapshot.controlEpoch, message);
     }
 
     void handleClient(
@@ -246,8 +266,36 @@ void runSyncServer()
             break;
         }
 
-        int clientId = room.addClient(clientSocket);
-        std::cout << "client #" << clientId << " connected. online clients: " << room.getClientCount() << "\n";
+        int clientId = 0;
+        RoomSnapshot initialSnapshot;
+        bool snapshotSent = false;
+
+        {
+            // 注册 client、读取 Room 和发送首份快照使用与控制命令相同的锁。
+            // 因此不可能出现“快照读取完成后、client 加入广播列表前漏掉一条控制命令”的窗口。
+            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+
+            clientId = room.addClient(clientSocket);
+            initialSnapshot = room.getSnapshot();
+            snapshotSent = room.sendMessageToClient(
+                clientSocket,
+                makeSnapshotMessage(initialSnapshot)
+            );
+        }
+
+        if (!snapshotSent)
+        {
+            std::cout << "initial snapshot send failed for client #" << clientId << "\n";
+            room.removeClient(clientSocket);
+            metrics.removeClient(clientId);
+            closeSocket(clientSocket);
+            continue;
+        }
+
+        std::cout << "client #" << clientId
+            << " connected. online clients: " << room.getClientCount() << "\n";
+        std::cout << "initial snapshot sent: epoch=" << initialSnapshot.controlEpoch
+            << ", " << syncStateToString(initialSnapshot.state) << "\n";
 
         // 一个 client 一个线程：每个线程只负责读自己的 clientSocket。
         // room 通过 mutex 保护共享的 client 列表和播放状态。

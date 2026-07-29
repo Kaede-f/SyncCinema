@@ -108,26 +108,43 @@ bool LibVlcPlayer::pause()
 
 bool LibVlcPlayer::seek(int seconds)
 {
-    if (mediaPlayer_ == nullptr)
-    {
-        std::cout << "[LibVLC] seek failed: no media opened.\n";
-        return false;
-    }
-
     if (seconds < 0)
     {
         std::cout << "[LibVLC] seek failed: seconds must be non-negative.\n";
         return false;
     }
 
-    // libVLC 的时间单位是毫秒；命令行协议里使用秒，所以这里乘以 1000。
+    return seekMilliseconds(static_cast<long long>(seconds) * 1000);
+}
+
+bool LibVlcPlayer::seekMilliseconds(long long milliseconds)
+{
+    if (mediaPlayer_ == nullptr)
+    {
+        std::cout << "[LibVLC] seek failed: no media opened.\n";
+        return false;
+    }
+
+    if (milliseconds < 0)
+    {
+        std::cout << "[LibVLC] seek failed: milliseconds must be non-negative.\n";
+        return false;
+    }
+
+    // libVLC 的时间单位本来就是毫秒，因此快照不需要先降精度到整秒。
     libvlc_media_player_set_time(
         mediaPlayer_,
-        static_cast<libvlc_time_t>(seconds) * 1000
+        static_cast<libvlc_time_t>(milliseconds)
     );
 
-    std::cout << "[LibVLC] seek to " << seconds << "\n";
+    std::cout << "[LibVLC] seek to " << milliseconds << " ms\n";
     return true;
+}
+
+bool LibVlcPlayer::isSeekable() const
+{
+    return mediaPlayer_ != nullptr &&
+        libvlc_media_player_is_seekable(mediaPlayer_) != 0;
 }
 
 long long LibVlcPlayer::getPositionMilliseconds() const

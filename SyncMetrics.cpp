@@ -224,11 +224,11 @@ void SyncMetricsCollector::recordPongReceived(
     }
 }
 
-void SyncMetricsCollector::beginControlEpoch(const SyncMessage& controlMessage)
+void SyncMetricsCollector::beginControlEpoch(
+    long long controlEpoch,
+    const SyncMessage& controlMessage)
 {
-    if (controlMessage.type != MessageType::Play &&
-        controlMessage.type != MessageType::Pause &&
-        controlMessage.type != MessageType::Seek)
+    if (!isPlaybackControlMessage(controlMessage.type) || controlEpoch <= 0)
     {
         return;
     }
@@ -239,7 +239,7 @@ void SyncMetricsCollector::beginControlEpoch(const SyncMessage& controlMessage)
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        ++currentControlEpoch_;
+        currentControlEpoch_ = controlEpoch;
         newEpoch = currentControlEpoch_;
         hasControlEpochStart_ = true;
         controlEpochStartedAt_ = now;
