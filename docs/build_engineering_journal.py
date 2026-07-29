@@ -270,8 +270,8 @@ def add_title_block(doc):
 
     metadata = [
         ("当前开发分支", "feature/sync-metrics"),
-        ("当前已发布提交", "4944cf8 - control epochs and robust skew windows"),
-        ("本次阶段", "晚加入房间快照、控制版本与毫秒级播放器对齐"),
+        ("当前已发布提交", "92300ce - synchronize late-joining clients with room snapshots"),
+        ("本次阶段", "只读校正决策、安全门与可解释建议日志"),
         ("维护日期", "2026-07-29"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
@@ -385,6 +385,7 @@ def add_commit_history_table(doc):
         ("02f6aba", "heartbeat RTT measurements", "以 PING/PONG 可靠测量每个 client 的 RTT"),
         ("2c1bf4f", "pairwise playback skew analysis", "把两端上报投影到同一时刻，直接测量客户端间偏差"),
         ("4944cf8", "control epochs and robust skew windows", "隔离控制周期并以中位数/P95 过滤单点抖动"),
+        ("92300ce", "late-joining room snapshots", "新 client 加入时按毫秒对齐当前房间状态与控制版本"),
     ]
 
     table = doc.add_table(rows=1, cols=3)
@@ -537,6 +538,61 @@ def add_snapshot_changed_files_table(doc):
             "CMake / core tests",
             "新增无第三方测试目标，覆盖协议、Room epoch 和伪造快照拒绝。",
             "Windows 与 Linux 都能快速锁住核心行为。",
+        ),
+    ]
+
+    table = doc.add_table(rows=1, cols=3)
+    set_table_geometry(table, [2200, 3580, 3580])
+    headers = ("文件/模块", "核心修改", "工程价值")
+    for index, header in enumerate(headers):
+        cell = table.rows[0].cells[index]
+        set_cell_shading(cell, COLOR_LIGHT_BLUE)
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+        run = paragraph.add_run(header)
+        set_run_font(run, size=9, bold=True, color=COLOR_DARK_BLUE)
+    mark_repeat_table_header(table.rows[0])
+
+    for module, change, value in rows:
+        cells = table.add_row().cells
+        for index, text in enumerate((module, change, value)):
+            paragraph = cells[index].paragraphs[0]
+            set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+            run = paragraph.add_run(text)
+            set_run_font(
+                run,
+                name=FONT_CODE if index == 0 else FONT_BODY,
+                size=8.6 if index == 0 else 9,
+            )
+
+
+def add_correction_changed_files_table(doc):
+    rows = [
+        (
+            "SyncCorrectionPolicy.h/.cpp",
+            "新增纯策略输入、配置、安全门、动作与原因；策略不访问 socket、Room 或播放器。",
+            "测量与决策解耦，可独立单元测试，也不会误触真实 seek。",
+        ),
+        (
+            "SyncMetrics.h/.cpp",
+            "从稳健窗口构造策略输入，计算方向一致率，并输出去重后的 correction_advice。",
+            "把既有指标转成可解释的控制建议，同时保留完整观测证据。",
+        ),
+        (
+            "SyncCinemaCoreTests",
+            "覆盖稳定期、窗口、状态、RTT、阈值、方向、连续性、冷却及目标端选择。",
+            "为未来闭环执行提供快速、跨平台的策略回归保护。",
+        ),
+        (
+            "CMakeLists.txt",
+            "让 Windows client、Linux server 和核心测试共同编译策略模块。",
+            "保证同一份决策规则在所有目标中保持一致。",
+        ),
+        (
+            "Engineering Journal",
+            "记录策略边界、安全门、本地证据、已知限制和面试表达。",
+            "让后续学习、评审与算法迭代具有连续上下文。",
         ),
     ]
 
@@ -806,8 +862,8 @@ def build_document():
     add_callout(
         doc,
         "当前状态",
-        "本阶段已作为 4944cf8 发布到 GitHub。当前文档后续章节记录的新快照功能仍是本地候选，"
-        "尚未提交或部署，便于清晰区分已发布基线与下一次提交。",
+        "本阶段已作为 4944cf8 发布到 GitHub。它留下的晚加入确定性缺陷，"
+        "已经在后续的 92300ce 快照提交中解决。",
     )
 
     doc.add_heading("4.7 该提交留下的边界", level=2)
@@ -816,7 +872,7 @@ def build_document():
     add_bullet(doc, "当前 P95 使用最近 12 个样本的 nearest-rank 算法，样本较少时粒度有限。")
     add_bullet(doc, "暂停和播放共用 2 秒稳定期，后续可按命令类型和播放器事件细化。")
 
-    doc.add_heading("5. 本地阶段：晚加入快照与房间版本", level=1)
+    doc.add_heading("5. 已发布阶段：晚加入快照与房间版本", level=1)
     doc.add_heading("5.1 问题与正确性目标", level=2)
     add_body(
         doc,
@@ -919,7 +975,104 @@ def build_document():
     add_bullet(doc, "libVLC 冷启动在一次真实测试中约为 16.7 秒，这是产品启动体验问题，不是本阶段快照算法的误差。")
     add_bullet(doc, "本阶段只完成状态初始化，不根据 pair 窗口自动控制播放器。")
 
-    doc.add_heading("6. 面试表达模板", level=1)
+    doc.add_heading("6. 本地阶段：只读校正决策引擎", level=1)
+    doc.add_heading("6.1 为什么不直接调用 seek", level=2)
+    add_body(
+        doc,
+        "到 92300ce 为止，系统已经能测量 RTT、把两端上报投影到同一 server 时刻，"
+        "并在每个控制 epoch 内形成中位数、P95 和连续严重偏差窗口。"
+        "但“测到偏差”并不等于“应该立刻控制播放器”：样本可能仍在稳定期、窗口不足、"
+        "方向反复变化，或者刚做过一次校正。若在这些情况下直接 seek，测量噪声会变成用户可见的画面跳动。",
+    )
+    add_callout(
+        doc,
+        "本阶段目标",
+        "新增一个只读策略层，把窗口证据转换成 hold / would_seek_forward 建议；"
+        "它输出原因、目标端和建议前进量，但绝不调用播放器 API。先验证决策质量，再打开闭环控制。",
+    )
+
+    doc.add_heading("6.2 测量、决策与执行三层分离", level=2)
+    add_code_block(
+        doc,
+        [
+            "SyncMetricsCollector",
+            "  -> normalized pair window / RTT / epoch evidence",
+            "  -> SyncCorrectionPolicy (pure decision)",
+            "  -> correction_advice mode=read_only",
+            "",
+            "future SyncCorrectionController",
+            "  -> validate client/session/epoch again",
+            "  -> send correction command",
+            "  -> client applies seek and reports result",
+        ],
+    )
+    add_body(
+        doc,
+        "SyncCorrectionPolicy 不持有共享状态，也不访问 socket、Room 或 PlayerController。"
+        "同一组输入总会得到同一决策，因此可以用快速单元测试覆盖边界。"
+        "SyncMetricsCollector 仍负责收集和归一化事实；未来控制器才负责命令发送、失败处理和执行反馈。",
+    )
+
+    doc.add_heading("6.3 安全门按顺序放行", level=2)
+    add_numbered(doc, "稳定期：控制后 2 秒内只观察，返回 settling。")
+    add_numbered(doc, "窗口完整性：至少 6 个有效 pair 样本，未满足时返回 window_not_ready。")
+    add_numbered(doc, "播放状态：Stopped 不纠偏；Playing 还要求两端均有 RTT，Paused 可直接比较静止位置。")
+    add_numbered(doc, "偏差分级：中位绝对偏差不超过 250 ms 时保持；250-750 ms 只观察，不做硬 seek。")
+    add_numbered(doc, "方向稳定性：至少 75% 窗口样本必须同向，防止 A/B 领先关系不断翻转。")
+    add_numbered(doc, "持续性：至少 3 个连续样本达到 750 ms，排除单点异常。")
+    add_numbered(doc, "冷却：一次 would_seek 后模拟 5 秒冷却，验证未来控制节奏不会连续触发。")
+    add_body(
+        doc,
+        "策略以 median_diff_ms 的符号确定领先方向，以 median_abs_diff_ms 判断典型偏差大小。"
+        "P95 当前只记录尾部风险，不参与第一版动作门槛；这样可以先积累真实数据，"
+        "再决定是否需要把尾部抖动纳入更复杂的策略。",
+    )
+
+    doc.add_heading("6.4 为什么只让落后端向前追", level=2)
+    add_body(
+        doc,
+        "pair_diff_ms 定义为 client_a - client_b。若结果为正，说明 B 落后，建议目标是 B；"
+        "若为负，说明 A 落后，建议目标是 A。第一版不把领先端向后拉，"
+        "因为后退会让用户再次看到已经看过的画面，通常比落后端向前跳更明显。"
+        "suggested_forward_ms 使用带符号中位差的绝对值，而不是某个瞬时样本。",
+    )
+    add_code_block(
+        doc,
+        [
+            "[metric] type=correction_advice mode=read_only",
+            "client_a=1 client_b=2 epoch=2 state=Paused",
+            "action=would_seek_forward reason=persistent_skew",
+            "target_client=2 reference_client=1 suggested_forward_ms=1000",
+            "median_diff_ms=1000 direction_agreement_pct=100",
+            "consecutive_severe=6 window_samples=6",
+        ],
+    )
+
+    doc.add_heading("6.5 核心修改", level=2)
+    add_correction_changed_files_table(doc)
+
+    doc.add_heading("6.6 验证证据", level=2)
+    add_numbered(doc, "Windows x64 Debug、x64 Debug with libVLC 均完整构建，两个配置的 CTest 均为 1/1 通过。")
+    add_numbered(doc, "WSL Ubuntu 22.04 的 SyncCinemaServer 与 SyncCinemaCoreTests 构建通过，CTest 1/1 通过。")
+    add_numbered(doc, "策略单元测试覆盖所有安全门，以及正负偏差下目标 client、参考 client 和建议前进量。")
+    add_numbered(doc, "双脚本 client 集成验证得到 window_not_ready -> persistent_skew -> cooldown 的确定序列。")
+    add_numbered(doc, "1 秒稳定偏差场景中，策略在第 6 个有效样本建议 client 2 向前 1000 ms；下一样本进入约 4.9 秒冷却。")
+    add_callout(
+        doc,
+        "关键保证",
+        "本地集成测试只验证建议日志，代码路径没有 PlayerController 依赖，也没有执行 seek。"
+        "因此这一阶段即使阈值仍需公网调参，也不会改变任何用户播放行为。",
+    )
+
+    doc.add_heading("6.7 已知局限与上线前门槛", level=2)
+    add_bullet(doc, "当前 5 秒冷却是只读模拟：would_seek 被当作“假设已执行”，用于验证建议节奏。")
+    add_bullet(doc, "多于两个 client 时会产生多组 pair 建议；未来执行器需要基于房间共识选目标，不能逐对盲目 seek。")
+    add_bullet(doc, "250/750 ms、75% 和 3 个连续样本是保守初值，需要两台真实异地设备的数据校准。")
+    add_bullet(doc, "P95 目前只作诊断；是否参与硬校正必须根据误触发率和用户体验决定。")
+    add_bullet(doc, "普通控制广播仍未携带命令 id/epoch，真正闭环前需要再次校验连接身份、epoch 和目标状态。")
+    add_bullet(doc, "下一步应先部署只读版本采集公网建议日志，再实现 server 到目标 client 的专用校正命令与执行回执。")
+
+    doc.add_heading("7. 面试表达模板", level=1)
     add_body(
         doc,
         "第一段可以这样说明指标演进：最初我用服务器 Room 的理论时钟评估每个客户端，"
@@ -946,8 +1099,20 @@ def build_document():
         "client 侧实现带超时的握手，能在快照前响应心跳并保留多读字节；真实播放器等待 seekable 后按毫秒定位。"
         "同时用 Windows/Linux 核心测试、脚本双客户端和真实 libVLC 三层验证，确保协议、并发顺序和播放器行为都成立。"
     )
+    add_body(
+        doc,
+        "第四段可以这样说明控制安全性：有了相对偏差后我没有直接 seek，而是把测量、决策和执行拆成三层。"
+        "纯策略层按稳定期、窗口、状态、RTT、阈值、方向一致率、连续异常和冷却逐层放行，"
+        "只输出 would_seek_forward 及可解释 reason。它只让落后端向前追赶，并通过跨平台单元测试和双客户端集成测试"
+        "验证 window_not_ready、persistent_skew、cooldown 的状态序列。当前仍是 read_only，"
+        "先用公网数据验证误触发率，再接入真正的命令执行和回执。"
+    )
 
-    doc.add_heading("7. 后续学习重点", level=1)
+    doc.add_heading("8. 后续学习重点", level=1)
+    add_numbered(doc, "evaluateSyncCorrection：如何用提前返回把安全门写成可读、可测试的纯决策函数。")
+    add_numbered(doc, "calculateDirectionAgreementPercent：为什么偏差大小之外还必须验证方向稳定。")
+    add_numbered(doc, "PairWindowStats 的建议去重与模拟冷却：状态为什么属于 pair+epoch，而不是某个 client。")
+    add_numbered(doc, "策略单元测试：如何用输入夹具覆盖安全门和正负方向，而不启动网络与播放器。")
     add_numbered(doc, "SyncServer 的 accept 初始化临界区：为什么 addClient、getSnapshot、send 必须与控制命令共用顺序锁。")
     add_numbered(doc, "Client::receiveInitialSnapshot：select 超时、PING 兼容和 TCP 多读缓冲如何组成握手状态机。")
     add_numbered(doc, "Client::applyInitialSnapshot：播放器准备、毫秒 seek 和 Playing 状态经过时间补偿。")
@@ -961,11 +1126,12 @@ def build_document():
     add_numbered(doc, "SyncMetricsCollector::recordPongReceived：为什么 RTT 可以只用 server 自己的时钟计算。")
     add_numbered(doc, "Client.cpp 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
 
-    doc.add_heading("8. 后续工程路线", level=1)
-    add_numbered(doc, "在合理提交间隔后提交晚加入快照候选，并部署到云端，用两台真实设备验证播放中加入、暂停中加入和 SEEK 后加入。")
-    add_numbered(doc, "设计只读校正决策引擎：根据 window_ready、中位数、P95、连续异常、状态和 epoch 输出 would_correct，但不实际控制。")
+    doc.add_heading("9. 后续工程路线", level=1)
+    add_numbered(doc, "在合理提交间隔后提交只读校正决策候选，并部署到云端，用两台真实设备统计建议频率、方向正确率和误触发场景。")
+    add_numbered(doc, "设计专用校正协议：携带目标 client、room epoch、目标毫秒位置和命令 id，并要求应用结果回执。")
+    add_numbered(doc, "加入最小闭环硬 seek：server 只向落后端发送，client 再次校验 epoch，执行后上报实际位置；失败时不连续重试。")
     add_numbered(doc, "为普通控制广播加入 epoch/命令 id，完善重连后的过期消息过滤和幂等语义。")
-    add_numbered(doc, "验证建议策略后，再加入带阈值、冷却和迟滞的硬 seek；小偏差优先观察，暂不贸然引入倍速控制。")
+    add_numbered(doc, "云端闭环稳定后，再研究 250-750 ms 小偏差的温和校正；暂不贸然引入倍速控制。")
     add_numbered(doc, "进一步同步 server/client 时钟并支持未来执行时间，让两端在约定时刻执行控制，降低广播到达差。")
     add_numbered(doc, "把网络与同步核心从 CLI 交互中进一步解耦，再接入 Qt 界面、聊天和弹幕。")
     add_numbered(doc, "补齐 systemd 服务、配置文件、日志轮转、自动构建测试和发布包。")
@@ -973,9 +1139,9 @@ def build_document():
     add_callout(
         doc,
         "下一阶段入口",
-        "当前快照候选已经完成本地实现与验证，按提交节奏要求停在未提交状态。下一阶段先让稳健窗口输出"
-        "“只建议、不执行”的校正决策，并把原因、阈值、方向和冷却状态写入日志；"
-        "不要直接根据 client-to-Room 或单条 pair_diff 触发 seek。",
+        "92300ce 晚加入快照已经发布。当前只读校正策略已完成本地实现、跨平台测试和双客户端集成验证，"
+        "按提交节奏要求停在未提交状态。下一步先部署该 read_only 版本收集真实异地建议日志；"
+        "确认方向、阈值和冷却可靠后，才设计带 epoch、命令 id 与执行回执的最小闭环。",
     )
 
     doc.save(OUTPUT_PATH)

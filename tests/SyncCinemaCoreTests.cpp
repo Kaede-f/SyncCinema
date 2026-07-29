@@ -6,6 +6,7 @@
 
 #include "Protocol.h"
 #include "Room.h"
+#include "SyncCorrectionPolicy.h"
 
 namespace
 {
@@ -187,6 +188,156 @@ namespace
             "refused messages do not advance Room epoch"
         );
     }
+
+    SyncCorrectionInput makePersistentSkewInput()
+    {
+        SyncCorrectionInput input;
+        input.clientAId = 1;
+        input.clientBId = 2;
+        input.controlEpoch = 4;
+        input.playbackState = PlaybackState::Playing;
+        input.windowReady = true;
+        input.windowSamples = 12;
+        input.medianDiffMs = 900;
+        input.medianAbsDiffMs = 900;
+        input.p95AbsDiffMs = 1050;
+        input.consecutiveSevereSamples = 4;
+        input.directionAgreementPercent = 83;
+        input.hasRttA = true;
+        input.hasRttB = true;
+        return input;
+    }
+
+    void testCorrectionPolicySafetyGates()
+    {
+        SyncCorrectionInput input = makePersistentSkewInput();
+        input.settling = true;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::Settling,
+            "correction advice waits for the control settling period"
+        );
+
+        input = makePersistentSkewInput();
+        input.windowReady = false;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::WindowNotReady,
+            "correction advice requires a ready robust window"
+        );
+
+        input = makePersistentSkewInput();
+        input.playbackState = PlaybackState::Stopped;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::PlaybackInactive,
+            "correction advice does not seek stopped playback"
+        );
+
+        input = makePersistentSkewInput();
+        input.hasRttB = false;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::MissingNetworkEstimate,
+            "playing correction advice requires RTT for both clients"
+        );
+
+        input = makePersistentSkewInput();
+        input.medianDiffMs = 180;
+        input.medianAbsDiffMs = 180;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::WithinTolerance,
+            "small skew remains inside the no-correction tolerance"
+        );
+
+        input = makePersistentSkewInput();
+        input.medianDiffMs = 500;
+        input.medianAbsDiffMs = 500;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::BelowSeekThreshold,
+            "moderate skew is observed without suggesting a hard seek"
+        );
+
+        input = makePersistentSkewInput();
+        input.medianDiffMs = 750;
+        input.medianAbsDiffMs = 750;
+        expect(
+            evaluateSyncCorrection(input).action ==
+                SyncCorrectionAction::WouldSeekForward,
+            "the hard-seek entry threshold uses an inclusive boundary"
+        );
+
+        input = makePersistentSkewInput();
+        input.directionAgreementPercent = 66;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::UnstableDirection,
+            "correction advice rejects a direction that keeps changing"
+        );
+
+        input = makePersistentSkewInput();
+        input.consecutiveSevereSamples = 2;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::InsufficientPersistence,
+            "correction advice requires consecutive severe samples"
+        );
+
+        input = makePersistentSkewInput();
+        input.cooldownActive = true;
+        input.cooldownRemainingMs = 2400;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::Cooldown,
+            "correction advice respects the simulated cooldown"
+        );
+
+        input = makePersistentSkewInput();
+        input.playbackState = PlaybackState::Paused;
+        input.hasRttA = false;
+        input.hasRttB = false;
+        expect(
+            evaluateSyncCorrection(input).action ==
+                SyncCorrectionAction::WouldSeekForward,
+            "paused positions can be compared without an RTT projection"
+        );
+    }
+
+    void testCorrectionPolicySelectsLaggingClient()
+    {
+        SyncCorrectionInput input = makePersistentSkewInput();
+        SyncCorrectionDecision decision = evaluateSyncCorrection(input);
+        expect(
+            decision.action == SyncCorrectionAction::WouldSeekForward,
+            "persistent stable skew produces a read-only seek suggestion"
+        );
+        expect(
+            decision.reason == SyncCorrectionReason::PersistentSkew,
+            "persistent skew explains the seek suggestion"
+        );
+        expect(
+            decision.targetClientId == 2 && decision.referenceClientId == 1,
+            "positive pair diff selects client B as the lagging target"
+        );
+        expect(
+            decision.suggestedForwardMs == 900,
+            "positive pair diff preserves the suggested forward offset"
+        );
+
+        input.medianDiffMs = -1250;
+        input.medianAbsDiffMs = 1250;
+        decision = evaluateSyncCorrection(input);
+        expect(
+            decision.targetClientId == 1 && decision.referenceClientId == 2,
+            "negative pair diff selects client A as the lagging target"
+        );
+        expect(
+            decision.suggestedForwardMs == 1250,
+            "negative pair diff becomes a positive forward offset"
+        );
+    }
 }
 
 int main()
@@ -195,6 +346,8 @@ int main()
     testSnapshotProtocolRejectsMalformedInput();
     testPlaybackControlClassification();
     testRoomSnapshotAndEpoch();
+    testCorrectionPolicySafetyGates();
+    testCorrectionPolicySelectsLaggingClient();
 
     if (failureCount != 0)
     {

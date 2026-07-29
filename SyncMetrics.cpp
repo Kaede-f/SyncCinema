@@ -11,7 +11,11 @@ namespace
     constexpr auto kControlSettleDuration = std::chrono::milliseconds(2000);
     constexpr std::size_t kPairWindowSize = 12;
     constexpr std::size_t kMinReadyPairWindowSamples = 6;
-    constexpr long long kSeverePairSkewMs = 750;
+    constexpr SyncCorrectionPolicyConfig kCorrectionPolicyConfig{};
+    constexpr auto kCorrectionAdviceCooldown = std::chrono::milliseconds(5000);
+    constexpr auto kCorrectionAdviceLogInterval = std::chrono::milliseconds(5000);
+    constexpr long long kSeverePairSkewMs =
+        kCorrectionPolicyConfig.seekEnterThresholdMs;
 
     using MetricsClock = SyncMetricsCollector::Clock;
 
@@ -37,7 +41,13 @@ namespace
         long long medianAbsDiffMs = 0;
         long long p95AbsDiffMs = 0;
         int consecutiveSevereSamples = 0;
+        int directionAgreementPercent = 0;
         long long qualityBasisAbsDiffMs = 0;
+        bool hasRttA = false;
+        bool hasRttB = false;
+        long long cooldownRemainingMs = 0;
+        SyncCorrectionDecision correctionDecision;
+        bool emitCorrectionAdvice = false;
     };
 
     long long absLongLong(long long value)
@@ -135,6 +145,30 @@ namespace
         // nearest-rank P95：向上取第 ceil(N * 0.95) 个样本。
         std::size_t rank = (absoluteValues.size() * 95 + 99) / 100;
         return absoluteValues[rank - 1];
+    }
+
+    int calculateDirectionAgreementPercent(
+        const std::deque<long long>& diffValues,
+        long long medianDiffMs)
+    {
+        if (diffValues.empty() || medianDiffMs == 0)
+        {
+            return 0;
+        }
+
+        std::size_t matchingDirectionCount = 0;
+        for (long long diffMs : diffValues)
+        {
+            if ((medianDiffMs > 0 && diffMs > 0) ||
+                (medianDiffMs < 0 && diffMs < 0))
+            {
+                ++matchingDirectionCount;
+            }
+        }
+
+        return static_cast<int>(
+            matchingDirectionCount * 100 / diffValues.size()
+        );
     }
 }
 
@@ -385,6 +419,10 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             // client 卡顿或正在退出；陈旧样本不应参与“当前同步程度”的判断。
             if (otherReportAgeMs > kMaxPairReportAge.count())
             {
+                pairStatsByKey_.erase(makePairKey(
+                    std::min(sample.clientId, otherClientId),
+                    std::max(sample.clientId, otherClientId)
+                ));
                 continue;
             }
 
@@ -392,6 +430,12 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             // 状态不一致本身会在 progress_report 的 client_state/room_state 中体现。
             if (otherStats.latestPlaybackState != sample.clientState)
             {
+                // 状态不一致说明这对 client 的连续证据已经断开。
+                // 清空旧窗口，防止状态重新一致后立即沿用过期趋势给出校正建议。
+                pairStatsByKey_.erase(makePairKey(
+                    std::min(sample.clientId, otherClientId),
+                    std::max(sample.clientId, otherClientId)
+                ));
                 continue;
             }
 
@@ -424,6 +468,8 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 pairMetric.reportAgeBMs = otherReportAgeMs;
                 pairMetric.estimatedOneWayDelayAMs = estimatedOneWayDelayMs;
                 pairMetric.estimatedOneWayDelayBMs = otherOneWayDelayMs;
+                pairMetric.hasRttA = stats.minRttMs >= 0;
+                pairMetric.hasRttB = otherStats.minRttMs >= 0;
             }
             else
             {
@@ -435,6 +481,8 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 pairMetric.reportAgeBMs = 0;
                 pairMetric.estimatedOneWayDelayAMs = otherOneWayDelayMs;
                 pairMetric.estimatedOneWayDelayBMs = estimatedOneWayDelayMs;
+                pairMetric.hasRttA = otherStats.minRttMs >= 0;
+                pairMetric.hasRttB = stats.minRttMs >= 0;
             }
 
             pairMetric.pairDiffMs =
@@ -442,22 +490,25 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 pairMetric.projectedClientBPositionMs;
             pairMetric.pairAbsDiffMs = absLongLong(pairMetric.pairDiffMs);
 
+            std::uint64_t pairKey = makePairKey(
+                pairMetric.clientAId,
+                pairMetric.clientBId
+            );
+            PairWindowStats& pairStats = pairStatsByKey_[pairKey];
+            pairStats.clientAId = pairMetric.clientAId;
+            pairStats.clientBId = pairMetric.clientBId;
+
             if (!settling)
             {
-                std::uint64_t pairKey = makePairKey(
-                    pairMetric.clientAId,
-                    pairMetric.clientBId
-                );
-                PairWindowStats& pairStats = pairStatsByKey_[pairKey];
-                pairStats.clientAId = pairMetric.clientAId;
-                pairStats.clientBId = pairMetric.clientBId;
                 pairStats.recentDiffMs.push_back(pairMetric.pairDiffMs);
                 if (pairStats.recentDiffMs.size() > kPairWindowSize)
                 {
                     pairStats.recentDiffMs.pop_front();
                 }
 
-                if (pairMetric.pairAbsDiffMs > kSeverePairSkewMs)
+                // 与策略层的 seekEnterThresholdMs 保持同一边界语义：
+                // 达到阈值（>=），就算作一次严重偏差样本。
+                if (pairMetric.pairAbsDiffMs >= kSeverePairSkewMs)
                 {
                     ++pairStats.consecutiveSevereSamples;
                 }
@@ -465,30 +516,107 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 {
                     pairStats.consecutiveSevereSamples = 0;
                 }
+            }
 
-                std::vector<long long> signedDiffs(
-                    pairStats.recentDiffMs.begin(),
-                    pairStats.recentDiffMs.end()
+            std::vector<long long> signedDiffs(
+                pairStats.recentDiffMs.begin(),
+                pairStats.recentDiffMs.end()
+            );
+            std::vector<long long> absoluteDiffs;
+            absoluteDiffs.reserve(signedDiffs.size());
+            for (long long value : signedDiffs)
+            {
+                absoluteDiffs.push_back(absLongLong(value));
+            }
+
+            pairMetric.windowSamples = pairStats.recentDiffMs.size();
+            pairMetric.windowReady =
+                pairMetric.windowSamples >= kMinReadyPairWindowSamples;
+            pairMetric.medianDiffMs = medianOf(signedDiffs);
+            pairMetric.medianAbsDiffMs = medianOf(absoluteDiffs);
+            pairMetric.p95AbsDiffMs =
+                percentile95OfAbsoluteDiffs(pairStats.recentDiffMs);
+            pairMetric.consecutiveSevereSamples =
+                pairStats.consecutiveSevereSamples;
+            pairMetric.directionAgreementPercent =
+                calculateDirectionAgreementPercent(
+                    pairStats.recentDiffMs,
+                    pairMetric.medianDiffMs
                 );
-                std::vector<long long> absoluteDiffs;
-                absoluteDiffs.reserve(signedDiffs.size());
-                for (long long value : signedDiffs)
-                {
-                    absoluteDiffs.push_back(absLongLong(value));
-                }
+            pairMetric.qualityBasisAbsDiffMs = pairMetric.windowReady
+                ? pairMetric.medianAbsDiffMs
+                : pairMetric.pairAbsDiffMs;
 
-                pairMetric.windowSamples = pairStats.recentDiffMs.size();
-                pairMetric.windowReady =
-                    pairMetric.windowSamples >= kMinReadyPairWindowSamples;
-                pairMetric.medianDiffMs = medianOf(signedDiffs);
-                pairMetric.medianAbsDiffMs = medianOf(absoluteDiffs);
-                pairMetric.p95AbsDiffMs =
-                    percentile95OfAbsoluteDiffs(pairStats.recentDiffMs);
-                pairMetric.consecutiveSevereSamples =
-                    pairStats.consecutiveSevereSamples;
-                pairMetric.qualityBasisAbsDiffMs = pairMetric.windowReady
-                    ? pairMetric.medianAbsDiffMs
-                    : pairMetric.pairAbsDiffMs;
+            SyncCorrectionInput correctionInput;
+            correctionInput.clientAId = pairMetric.clientAId;
+            correctionInput.clientBId = pairMetric.clientBId;
+            correctionInput.controlEpoch = pairMetric.controlEpoch;
+            correctionInput.playbackState = pairMetric.playbackState;
+            correctionInput.settling = pairMetric.settling;
+            correctionInput.windowReady = pairMetric.windowReady;
+            correctionInput.windowSamples = pairMetric.windowSamples;
+            correctionInput.medianDiffMs = pairMetric.medianDiffMs;
+            correctionInput.medianAbsDiffMs = pairMetric.medianAbsDiffMs;
+            correctionInput.p95AbsDiffMs = pairMetric.p95AbsDiffMs;
+            correctionInput.consecutiveSevereSamples =
+                pairMetric.consecutiveSevereSamples;
+            correctionInput.directionAgreementPercent =
+                pairMetric.directionAgreementPercent;
+            correctionInput.hasRttA = pairMetric.hasRttA;
+            correctionInput.hasRttB = pairMetric.hasRttB;
+
+            if (pairStats.hasLastWouldCorrectTime)
+            {
+                long long elapsedSinceAdviceMs = elapsedMilliseconds(
+                    pairStats.lastWouldCorrectTime,
+                    now
+                );
+                if (elapsedSinceAdviceMs < kCorrectionAdviceCooldown.count())
+                {
+                    correctionInput.cooldownActive = true;
+                    correctionInput.cooldownRemainingMs =
+                        kCorrectionAdviceCooldown.count() - elapsedSinceAdviceMs;
+                }
+            }
+
+            pairMetric.cooldownRemainingMs =
+                correctionInput.cooldownRemainingMs;
+            pairMetric.correctionDecision = evaluateSyncCorrection(
+                correctionInput,
+                kCorrectionPolicyConfig
+            );
+
+            if (pairMetric.correctionDecision.action ==
+                SyncCorrectionAction::WouldSeekForward)
+            {
+                // 这里只记录“如果闭环已经启用，本次会执行校正”。
+                // 记录时间用于模拟未来控制器的冷却，但绝不调用 seek。
+                pairStats.hasLastWouldCorrectTime = true;
+                pairStats.lastWouldCorrectTime = now;
+            }
+
+            bool decisionChanged =
+                !pairStats.hasLastLoggedDecision ||
+                pairStats.lastLoggedAction !=
+                    pairMetric.correctionDecision.action ||
+                pairStats.lastLoggedReason !=
+                    pairMetric.correctionDecision.reason;
+            bool periodicSummaryDue =
+                !pairStats.hasLastLoggedDecision ||
+                elapsedMilliseconds(pairStats.lastDecisionLoggedAt, now) >=
+                    kCorrectionAdviceLogInterval.count();
+
+            pairMetric.emitCorrectionAdvice =
+                decisionChanged || periodicSummaryDue;
+
+            if (pairMetric.emitCorrectionAdvice)
+            {
+                pairStats.hasLastLoggedDecision = true;
+                pairStats.lastLoggedAction =
+                    pairMetric.correctionDecision.action;
+                pairStats.lastLoggedReason =
+                    pairMetric.correctionDecision.reason;
+                pairStats.lastDecisionLoggedAt = now;
             }
 
             pairMetrics.push_back(pairMetric);
@@ -562,12 +690,51 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 << " median_abs_diff_ms=" << pairMetric.medianAbsDiffMs
                 << " p95_abs_diff_ms=" << pairMetric.p95AbsDiffMs
                 << " consecutive_severe=" << pairMetric.consecutiveSevereSamples
+                << " direction_agreement_pct="
+                << pairMetric.directionAgreementPercent
                 << " quality=" << (
                     pairMetric.settling
                         ? "settling"
                         : syncQualityFromDiff(pairMetric.qualityBasisAbsDiffMs)
                 )
                 << "\n";
+
+            if (pairMetric.emitCorrectionAdvice)
+            {
+                const SyncCorrectionDecision& decision =
+                    pairMetric.correctionDecision;
+
+                std::cout << "[metric] type=correction_advice"
+                    << " mode=read_only"
+                    << " client_a=" << pairMetric.clientAId
+                    << " client_b=" << pairMetric.clientBId
+                    << " epoch=" << pairMetric.controlEpoch
+                    << " state=" << stateToString(pairMetric.playbackState)
+                    << " action="
+                    << syncCorrectionActionToString(decision.action)
+                    << " reason="
+                    << syncCorrectionReasonToString(decision.reason)
+                    << " target_client=" << decision.targetClientId
+                    << " reference_client=" << decision.referenceClientId
+                    << " suggested_forward_ms=" << decision.suggestedForwardMs
+                    << " median_diff_ms=" << pairMetric.medianDiffMs
+                    << " median_abs_diff_ms=" << pairMetric.medianAbsDiffMs
+                    << " p95_abs_diff_ms=" << pairMetric.p95AbsDiffMs
+                    << " direction_agreement_pct="
+                    << pairMetric.directionAgreementPercent
+                    << " consecutive_severe="
+                    << pairMetric.consecutiveSevereSamples
+                    << " window_samples=" << pairMetric.windowSamples
+                    << " has_rtt_a=" << (pairMetric.hasRttA ? 1 : 0)
+                    << " has_rtt_b=" << (pairMetric.hasRttB ? 1 : 0)
+                    << " cooldown_remaining_ms="
+                    << pairMetric.cooldownRemainingMs
+                    << " tolerance_ms="
+                    << kCorrectionPolicyConfig.toleranceMs
+                    << " seek_enter_ms="
+                    << kCorrectionPolicyConfig.seekEnterThresholdMs
+                    << "\n";
+            }
         }
     }
 }

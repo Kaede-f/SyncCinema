@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "Protocol.h"
+#include "SyncCorrectionPolicy.h"
 
 // 单次进度上报样本。
 // clientPositionMs 来自某个 client 的真实播放器进度；
@@ -20,7 +21,7 @@ struct SyncMetricSample
     PlaybackState roomState = PlaybackState::Stopped;
 };
 
-// SyncMetricsCollector 只做日志分析，不做自动纠偏。
+// SyncMetricsCollector 只做日志分析和只读校正建议，不控制真实播放器。
 //
 // 当前同时观察两类偏差：
 //   1. client 与 Room 理论进度的偏差，用于发现播放器整体落后于房间时钟；
@@ -78,6 +79,17 @@ private:
         int clientBId = 0;
         std::deque<long long> recentDiffMs;
         int consecutiveSevereSamples = 0;
+
+        // 只读阶段也模拟未来控制器的冷却状态。
+        // 它只限制 would_seek 日志频率，不会调用任何播放器 API。
+        bool hasLastWouldCorrectTime = false;
+        Clock::time_point lastWouldCorrectTime{};
+
+        // 相同建议只在状态变化或定期摘要时输出，避免每秒重复刷屏。
+        bool hasLastLoggedDecision = false;
+        SyncCorrectionAction lastLoggedAction = SyncCorrectionAction::Hold;
+        SyncCorrectionReason lastLoggedReason = SyncCorrectionReason::WindowNotReady;
+        Clock::time_point lastDecisionLoggedAt{};
     };
 
     std::mutex mutex_;
