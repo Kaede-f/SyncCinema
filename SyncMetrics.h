@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 
@@ -33,6 +35,11 @@ public:
 
     void recordPingSent(int clientId, int sequenceNumber, Clock::time_point sentAt);
     void recordPongReceived(int clientId, int sequenceNumber, Clock::time_point receivedAt);
+
+    // 每次 PLAY / PAUSE / SEEK 都开启新的测量周期。
+    // RTT 描述网络链路，可以跨周期保留；播放偏差属于某次控制后的结果，必须重新统计。
+    void beginControlEpoch(const SyncMessage& controlMessage);
+
     void recordProgressReport(const SyncMetricSample& sample);
     void removeClient(int clientId);
 
@@ -64,7 +71,20 @@ private:
         std::unordered_map<int, Clock::time_point> pendingPings;
     };
 
+    struct PairWindowStats
+    {
+        int clientAId = 0;
+        int clientBId = 0;
+        std::deque<long long> recentDiffMs;
+        int consecutiveSevereSamples = 0;
+    };
+
     std::mutex mutex_;
     std::mutex logMutex_; // 保护指标日志输出
     std::unordered_map<int, ClientStats> statsByClient_;
+    std::unordered_map<std::uint64_t, PairWindowStats> pairStatsByKey_;
+
+    long long currentControlEpoch_ = 0;
+    bool hasControlEpochStart_ = false;
+    Clock::time_point controlEpochStartedAt_{};
 };

@@ -48,6 +48,8 @@ Testing/
 *.cache
 *.zip
 ~$*.docx
+__pycache__/
+*.py[cod]
 
 # OS/editor noise
 Thumbs.db

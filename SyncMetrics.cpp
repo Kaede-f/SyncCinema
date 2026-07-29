@@ -8,6 +8,10 @@ namespace
 {
     constexpr std::size_t kMaxPendingPingsPerClient = 64;
     constexpr auto kMaxPairReportAge = std::chrono::milliseconds(2500);
+    constexpr auto kControlSettleDuration = std::chrono::milliseconds(2000);
+    constexpr std::size_t kPairWindowSize = 12;
+    constexpr std::size_t kMinReadyPairWindowSamples = 6;
+    constexpr long long kSeverePairSkewMs = 750;
 
     using MetricsClock = SyncMetricsCollector::Clock;
 
@@ -16,6 +20,7 @@ namespace
         int triggerClientId = 0;
         int clientAId = 0;
         int clientBId = 0;
+        long long controlEpoch = 0;
         PlaybackState playbackState = PlaybackState::Stopped;
         long long projectedClientAPositionMs = 0;
         long long projectedClientBPositionMs = 0;
@@ -25,6 +30,14 @@ namespace
         long long reportAgeBMs = 0;
         long long estimatedOneWayDelayAMs = 0;
         long long estimatedOneWayDelayBMs = 0;
+        bool settling = false;
+        bool windowReady = false;
+        std::size_t windowSamples = 0;
+        long long medianDiffMs = 0;
+        long long medianAbsDiffMs = 0;
+        long long p95AbsDiffMs = 0;
+        int consecutiveSevereSamples = 0;
+        long long qualityBasisAbsDiffMs = 0;
     };
 
     long long absLongLong(long long value)
@@ -75,6 +88,53 @@ namespace
         return reportedPositionMs +
             std::max(0LL, estimatedOneWayDelayMs) +
             elapsedMilliseconds(reportReceivedAt, targetTime);
+    }
+
+    std::uint64_t makePairKey(int clientAId, int clientBId)
+    {
+        std::uint64_t high = static_cast<std::uint32_t>(clientAId);
+        std::uint64_t low = static_cast<std::uint32_t>(clientBId);
+        return (high << 32) | low;
+    }
+
+    long long medianOf(std::vector<long long> values)
+    {
+        if (values.empty())
+        {
+            return 0;
+        }
+
+        std::sort(values.begin(), values.end());
+        std::size_t middle = values.size() / 2;
+        if (values.size() % 2 == 1)
+        {
+            return values[middle];
+        }
+
+        long long lower = values[middle - 1];
+        long long upper = values[middle];
+        return lower + (upper - lower) / 2;
+    }
+
+    long long percentile95OfAbsoluteDiffs(const std::deque<long long>& diffValues)
+    {
+        if (diffValues.empty())
+        {
+            return 0;
+        }
+
+        std::vector<long long> absoluteValues;
+        absoluteValues.reserve(diffValues.size());
+        for (long long diff : diffValues)
+        {
+            absoluteValues.push_back(absLongLong(diff));
+        }
+
+        std::sort(absoluteValues.begin(), absoluteValues.end());
+
+        // nearest-rank P95：向上取第 ceil(N * 0.95) 个样本。
+        std::size_t rank = (absoluteValues.size() * 95 + 99) / 100;
+        return absoluteValues[rank - 1];
     }
 }
 
@@ -164,6 +224,58 @@ void SyncMetricsCollector::recordPongReceived(
     }
 }
 
+void SyncMetricsCollector::beginControlEpoch(const SyncMessage& controlMessage)
+{
+    if (controlMessage.type != MessageType::Play &&
+        controlMessage.type != MessageType::Pause &&
+        controlMessage.type != MessageType::Seek)
+    {
+        return;
+    }
+
+    Clock::time_point now = Clock::now();
+    long long newEpoch = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        ++currentControlEpoch_;
+        newEpoch = currentControlEpoch_;
+        hasControlEpochStart_ = true;
+        controlEpochStartedAt_ = now;
+        pairStatsByKey_.clear();
+
+        for (auto& [clientId, stats] : statsByClient_)
+        {
+            (void)clientId;
+
+            // RTT 反映网络链路，不因播放命令改变，所以保留 RTT 统计。
+            // 下面只清理与“本次播放控制结果”相关的进度和偏差数据。
+            stats.sampleCount = 0;
+            stats.totalAbsDiffMs = 0;
+            stats.minDiffMs = 0;
+            stats.maxDiffMs = 0;
+            stats.maxAbsDiffMs = 0;
+            stats.hasDiff = false;
+            stats.hasLastReportTime = false;
+            stats.lastReportTime = {};
+            stats.hasLatestProgressReport = false;
+            stats.latestPositionMs = 0;
+            stats.latestPlaybackState = PlaybackState::Stopped;
+            stats.latestReportReceivedAt = {};
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> logLock(logMutex_);
+        std::cout << "[metric] type=control_epoch"
+            << " epoch=" << newEpoch
+            << " command=" << messageTypeToString(controlMessage.type)
+            << " settle_ms=" << kControlSettleDuration.count()
+            << "\n";
+    }
+}
+
 void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
 {
     Clock::time_point now = Clock::now();
@@ -183,10 +295,16 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
     long long minRttMs = -1;
     long long avgRttMs = -1;
     long long rttSampleCount = 0;
+    long long controlEpoch = 0;
+    bool settling = false;
     std::vector<PairProgressMetric> pairMetrics;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+
+        controlEpoch = currentControlEpoch_;
+        settling = hasControlEpochStart_ &&
+            (now - controlEpochStartedAt_) < kControlSettleDuration;
 
         ClientStats& stats = statsByClient_[sample.clientId];
         if (stats.hasLastReportTime)
@@ -199,29 +317,32 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
         stats.lastReportTime = now;
         stats.hasLastReportTime = true;
 
-        ++stats.sampleCount;
-        stats.totalAbsDiffMs += absDiffMs;
-        stats.maxAbsDiffMs = stats.sampleCount == 1
-            ? absDiffMs
-            : std::max(stats.maxAbsDiffMs, absDiffMs);
-
-        if (!stats.hasDiff)
+        if (!settling)
         {
-            stats.minDiffMs = diffMs;
-            stats.maxDiffMs = diffMs;
-            stats.hasDiff = true;
-        }
-        else
-        {
-            stats.minDiffMs = std::min(stats.minDiffMs, diffMs);
-            stats.maxDiffMs = std::max(stats.maxDiffMs, diffMs);
-        }
+            ++stats.sampleCount;
+            stats.totalAbsDiffMs += absDiffMs;
+            stats.maxAbsDiffMs = stats.sampleCount == 1
+                ? absDiffMs
+                : std::max(stats.maxAbsDiffMs, absDiffMs);
 
-        sampleCount = stats.sampleCount;
-        avgAbsDiffMs = stats.totalAbsDiffMs / stats.sampleCount;
-        maxAbsDiffMs = stats.maxAbsDiffMs;
-        minDiffMs = stats.minDiffMs;
-        maxDiffMs = stats.maxDiffMs;
+            if (!stats.hasDiff)
+            {
+                stats.minDiffMs = diffMs;
+                stats.maxDiffMs = diffMs;
+                stats.hasDiff = true;
+            }
+            else
+            {
+                stats.minDiffMs = std::min(stats.minDiffMs, diffMs);
+                stats.maxDiffMs = std::max(stats.maxDiffMs, diffMs);
+            }
+
+            sampleCount = stats.sampleCount;
+            avgAbsDiffMs = stats.totalAbsDiffMs / stats.sampleCount;
+            maxAbsDiffMs = stats.maxAbsDiffMs;
+            minDiffMs = stats.minDiffMs;
+            maxDiffMs = stats.maxDiffMs;
+        }
 
         latestRttMs = stats.latestRttMs;
         minRttMs = stats.minRttMs;
@@ -287,7 +408,9 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
 
             PairProgressMetric pairMetric;
             pairMetric.triggerClientId = sample.clientId;
+            pairMetric.controlEpoch = controlEpoch;
             pairMetric.playbackState = sample.clientState;
+            pairMetric.settling = settling;
 
             // client_a/client_b 始终按 id 排序，使 pair_diff_ms 的正负含义稳定：
             // pair_diff_ms > 0 表示 client_a 比 client_b 更靠前。
@@ -318,6 +441,56 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 pairMetric.projectedClientAPositionMs -
                 pairMetric.projectedClientBPositionMs;
             pairMetric.pairAbsDiffMs = absLongLong(pairMetric.pairDiffMs);
+
+            if (!settling)
+            {
+                std::uint64_t pairKey = makePairKey(
+                    pairMetric.clientAId,
+                    pairMetric.clientBId
+                );
+                PairWindowStats& pairStats = pairStatsByKey_[pairKey];
+                pairStats.clientAId = pairMetric.clientAId;
+                pairStats.clientBId = pairMetric.clientBId;
+                pairStats.recentDiffMs.push_back(pairMetric.pairDiffMs);
+                if (pairStats.recentDiffMs.size() > kPairWindowSize)
+                {
+                    pairStats.recentDiffMs.pop_front();
+                }
+
+                if (pairMetric.pairAbsDiffMs > kSeverePairSkewMs)
+                {
+                    ++pairStats.consecutiveSevereSamples;
+                }
+                else
+                {
+                    pairStats.consecutiveSevereSamples = 0;
+                }
+
+                std::vector<long long> signedDiffs(
+                    pairStats.recentDiffMs.begin(),
+                    pairStats.recentDiffMs.end()
+                );
+                std::vector<long long> absoluteDiffs;
+                absoluteDiffs.reserve(signedDiffs.size());
+                for (long long value : signedDiffs)
+                {
+                    absoluteDiffs.push_back(absLongLong(value));
+                }
+
+                pairMetric.windowSamples = pairStats.recentDiffMs.size();
+                pairMetric.windowReady =
+                    pairMetric.windowSamples >= kMinReadyPairWindowSamples;
+                pairMetric.medianDiffMs = medianOf(signedDiffs);
+                pairMetric.medianAbsDiffMs = medianOf(absoluteDiffs);
+                pairMetric.p95AbsDiffMs =
+                    percentile95OfAbsoluteDiffs(pairStats.recentDiffMs);
+                pairMetric.consecutiveSevereSamples =
+                    pairStats.consecutiveSevereSamples;
+                pairMetric.qualityBasisAbsDiffMs = pairMetric.windowReady
+                    ? pairMetric.medianAbsDiffMs
+                    : pairMetric.pairAbsDiffMs;
+            }
+
             pairMetrics.push_back(pairMetric);
         }
     }
@@ -339,6 +512,7 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
 
         std::cout << "[metric] type=progress_report"
             << " client=" << sample.clientId
+            << " epoch=" << controlEpoch
             << " sample=" << sampleCount
             << " client_state=" << stateToString(sample.clientState)
             << " room_state=" << stateToString(sample.roomState)
@@ -359,7 +533,10 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             << " avg_rtt_ms=" << avgRttMs
             << " rtt_samples=" << rttSampleCount
             << " report_interval_ms=" << reportIntervalMs
-            << " quality=" << syncQualityFromDiff(compensatedAbsDiffMs)
+            << " settling=" << (settling ? 1 : 0)
+            << " quality=" << (
+                settling ? "settling" : syncQualityFromDiff(compensatedAbsDiffMs)
+            )
             << "\n";
 
         for (const PairProgressMetric& pairMetric : pairMetrics)
@@ -368,6 +545,7 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 << " trigger_client=" << pairMetric.triggerClientId
                 << " client_a=" << pairMetric.clientAId
                 << " client_b=" << pairMetric.clientBId
+                << " epoch=" << pairMetric.controlEpoch
                 << " state=" << stateToString(pairMetric.playbackState)
                 << " projected_a_ms=" << pairMetric.projectedClientAPositionMs
                 << " projected_b_ms=" << pairMetric.projectedClientBPositionMs
@@ -377,7 +555,18 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 << " report_age_b_ms=" << pairMetric.reportAgeBMs
                 << " one_way_a_ms=" << pairMetric.estimatedOneWayDelayAMs
                 << " one_way_b_ms=" << pairMetric.estimatedOneWayDelayBMs
-                << " quality=" << syncQualityFromDiff(pairMetric.pairAbsDiffMs)
+                << " settling=" << (pairMetric.settling ? 1 : 0)
+                << " window_samples=" << pairMetric.windowSamples
+                << " window_ready=" << (pairMetric.windowReady ? 1 : 0)
+                << " median_diff_ms=" << pairMetric.medianDiffMs
+                << " median_abs_diff_ms=" << pairMetric.medianAbsDiffMs
+                << " p95_abs_diff_ms=" << pairMetric.p95AbsDiffMs
+                << " consecutive_severe=" << pairMetric.consecutiveSevereSamples
+                << " quality=" << (
+                    pairMetric.settling
+                        ? "settling"
+                        : syncQualityFromDiff(pairMetric.qualityBasisAbsDiffMs)
+                )
                 << "\n";
         }
     }
@@ -387,4 +576,16 @@ void SyncMetricsCollector::removeClient(int clientId)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     statsByClient_.erase(clientId);
+
+    for (auto it = pairStatsByKey_.begin(); it != pairStatsByKey_.end();)
+    {
+        if (it->second.clientAId == clientId || it->second.clientBId == clientId)
+        {
+            it = pairStatsByKey_.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 }

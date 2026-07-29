@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <mutex>
 
 #include "Protocol.h"
 #include "NetSocket.h"
@@ -23,6 +24,7 @@ namespace
         int clientId,
         Room& room,
         SyncMetricsCollector& metrics,
+        std::mutex& controlCommandMutex,
         const std::string& line)
     {
         if (line.empty())
@@ -52,6 +54,11 @@ namespace
 
         if (message.type == MessageType::Report)
         {
+            // 控制命令会同时修改 Room 状态并开启新的 metrics epoch。
+            // REPORT 也使用同一把锁读取这两个对象，避免采到“新 Room + 旧 epoch”
+            // 或“旧 Room + 新 epoch”这种不一致快照。
+            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+
             SyncState roomState = room.getState();
             SyncMetricSample sample;
             sample.clientId = clientId;
@@ -68,14 +75,20 @@ namespace
 
         // server 不再控制本地播放器。
         // 新架构里 server 是“房间协调者”：更新房间状态，然后把控制命令广播给其他 client。
+        //
+        // 多个 client 可能同时发控制命令。这把锁保证 Room 应用顺序、广播顺序和
+        // metrics epoch 顺序完全一致，后续同步算法才有稳定的“先后”语义。
+        std::lock_guard<std::mutex> controlLock(controlCommandMutex);
         room.broadcastControlMessage(clientSocket, message);
+        metrics.beginControlEpoch(message);
     }
 
     void handleClient(
         SocketHandle clientSocket,
         int clientId,
         Room& room,
-        SyncMetricsCollector& metrics)
+        SyncMetricsCollector& metrics,
+        std::mutex& controlCommandMutex)
     {
         std::string receiveBuffer;
         char buffer[512]{};
@@ -106,7 +119,14 @@ namespace
                         line.pop_back();
                     }
 
-                    processLine(clientSocket, clientId, room, metrics, line);
+                    processLine(
+                        clientSocket,
+                        clientId,
+                        room,
+                        metrics,
+                        controlCommandMutex,
+                        line
+                    );
                 }
             }
             else if (bytesReceived == 0)
@@ -201,6 +221,7 @@ void runSyncServer()
 
     Room room;
     SyncMetricsCollector metrics;
+    std::mutex controlCommandMutex;
     std::atomic_bool serverRunning{ true };
 
     std::cout << "SyncServer listening on port " << kServerPort << "...\n";
@@ -235,7 +256,8 @@ void runSyncServer()
             clientSocket,
             clientId,
             std::ref(room),
-            std::ref(metrics)
+            std::ref(metrics),
+            std::ref(controlCommandMutex)
         );
         clientThread.detach();
     }
