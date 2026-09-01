@@ -62,3 +62,30 @@ int ConsoleMockPlayer::getPositionSeconds() const
 {
     return positionSeconds_;
 }
+
+bool ConsoleMockPlayer::setVideoOutputWindow(void* nativeWindow)
+{
+    (void)nativeWindow;
+    return true;
+}
+
+long long ConsoleMockPlayer::getDurationMilliseconds() const
+{
+    return 0;
+}
+
+bool ConsoleMockPlayer::setVolume(int volume)
+{
+    if (volume < 0 || volume > 100)
+    {
+        return false;
+    }
+
+    volume_ = volume;
+    return true;
+}
+
+int ConsoleMockPlayer::getVolume() const
+{
+    return volume_;
+}

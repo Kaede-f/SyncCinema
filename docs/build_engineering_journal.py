@@ -269,9 +269,9 @@ def add_title_block(doc):
     set_run_font(run, size=12.5, color=COLOR_MUTED)
 
     metadata = [
-        ("当前开发分支", "feature/sync-metrics"),
-        ("当前已发布提交", "92300ce - synchronize late-joining clients with room snapshots"),
-        ("本次阶段", "只读校正决策、安全门与可解释建议日志"),
+        ("当前开发分支", "feature/qt-client-ui"),
+        ("当前已发布提交", "2f4f27a - add read-only sync correction advice"),
+        ("本次阶段", "Qt 桌面客户端、共享会话层与播放器画面嵌入"),
         ("维护日期", "2026-07-29"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
@@ -386,6 +386,7 @@ def add_commit_history_table(doc):
         ("2c1bf4f", "pairwise playback skew analysis", "把两端上报投影到同一时刻，直接测量客户端间偏差"),
         ("4944cf8", "control epochs and robust skew windows", "隔离控制周期并以中位数/P95 过滤单点抖动"),
         ("92300ce", "late-joining room snapshots", "新 client 加入时按毫秒对齐当前房间状态与控制版本"),
+        ("2f4f27a", "read-only sync correction advice", "以安全门和可解释原因生成校正建议，但不改变播放行为"),
     ]
 
     table = doc.add_table(rows=1, cols=3)
@@ -593,6 +594,66 @@ def add_correction_changed_files_table(doc):
             "Engineering Journal",
             "记录策略边界、安全门、本地证据、已知限制和面试表达。",
             "让后续学习、评审与算法迭代具有连续上下文。",
+        ),
+    ]
+
+    table = doc.add_table(rows=1, cols=3)
+    set_table_geometry(table, [2200, 3580, 3580])
+    headers = ("文件/模块", "核心修改", "工程价值")
+    for index, header in enumerate(headers):
+        cell = table.rows[0].cells[index]
+        set_cell_shading(cell, COLOR_LIGHT_BLUE)
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+        run = paragraph.add_run(header)
+        set_run_font(run, size=9, bold=True, color=COLOR_DARK_BLUE)
+    mark_repeat_table_header(table.rows[0])
+
+    for module, change, value in rows:
+        cells = table.add_row().cells
+        for index, text in enumerate((module, change, value)):
+            paragraph = cells[index].paragraphs[0]
+            set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+            run = paragraph.add_run(text)
+            set_run_font(
+                run,
+                name=FONT_CODE if index == 0 else FONT_BODY,
+                size=8.6 if index == 0 else 9,
+            )
+
+
+def add_qt_changed_files_table(doc):
+    rows = [
+        (
+            "SyncClientSession.h/.cpp",
+            "从原 Client.cpp 抽出连接、快照握手、广播接收、PING/PONG、进度上报和串行发送。",
+            "CLI 与 Qt 共用同一套网络行为，后续协议升级不再维护两份实现。",
+        ),
+        (
+            "QtClientWindow.h/.cpp",
+            "新增媒体/服务器输入、连接状态、视频区域、播放控制、进度、音量和全屏界面。",
+            "普通测试用户无需学习命令行，即可完成核心观影流程。",
+        ),
+        (
+            "QtClientController.h/.cpp",
+            "在后台线程初始化 libVLC 和连接 server，并用 queued invoke 把网络回调送回 UI 线程。",
+            "避免冷启动和网络握手冻结界面，也禁止后台线程直接操作 QWidget。",
+        ),
+        (
+            "PlayerController / LibVlcPlayer",
+            "补充原生视频窗口、媒体总时长和音量接口，并用 libvlc_media_player_set_hwnd 嵌入画面。",
+            "播放器能力继续隐藏在抽象接口后，网络会话不依赖 libVLC C API。",
+        ),
+        (
+            "CMake / presets",
+            "新增可选 SyncCinemaQt 目标、Qt5/Qt6 发现、windeployqt 与 VLC runtime 自动复制。",
+            "Qt 默认关闭，Windows CLI 与 Linux server 保持原构建路径；发布目录可独立运行。",
+        ),
+        (
+            "QtMsvcCompatibility.h",
+            "仅在 Qt 5 + 新版 MSVC 下替换已经被 VS 2026 删除的 stdext 迭代器宏。",
+            "兼容当前开发环境；迁移到官方 Qt 6 后自动退出构建。",
         ),
     ]
 
@@ -975,7 +1036,7 @@ def build_document():
     add_bullet(doc, "libVLC 冷启动在一次真实测试中约为 16.7 秒，这是产品启动体验问题，不是本阶段快照算法的误差。")
     add_bullet(doc, "本阶段只完成状态初始化，不根据 pair 窗口自动控制播放器。")
 
-    doc.add_heading("6. 本地阶段：只读校正决策引擎", level=1)
+    doc.add_heading("6. 已发布阶段：只读校正决策引擎", level=1)
     doc.add_heading("6.1 为什么不直接调用 seek", level=2)
     add_body(
         doc,
@@ -1072,7 +1133,102 @@ def build_document():
     add_bullet(doc, "普通控制广播仍未携带命令 id/epoch，真正闭环前需要再次校验连接身份、epoch 和目标状态。")
     add_bullet(doc, "下一步应先部署只读版本采集公网建议日志，再实现 server 到目标 client 的专用校正命令与执行回执。")
 
-    doc.add_heading("7. 面试表达模板", level=1)
+    doc.add_heading("7. 本地阶段：Qt 桌面客户端 MVP", level=1)
+    doc.add_heading("7.1 为什么先做 UI", level=2)
+    add_body(
+        doc,
+        "同步算法已经具备 RTT、同刻投影、稳健窗口和只读校正建议，但真实异地测试仍依赖对方熟悉命令行。"
+        "本阶段先把现有核心能力包装成普通用户可以直接操作的桌面播放器，让第二台电脑能够作为真实测试端参与，"
+        "同时坚持不在 UI 文件里复制 TCP 和协议逻辑。",
+    )
+    add_callout(
+        doc,
+        "产品目标",
+        "用户只需填写同一媒体 URL 与 server 地址，点击连接后即可播放、暂停、拖动进度、调节音量和全屏；"
+        "server 仍只协调状态，不传输播放器控制之外的 TCP 视频数据。",
+    )
+
+    doc.add_heading("7.2 先抽会话层，再接界面", level=2)
+    add_code_block(
+        doc,
+        [
+            "QtClientWindow (widgets / visual state)",
+            "  -> QtClientController (Qt <-> C++ adapter)",
+            "  -> SyncClientSession (TCP / protocol / worker threads)",
+            "  -> PlayerController",
+            "       -> LibVlcPlayer",
+            "",
+            "CLI Client.cpp",
+            "  -> same SyncClientSession",
+        ],
+    )
+    add_body(
+        doc,
+        "旧 Client.cpp 同时承担命令解析、Winsock 生命周期、消息边界、快照握手、广播线程、"
+        "心跳回复、进度上报和播放器互斥。若 Qt 再复制一遍，任何协议修复都必须改两处。"
+        "因此新增 SyncClientSession，把一个 client 连接的完整生命周期封装为纯 C++ 对象；"
+        "CLI 只负责读取 std::cin，Qt 只负责控件和信号，两者通过 callbacks 消费相同事件。",
+    )
+
+    doc.add_heading("7.3 UI 线程为什么不能做冷启动和网络握手", level=2)
+    add_body(
+        doc,
+        "libVLC 第一次初始化曾实测需要十几秒，TCP connect 和初始 SNAPSHOT 也可能等待超时。"
+        "若这些操作直接发生在 Qt 主线程，窗口会无法拖动、重绘或响应关闭。QtClientController 因此使用"
+        " startupThread 创建播放器、打开媒体和建立会话；网络回调通过 QMetaObject::invokeMethod"
+        " 的 QueuedConnection 回到 UI 线程，再更新控件。后台线程从不直接操作 QWidget。",
+    )
+    add_bullet(doc, "resourcesMutex 保护 controller 持有的 player/session 指针和断开时的所有权转移。")
+    add_bullet(doc, "SyncClientSession 内部 playerMutex 保护同一个播放器，sendMutex 保证多线程发送不会交叉 TCP 字节。")
+    add_bullet(doc, "关闭窗口时先取消启动、停止会话并 join 线程，再销毁被 session 引用的 player。")
+
+    doc.add_heading("7.4 播放器嵌入与常用控件", level=2)
+    add_body(
+        doc,
+        "Qt 的视频区域设置为原生窗口，winId() 转成 Windows HWND 后交给"
+        " libvlc_media_player_set_hwnd。画面由 libVLC 渲染，Qt 负责其外部布局。"
+        "PlayerController 新增 setVideoOutputWindow、getDurationMilliseconds、setVolume 和 getVolume，"
+        "因此 Qt 层仍然不接触 libVLC 头文件之外的实现细节。",
+    )
+    add_bullet(doc, "顶部保留媒体文件/URL、文件选择、server 地址、连接按钮和状态指示。")
+    add_bullet(doc, "视频区域全宽占据主体，不使用营销式卡片或无关装饰。")
+    add_bullet(doc, "底部采用播放器熟悉的播放/暂停、时间轴、时间、音量和全屏图标；双击画面也可全屏，Esc 退出。")
+    add_bullet(doc, "QSettings 保存媒体地址、server 地址和音量，降低重复测试成本。")
+
+    doc.add_heading("7.5 构建与发布边界", level=2)
+    add_body(
+        doc,
+        "BUILD_QT_CLIENT 默认 OFF，保证 Linux 云 server 和未安装 Qt 的开发环境不受影响。"
+        "x64-qt-vlc-release preset 才启用桌面目标；CMake 优先查找 Qt 6，找不到时兼容 Qt 5。"
+        "构建后 windeployqt 自动复制 Qt DLL 与 platform plugin，公共 helper 同时复制 libVLC DLL 和 plugins。"
+        "给测试用户时必须发送整个输出目录，而不是单独发送 exe。",
+    )
+    add_callout(
+        doc,
+        "环境兼容记录",
+        "本机 Anaconda Qt 5.15 仍使用已被 VS 2026 删除的 stdext 检查迭代器。"
+        "QtMsvcCompatibility.h 只在 Qt 5 + MSVC 下把相关宏退化为普通指针；"
+        "这是当前开发环境适配，不是长期替代官方 Qt 6 SDK 的方案。",
+    )
+
+    doc.add_heading("7.6 核心修改", level=2)
+    add_qt_changed_files_table(doc)
+
+    doc.add_heading("7.7 当前验证证据", level=2)
+    add_numbered(doc, "SyncCinemaQt、libVLC CLI、SyncCinemaServer 和 SyncCinemaCoreTests 在 Windows Release 配置共同构建通过。")
+    add_numbered(doc, "无 libVLC 的 Windows x64 Debug MockPlayer 配置构建通过，CTest 1/1 通过。")
+    add_numbered(doc, "WSL Ubuntu 22.04 的 Linux server 和核心测试构建通过，CTest 1/1 通过。")
+    add_numbered(doc, "CLI 通过新 SyncClientSession 完成真实 TCP 连接、SNAPSHOT 0 Stopped 0 握手、状态查询和正常退出。")
+    add_numbered(doc, "Qt 界面在 1180x760 与最小 820x560 下完成真实渲染截图检查，无控件重叠、文字截断或空白窗口。")
+
+    doc.add_heading("7.8 当前局限", level=2)
+    add_bullet(doc, "当前尚未在第二台真实电脑上完成 Qt 客户端的完整播放、暂停和 seek 验收。")
+    add_bullet(doc, "server 端口仍固定为 9000，界面尚无房间码、用户身份和在线成员列表。")
+    add_bullet(doc, "聊天、弹幕、安装器、自动更新、日志文件和崩溃收集均不属于第一版。")
+    add_bullet(doc, "只读校正建议仍未闭环执行；UI 不会自动 seek 用户播放器。")
+    add_bullet(doc, "公开发布前应换用正式 Qt SDK，并建立可复现的 Release 打包与签名流程。")
+
+    doc.add_heading("8. 面试表达模板", level=1)
     add_body(
         doc,
         "第一段可以这样说明指标演进：最初我用服务器 Room 的理论时钟评估每个客户端，"
@@ -1108,14 +1264,28 @@ def build_document():
         "先用公网数据验证误触发率，再接入真正的命令执行和回执。"
     )
 
-    doc.add_heading("8. 后续学习重点", level=1)
+    add_body(
+        doc,
+        "第五段可以这样说明客户端工程化：为了让另一台电脑由普通用户直接参与测试，"
+        "我没有在 Qt 中重写一套网络代码，而是先把旧 Client.cpp 拆成纯 C++ 的 SyncClientSession。"
+        "CLI 和 Qt 共用快照握手、心跳、广播与进度上报；QtClientController 在后台完成 libVLC 冷启动和连接，"
+        "再用 queued invoke 回到 UI 线程。视频通过 HWND 嵌入，CMake 把 Qt 目标设为可选并自动部署 Qt/VLC runtime，"
+        "因此 Linux server 构建路径保持不变。",
+    )
+
+    doc.add_heading("9. 后续学习重点", level=1)
+    add_numbered(doc, "SyncClientSession：如何把 UI/CLI 与网络、协议、播放器并发解耦。")
+    add_numbered(doc, "QtClientController：为什么慢操作放到 worker thread，QWidget 更新必须回到 UI 线程。")
+    add_numbered(doc, "QObject signal、QMetaObject::invokeMethod 与 QueuedConnection 的线程边界。")
+    add_numbered(doc, "libvlc_media_player_set_hwnd：第三方播放器如何嵌入 Qt 原生窗口。")
+    add_numbered(doc, "CMake 的可选目标、find_package、AUTOMOC 和 POST_BUILD runtime 部署。")
     add_numbered(doc, "evaluateSyncCorrection：如何用提前返回把安全门写成可读、可测试的纯决策函数。")
     add_numbered(doc, "calculateDirectionAgreementPercent：为什么偏差大小之外还必须验证方向稳定。")
     add_numbered(doc, "PairWindowStats 的建议去重与模拟冷却：状态为什么属于 pair+epoch，而不是某个 client。")
     add_numbered(doc, "策略单元测试：如何用输入夹具覆盖安全门和正负方向，而不启动网络与播放器。")
     add_numbered(doc, "SyncServer 的 accept 初始化临界区：为什么 addClient、getSnapshot、send 必须与控制命令共用顺序锁。")
-    add_numbered(doc, "Client::receiveInitialSnapshot：select 超时、PING 兼容和 TCP 多读缓冲如何组成握手状态机。")
-    add_numbered(doc, "Client::applyInitialSnapshot：播放器准备、毫秒 seek 和 Playing 状态经过时间补偿。")
+    add_numbered(doc, "SyncClientSession::receiveInitialSnapshot：select 超时、PING 兼容和 TCP 多读缓冲如何组成握手状态机。")
+    add_numbered(doc, "SyncClientSession::applyInitialSnapshot：播放器准备、毫秒 seek 和 Playing 状态经过时间补偿。")
     add_numbered(doc, "Room::getSnapshot：如何在同一把锁下形成 state+epoch 的一致快照。")
     add_numbered(doc, "SyncMetricsCollector::recordProgressReport：共享状态、快照、时间投影和日志输出如何分层。")
     add_numbered(doc, "projectPositionToServerTime：为什么 Playing 才能按经过时间推进。")
@@ -1124,24 +1294,25 @@ def build_document():
     add_numbered(doc, "SyncServer::processLine：controlCommandMutex 如何统一 Room、广播、epoch 和 REPORT 的并发顺序。")
     add_numbered(doc, "Room::getEstimatedStateLocked：服务器如何用基准位置与 steady_clock 维护权威状态。")
     add_numbered(doc, "SyncMetricsCollector::recordPongReceived：为什么 RTT 可以只用 server 自己的时钟计算。")
-    add_numbered(doc, "Client.cpp 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
+    add_numbered(doc, "SyncClientSession 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
 
-    doc.add_heading("9. 后续工程路线", level=1)
-    add_numbered(doc, "在合理提交间隔后提交只读校正决策候选，并部署到云端，用两台真实设备统计建议频率、方向正确率和误触发场景。")
+    doc.add_heading("10. 后续工程路线", level=1)
+    add_numbered(doc, "在合理提交间隔后提交 Qt 桌面客户端候选，并打包完整 runtime 目录交给第二台电脑做真实用户验收。")
+    add_numbered(doc, "用两台真实设备采集 read_only 建议日志，统计建议频率、方向正确率和误触发场景。")
     add_numbered(doc, "设计专用校正协议：携带目标 client、room epoch、目标毫秒位置和命令 id，并要求应用结果回执。")
     add_numbered(doc, "加入最小闭环硬 seek：server 只向落后端发送，client 再次校验 epoch，执行后上报实际位置；失败时不连续重试。")
     add_numbered(doc, "为普通控制广播加入 epoch/命令 id，完善重连后的过期消息过滤和幂等语义。")
     add_numbered(doc, "云端闭环稳定后，再研究 250-750 ms 小偏差的温和校正；暂不贸然引入倍速控制。")
     add_numbered(doc, "进一步同步 server/client 时钟并支持未来执行时间，让两端在约定时刻执行控制，降低广播到达差。")
-    add_numbered(doc, "把网络与同步核心从 CLI 交互中进一步解耦，再接入 Qt 界面、聊天和弹幕。")
+    add_numbered(doc, "在 Qt 客户端上继续增加房间信息、聊天与弹幕，但不让 UI 直接处理协议字符串。")
     add_numbered(doc, "补齐 systemd 服务、配置文件、日志轮转、自动构建测试和发布包。")
 
     add_callout(
         doc,
         "下一阶段入口",
-        "92300ce 晚加入快照已经发布。当前只读校正策略已完成本地实现、跨平台测试和双客户端集成验证，"
-        "按提交节奏要求停在未提交状态。下一步先部署该 read_only 版本收集真实异地建议日志；"
-        "确认方向、阈值和冷却可靠后，才设计带 epoch、命令 id 与执行回执的最小闭环。",
+        "只读校正策略已作为 2f4f27a 发布。feature/qt-client-ui 已形成可构建、可打包的本地候选，"
+        "并保持 CLI 与 Linux server 回归通过。下一步在合理提交间隔后提交该 UI 阶段，"
+        "把完整运行目录交给第二台电脑做真实用户测试；随后用异地日志校准阈值，再打开最小闭环。",
     )
 
     doc.save(OUTPUT_PATH)

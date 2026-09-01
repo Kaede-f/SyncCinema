@@ -68,6 +68,7 @@ bool LibVlcPlayer::openMedia(const std::string& mediaSource)
         return false;
     }
 
+    applyVideoOutputWindow();
     mediaPath_ = mediaSource;
     std::cout << "[LibVLC] open: " << mediaPath_ << "\n";
     return true;
@@ -168,6 +169,46 @@ int LibVlcPlayer::getPositionSeconds() const
     return static_cast<int>(getPositionMilliseconds() / 1000);
 }
 
+bool LibVlcPlayer::setVideoOutputWindow(void* nativeWindow)
+{
+    videoOutputWindow_ = nativeWindow;
+    applyVideoOutputWindow();
+    return nativeWindow != nullptr;
+}
+
+long long LibVlcPlayer::getDurationMilliseconds() const
+{
+    if (mediaPlayer_ == nullptr)
+    {
+        return 0;
+    }
+
+    libvlc_time_t duration = libvlc_media_player_get_length(mediaPlayer_);
+    return duration > 0 ? static_cast<long long>(duration) : 0;
+}
+
+bool LibVlcPlayer::setVolume(int volume)
+{
+    if (mediaPlayer_ == nullptr)
+    {
+        return false;
+    }
+
+    int clampedVolume = std::clamp(volume, 0, 100);
+    return libvlc_audio_set_volume(mediaPlayer_, clampedVolume) == 0;
+}
+
+int LibVlcPlayer::getVolume() const
+{
+    if (mediaPlayer_ == nullptr)
+    {
+        return 100;
+    }
+
+    int volume = libvlc_audio_get_volume(mediaPlayer_);
+    return volume >= 0 ? volume : 100;
+}
+
 void LibVlcPlayer::releaseCurrentMediaPlayer()
 {
     if (mediaPlayer_ != nullptr)
@@ -187,4 +228,17 @@ libvlc_media_t* LibVlcPlayer::createMediaFromSource(const std::string& mediaSour
 
     std::string localPath = normalizeLocalPathForLibVlc(mediaSource);
     return libvlc_media_new_path(vlcInstance_, localPath.c_str());
+}
+
+void LibVlcPlayer::applyVideoOutputWindow()
+{
+#ifdef _WIN32
+    if (mediaPlayer_ != nullptr && videoOutputWindow_ != nullptr)
+    {
+        libvlc_media_player_set_hwnd(mediaPlayer_, videoOutputWindow_);
+    }
+#else
+    // 当前 Qt client 只在 Windows 构建。保留分支便于未来扩展其他平台。
+    (void)videoOutputWindow_;
+#endif
 }

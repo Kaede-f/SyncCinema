@@ -22,12 +22,18 @@ public:
     bool isSeekable() const override;
     long long getPositionMilliseconds() const override;
     int getPositionSeconds() const override;
+    bool setVideoOutputWindow(void* nativeWindow) override;
+    long long getDurationMilliseconds() const override;
+    bool setVolume(int volume) override;
+    int getVolume() const override;
 
 private:
     void releaseCurrentMediaPlayer();
     libvlc_media_t* createMediaFromSource(const std::string& mediaSource);
+    void applyVideoOutputWindow();
 
     libvlc_instance_t* vlcInstance_ = nullptr;
     libvlc_media_player_t* mediaPlayer_ = nullptr;
+    void* videoOutputWindow_ = nullptr;
     std::string mediaPath_;
 };

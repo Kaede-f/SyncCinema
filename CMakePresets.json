@@ -50,6 +50,20 @@
             }
         },
         {
+            "name": "x64-qt-vlc-release",
+            "displayName": "x64 Release with Qt and libVLC",
+            "inherits": "x64-release",
+            "cacheVariables": {
+                "BUILD_QT_CLIENT": "ON",
+                "USE_LIBVLC": "ON",
+                "CMAKE_PREFIX_PATH": "D:/Download/Anaconda3/Library",
+                "VLC_INCLUDE_DIR": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64/sdk/include",
+                "VLC_LIBRARY": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64/sdk/lib/libvlc.lib",
+                "VLC_CORE_LIBRARY": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64/sdk/lib/libvlccore.lib",
+                "VLC_RUNTIME_DIR": "D:/Dev/SDKs/VLC/vlc-3.0.23-win64"
+            }
+        },
+        {
             "name": "x86-debug",
             "displayName": "x86 Debug",
             "inherits": "windows-base",

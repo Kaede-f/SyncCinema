@@ -29,6 +29,14 @@ public:
     // 秒级进度适合命令行展示；毫秒级进度才能看出真实同步偏差。
     virtual long long getPositionMilliseconds() const = 0;
     virtual int getPositionSeconds() const = 0;
+
+    // GUI 播放器把 libVLC 画面嵌入自己的原生窗口。
+    // 命令行 MockPlayer 不需要真实窗口，但仍实现同一接口以保持可替换性。
+    virtual bool setVideoOutputWindow(void* nativeWindow) = 0;
+
+    virtual long long getDurationMilliseconds() const = 0;
+    virtual bool setVolume(int volume) = 0;
+    virtual int getVolume() const = 0;
 };
 
 // 把协议消息应用到播放器。
