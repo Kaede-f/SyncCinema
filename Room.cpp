@@ -40,14 +40,42 @@ namespace
     }
 }
 
-int Room::addClient(SocketHandle clientSocket)
+RoomJoinResult Room::joinClient(
+    SocketHandle clientSocket,
+    const std::string& mediaIdentity)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    RoomJoinResult result;
+
+    if (mediaIdentity.empty())
+    {
+        return result;
+    }
+
+    if (clients_.empty())
+    {
+        // 没有观众时，旧房间生命周期已经结束。首个 client 建立全新的
+        // 媒体会话，状态必须从 Stopped/0 开始，不能继承上一部电影。
+        state_ = SyncState{};
+        mediaIdentity_ = mediaIdentity;
+        controlEpoch_ = 0;
+        lastStateUpdateTime_ = Clock::now();
+    }
+    else if (mediaIdentity_ != mediaIdentity)
+    {
+        result.activeMediaIdentity = mediaIdentity_;
+        return result;
+    }
 
     int clientId = nextClientId_;
     ++nextClientId_;
     clients_.push_back(ClientConnection{ clientId, clientSocket });
-    return clientId;
+
+    result.accepted = true;
+    result.clientId = clientId;
+    result.activeMediaIdentity = mediaIdentity_;
+    return result;
 }
 
 void Room::removeClient(SocketHandle clientSocket)
@@ -63,6 +91,16 @@ void Room::removeClient(SocketHandle clientSocket)
         }
     );
     clients_.erase(newEnd, clients_.end());
+
+    if (clients_.empty())
+    {
+        // 单房间 MVP 把“最后一个 client 离开”定义为会话结束。
+        // 下一个首位加入者会重新选择媒体并从 0 开始。
+        state_ = SyncState{};
+        mediaIdentity_.clear();
+        controlEpoch_ = 0;
+        lastStateUpdateTime_ = Clock::now();
+    }
 }
 
 bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message)
@@ -136,6 +174,7 @@ RoomSnapshot Room::getSnapshot() const
     RoomSnapshot snapshot;
     snapshot.state = getEstimatedStateLocked(Clock::now());
     snapshot.controlEpoch = controlEpoch_;
+    snapshot.mediaIdentity = mediaIdentity_;
     return snapshot;
 }
 
@@ -208,6 +247,8 @@ void Room::applyControlMessageLocked(const SyncMessage& message, Clock::time_poi
     case MessageType::Report:
     case MessageType::Ping:
     case MessageType::Pong:
+    case MessageType::Join:
+    case MessageType::JoinRejected:
     case MessageType::Snapshot:
     case MessageType::Unknown:
         break;

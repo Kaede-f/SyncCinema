@@ -33,6 +33,8 @@ enum class MessageType
     Report,
     Ping,
     Pong,
+    Join,
+    JoinRejected,
     Snapshot,
     Unknown
 };
@@ -50,6 +52,8 @@ struct SyncMessage
     PlaybackState playbackState = PlaybackState::Stopped;
     int sequenceNumber = 0; // PING/PONG 使用，用来把一次请求和一次响应配对。
     long long controlEpoch = 0; // SNAPSHOT 使用：表示房间已经处理过多少次控制命令。
+    std::string mediaIdentity; // JOIN/SNAPSHOT 使用：标识本次房间播放的媒体来源。
+    std::string rejectionReason; // REJECT 使用：返回握手失败的稳定错误码。
 };
 
 std::string stateToString(PlaybackState state);
@@ -58,6 +62,10 @@ std::string messageTypeToString(MessageType type);
 // 只有 PLAY / PAUSE / SEEK 会改变房间的权威播放状态。
 // 把这个判断集中在协议层，避免 server、Room 和 metrics 各自维护一份不同规则。
 bool isPlaybackControlMessage(MessageType type);
+
+// 将媒体路径或 URL 转成跨进程稳定的短标识。
+// 该标识只用于房间一致性判断，不是密码学摘要，也不能用于安全校验。
+std::string makeMediaIdentity(const std::string& mediaSource);
 
 // Serialize a structured command into one TCP line.
 // The trailing '\n' is the message boundary.

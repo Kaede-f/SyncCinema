@@ -270,8 +270,8 @@ def add_title_block(doc):
 
     metadata = [
         ("当前开发分支", "feature/qt-client-ui"),
-        ("当前已发布提交", "2f4f27a - add read-only sync correction advice"),
-        ("本次阶段", "Qt 桌面客户端、共享会话层与播放器画面嵌入"),
+        ("当前已发布提交", "81ec949 - add Qt desktop client and shared session layer"),
+        ("本次阶段", "媒体会话身份、JOIN 握手与旧进度隔离"),
         ("维护日期", "2026-07-29"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
@@ -1228,6 +1228,35 @@ def build_document():
     add_bullet(doc, "只读校正建议仍未闭环执行；UI 不会自动 seek 用户播放器。")
     add_bullet(doc, "公开发布前应换用正式 Qt SDK，并建立可复现的 Release 打包与签名流程。")
 
+    doc.add_heading("7.9 媒体会话身份与旧进度隔离", level=2)
+    add_body(
+        doc,
+        "Qt MVP 暴露出一个房间语义缺口：client 断开后打开另一部电影，server 仍会把上一部电影的"
+        " SNAPSHOT 位置应用到新播放器。根因不是 libVLC，而是原协议只同步状态和进度，完全没有说明"
+        "这些状态属于哪一个媒体。仅在 UI 中把进度强制归零会掩盖问题，并且无法阻止两个 client 播放"
+        "不同电影时继续交换 PLAY、PAUSE 和 SEEK。",
+    )
+    add_code_block(
+        doc,
+        [
+            "TCP connected",
+            "  -> client: JOIN <media_identity>",
+            "  -> server: SNAPSHOT <epoch> <state> <position_ms> <media_identity>",
+            "     or REJECT MEDIA_MISMATCH",
+        ],
+    )
+    add_bullet(doc, "媒体身份使用规范化来源字符串的稳定 FNV-1a 64-bit 标识，仅做一致性判断，不用于安全认证。")
+    add_bullet(doc, "空房间的首个 client 建立新媒体会话，Room 从 Stopped/0 和 epoch 0 开始。")
+    add_bullet(doc, "房间已有观众时只允许相同媒体加入，不同媒体在进入广播列表前被拒绝。")
+    add_bullet(doc, "最后一个 client 离开后清空媒体、权威状态和 epoch，下一部电影不会继承旧进度。")
+    add_bullet(doc, "每个 TCP 连接在独立线程中完成限时 JOIN，慢连接不会阻塞 server 的 accept 循环。")
+    add_body(
+        doc,
+        "测试覆盖 JOIN/REJECT/SNAPSHOT 序列化、路径分隔符归一化、同媒体加入、异媒体拒绝、"
+        "广播列表隔离以及最后一位用户离开后的状态重置。这个改动先建立正确的会话边界，"
+        "后续自动校正命令才能确保 epoch、进度和目标 client 都属于同一部媒体。",
+    )
+
     doc.add_heading("8. 面试表达模板", level=1)
     add_body(
         doc,
@@ -1272,6 +1301,13 @@ def build_document():
         "再用 queued invoke 回到 UI 线程。视频通过 HWND 嵌入，CMake 把 Qt 目标设为可选并自动部署 Qt/VLC runtime，"
         "因此 Linux server 构建路径保持不变。",
     )
+    add_body(
+        doc,
+        "第六段可以这样说明媒体一致性：Qt 实测发现切换影片会继承旧 Room 进度，我没有只在 UI 中归零，"
+        "而是追到协议层补上媒体会话身份。client 先发送 JOIN，server 只有在媒体一致时才注册并返回带身份的快照；"
+        "活跃房间拒绝不同媒体，最后一位用户离开后重置状态。这样从协议、Room 到 UI 都不会把一部电影的进度"
+        "错误应用到另一部电影，也为后续带 epoch 的自动校正建立了正确边界。",
+    )
 
     doc.add_heading("9. 后续学习重点", level=1)
     add_numbered(doc, "SyncClientSession：如何把 UI/CLI 与网络、协议、播放器并发解耦。")
@@ -1297,7 +1333,8 @@ def build_document():
     add_numbered(doc, "SyncClientSession 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
 
     doc.add_heading("10. 后续工程路线", level=1)
-    add_numbered(doc, "在合理提交间隔后提交 Qt 桌面客户端候选，并打包完整 runtime 目录交给第二台电脑做真实用户验收。")
+    add_numbered(doc, "提交媒体会话身份阶段，并同步部署新版 server 与 client 做切换影片回归。")
+    add_numbered(doc, "打包完整 Qt/VLC runtime 目录，交给第二台电脑做真实用户验收。")
     add_numbered(doc, "用两台真实设备采集 read_only 建议日志，统计建议频率、方向正确率和误触发场景。")
     add_numbered(doc, "设计专用校正协议：携带目标 client、room epoch、目标毫秒位置和命令 id，并要求应用结果回执。")
     add_numbered(doc, "加入最小闭环硬 seek：server 只向落后端发送，client 再次校验 epoch，执行后上报实际位置；失败时不连续重试。")
@@ -1310,9 +1347,9 @@ def build_document():
     add_callout(
         doc,
         "下一阶段入口",
-        "只读校正策略已作为 2f4f27a 发布。feature/qt-client-ui 已形成可构建、可打包的本地候选，"
-        "并保持 CLI 与 Linux server 回归通过。下一步在合理提交间隔后提交该 UI 阶段，"
-        "把完整运行目录交给第二台电脑做真实用户测试；随后用异地日志校准阈值，再打开最小闭环。",
+        "Qt 桌面客户端已作为 81ec949 发布。当前在独立分支补齐媒体 JOIN 握手、活跃房间一致性检查和"
+        "空房间状态重置。下一步完成 Windows/Linux 回归并部署新版 server/client，验证切换影片不会继承旧进度；"
+        "随后把完整运行目录交给第二台电脑测试，再用异地日志校准阈值并打开最小校正闭环。",
     )
 
     doc.save(OUTPUT_PATH)

@@ -98,6 +98,7 @@ SyncClientSession::~SyncClientSession()
 
 bool SyncClientSession::connectToRoom(
     const std::string& serverHost,
+    const std::string& mediaSource,
     std::string& errorMessage,
     SyncClientConnectMetrics* metrics)
 {
@@ -118,6 +119,8 @@ bool SyncClientSession::connectToRoom(
     }
     winsockInitialized_ = true;
 
+    mediaIdentity_ = makeMediaIdentity(mediaSource);
+
     Clock::time_point connectStartedAt = Clock::now();
     if (!connectSocket(serverHost, errorMessage))
     {
@@ -131,6 +134,15 @@ bool SyncClientSession::connectToRoom(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - connectStartedAt
             ).count();
+    }
+
+    SyncMessage joinMessage;
+    joinMessage.type = MessageType::Join;
+    joinMessage.mediaIdentity = mediaIdentity_;
+    if (!sendProtocolMessage(joinMessage, errorMessage))
+    {
+        closeSocketAndCleanup();
+        return false;
     }
 
     running_ = true;
@@ -213,6 +225,7 @@ void SyncClientSession::disconnect()
     lifecycleLock.lock();
     closeSocketAndCleanup();
     bool wasConnected = connected_.exchange(false);
+    mediaIdentity_.clear();
     lifecycleLock.unlock();
 
     if (wasConnected)
@@ -381,6 +394,15 @@ bool SyncClientSession::receiveInitialSnapshot(
                 return true;
             }
 
+            if (message.type == MessageType::JoinRejected)
+            {
+                errorMessage = message.rejectionReason == "MEDIA_MISMATCH"
+                    ? "room is already using a different media source"
+                    : "server rejected the media join request: " +
+                        message.rejectionReason;
+                return false;
+            }
+
             if (message.type == MessageType::Ping)
             {
                 SyncMessage pong;
@@ -463,6 +485,13 @@ bool SyncClientSession::applyInitialSnapshot(
     if (snapshot.type != MessageType::Snapshot)
     {
         errorMessage = "initial message is not a SNAPSHOT";
+        return false;
+    }
+
+    if (snapshot.mediaIdentity != mediaIdentity_)
+    {
+        errorMessage =
+            "initial snapshot media identity does not match the opened media";
         return false;
     }
 
@@ -657,6 +686,8 @@ void SyncClientSession::receiverLoop(std::string receiveBuffer)
 
             if (message.type == MessageType::Pong ||
                 message.type == MessageType::Report ||
+                message.type == MessageType::Join ||
+                message.type == MessageType::JoinRejected ||
                 message.type == MessageType::Snapshot)
             {
                 continue;

@@ -26,16 +26,20 @@ namespace
 
     void testSnapshotProtocolRoundTrip()
     {
+        const std::string mediaIdentity = makeMediaIdentity(
+            "http://example.test/videos/movie.mp4"
+        );
         SyncMessage outgoing;
         outgoing.type = MessageType::Snapshot;
         outgoing.controlEpoch = 7;
         outgoing.playbackState = PlaybackState::Playing;
         outgoing.positionMilliseconds = 123456;
         outgoing.positionSeconds = 123;
+        outgoing.mediaIdentity = mediaIdentity;
 
         std::string wireText = messageToString(outgoing);
         expect(
-            wireText == "SNAPSHOT 7 Playing 123456\n",
+            wireText == "SNAPSHOT 7 Playing 123456 " + mediaIdentity + "\n",
             "SNAPSHOT serializes to one newline-delimited protocol line"
         );
 
@@ -51,6 +55,10 @@ namespace
             "SNAPSHOT millisecond position parses"
         );
         expect(parsed.positionSeconds == 123, "SNAPSHOT derives second position");
+        expect(
+            parsed.mediaIdentity == mediaIdentity,
+            "SNAPSHOT media identity parses"
+        );
 
         SyncState state;
         applyMessageToState(parsed, state);
@@ -89,9 +97,133 @@ namespace
         expect(
             stringToMessage(
                 "SNAPSHOT 1 Paused " + std::to_string(tooLargePositionMs)
+                + " 0123456789abcdef"
             ).type == MessageType::Unknown,
             "SNAPSHOT rejects a position that cannot fit SyncState seconds"
         );
+    }
+
+    void testMediaJoinProtocol()
+    {
+        const std::string windowsPath = "D:\\videos\\movie.mp4";
+        const std::string slashPath = "D:/videos/movie.mp4";
+        const std::string mediaIdentity = makeMediaIdentity(windowsPath);
+
+        expect(
+            mediaIdentity == makeMediaIdentity(slashPath),
+            "media identity normalizes path separators"
+        );
+        expect(
+            mediaIdentity != makeMediaIdentity("D:/videos/other.mp4"),
+            "different media sources produce different identities"
+        );
+
+        SyncMessage join;
+        join.type = MessageType::Join;
+        join.mediaIdentity = mediaIdentity;
+        std::string joinWire = messageToString(join);
+        expect(
+            joinWire == "JOIN " + mediaIdentity + "\n",
+            "JOIN serializes to one protocol line"
+        );
+
+        SyncMessage parsedJoin = stringToMessage(joinWire);
+        expect(parsedJoin.type == MessageType::Join, "JOIN type parses");
+        expect(
+            parsedJoin.mediaIdentity == mediaIdentity,
+            "JOIN media identity parses"
+        );
+        expect(
+            stringToMessage("JOIN not-a-valid-id").type == MessageType::Unknown,
+            "JOIN rejects malformed media identities"
+        );
+
+        SyncMessage rejection;
+        rejection.type = MessageType::JoinRejected;
+        rejection.rejectionReason = "MEDIA_MISMATCH";
+        SyncMessage parsedRejection = stringToMessage(
+            messageToString(rejection)
+        );
+        expect(
+            parsedRejection.type == MessageType::JoinRejected,
+            "REJECT type parses"
+        );
+        expect(
+            parsedRejection.rejectionReason == "MEDIA_MISMATCH",
+            "REJECT reason parses"
+        );
+    }
+
+    void testRoomMediaSessionLifecycle()
+    {
+        Room room;
+        const SocketHandle firstSocket = static_cast<SocketHandle>(101);
+        const SocketHandle secondSocket = static_cast<SocketHandle>(102);
+        const std::string firstMedia = makeMediaIdentity("movie-a.mp4");
+        const std::string secondMedia = makeMediaIdentity("movie-b.mp4");
+
+        RoomJoinResult firstJoin = room.joinClient(firstSocket, firstMedia);
+        expect(firstJoin.accepted, "first client establishes the room media");
+        expect(
+            room.getSnapshot().mediaIdentity == firstMedia,
+            "Room snapshot carries the active media identity"
+        );
+
+        SyncMessage seek;
+        seek.type = MessageType::Seek;
+        seek.positionSeconds = 95;
+        seek.positionMilliseconds = 95000;
+        expect(
+            room.broadcastControlMessage(firstSocket, seek),
+            "active media session accepts playback controls"
+        );
+
+        RoomJoinResult mismatchedJoin = room.joinClient(
+            secondSocket,
+            secondMedia
+        );
+        expect(
+            !mismatchedJoin.accepted,
+            "Room rejects a different media while viewers remain"
+        );
+        expect(
+            room.getClientCount() == 1,
+            "rejected media does not enter the broadcast list"
+        );
+
+        RoomJoinResult matchingJoin = room.joinClient(
+            secondSocket,
+            firstMedia
+        );
+        expect(
+            matchingJoin.accepted,
+            "Room accepts another client with the same media"
+        );
+
+        room.removeClient(secondSocket);
+        room.removeClient(firstSocket);
+        RoomSnapshot emptyRoom = room.getSnapshot();
+        expect(
+            emptyRoom.mediaIdentity.empty(),
+            "last client leaving ends the media session"
+        );
+        expect(
+            emptyRoom.state.state == PlaybackState::Stopped &&
+                emptyRoom.state.positionMilliseconds == 0 &&
+                emptyRoom.controlEpoch == 0,
+            "ended media session resets authoritative playback state"
+        );
+
+        RoomJoinResult nextJoin = room.joinClient(firstSocket, secondMedia);
+        RoomSnapshot nextSnapshot = room.getSnapshot();
+        expect(nextJoin.accepted, "next media can establish a fresh session");
+        expect(
+            nextSnapshot.mediaIdentity == secondMedia &&
+                nextSnapshot.state.state == PlaybackState::Stopped &&
+                nextSnapshot.state.positionMilliseconds == 0,
+            "new media starts from Stopped at position zero"
+        );
+        room.removeClient(firstSocket);
     }
 
     void testPlaybackControlClassification()
@@ -344,8 +476,10 @@ int main()
 {
     testSnapshotProtocolRoundTrip();
     testSnapshotProtocolRejectsMalformedInput();
+    testMediaJoinProtocol();
     testPlaybackControlClassification();
     testRoomSnapshotAndEpoch();
+    testRoomMediaSessionLifecycle();
     testCorrectionPolicySafetyGates();
     testCorrectionPolicySelectsLaggingClient();
 

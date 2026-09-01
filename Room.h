@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "NetSocket.h"
@@ -20,6 +21,14 @@ struct RoomSnapshot
 {
     SyncState state;
     long long controlEpoch = 0;
+    std::string mediaIdentity;
+};
+
+struct RoomJoinResult
+{
+    bool accepted = false;
+    int clientId = 0;
+    std::string activeMediaIdentity;
 };
 
 // Room 表示一个同步观影房间。
@@ -34,7 +43,10 @@ struct RoomSnapshot
 class Room
 {
 public:
-    int addClient(SocketHandle clientSocket);
+    RoomJoinResult joinClient(
+        SocketHandle clientSocket,
+        const std::string& mediaIdentity
+    );
     void removeClient(SocketHandle clientSocket);
 
     // senderSocket 是发起命令的 client。
@@ -60,6 +72,7 @@ private:
     mutable std::mutex sendMutex_;
     std::vector<ClientConnection> clients_;
     SyncState state_;
+    std::string mediaIdentity_;
     Clock::time_point lastStateUpdateTime_ = Clock::now();
     long long controlEpoch_ = 0;
     int nextClientId_ = 1;

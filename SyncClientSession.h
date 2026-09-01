@@ -66,6 +66,7 @@ public:
 
     bool connectToRoom(
         const std::string& serverHost,
+        const std::string& mediaSource,
         std::string& errorMessage,
         SyncClientConnectMetrics* metrics = nullptr
     );
@@ -138,6 +139,7 @@ private:
     std::atomic_bool connected_{ false };
 
     SyncState localState_;
+    std::string mediaIdentity_;
     std::thread receiverThread_;
     std::thread progressReportThread_;
 };

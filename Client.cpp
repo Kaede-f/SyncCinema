@@ -170,6 +170,7 @@ void runClient(
     );
     if (!session.connectToRoom(
             serverIp,
+            mediaSource,
             errorMessage,
             &connectMetrics))
     {

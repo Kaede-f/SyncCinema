@@ -139,7 +139,11 @@ void QtClientController::connectToRoom(
 
             std::string errorMessage;
             SyncClientConnectMetrics metrics;
-            if (!session->connectToRoom(server, errorMessage, &metrics))
+            if (!session->connectToRoom(
+                    server,
+                    media,
+                    errorMessage,
+                    &metrics))
             {
                 postError(errorMessage);
                 startupRunning_ = false;
