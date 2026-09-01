@@ -269,10 +269,10 @@ def add_title_block(doc):
     set_run_font(run, size=12.5, color=COLOR_MUTED)
 
     metadata = [
-        ("当前开发分支", "feature/qt-client-ui"),
-        ("当前已发布提交", "81ec949 - add Qt desktop client and shared session layer"),
-        ("本次阶段", "媒体会话身份、JOIN 握手与旧进度隔离"),
-        ("维护日期", "2026-07-29"),
+        ("当前开发分支", "feature/media-load-feedback"),
+        ("版本基线", "10a19af + 本阶段 media-load-feedback"),
+        ("本次阶段", "libVLC 异步媒体状态与 Qt 错误反馈"),
+        ("维护日期", "2026-09-01"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
     table = doc.add_table(rows=1, cols=2)
@@ -1257,6 +1257,36 @@ def build_document():
         "后续自动校正命令才能确保 epoch、进度和目标 client 都属于同一部媒体。",
     )
 
+    doc.add_heading("7.10 libVLC 异步媒体状态与失败反馈", level=2)
+    add_body(
+        doc,
+        "Qt 实测发现，错误 URL 会连接房间但视频区域长期黑屏。根因是 openMedia 只完成媒体对象和"
+        " media player 的创建；HTTP 404、格式不支持和解码失败发生在真正播放后的 libVLC 内部线程，"
+        "因此不能用 openMedia 的同步返回值代表媒体已经可播放。",
+    )
+    add_code_block(
+        doc,
+        [
+            "libVLC internal thread",
+            "  -> PlayerEvent { Opening | Buffering | Playing | Error | EndReached }",
+            "  -> QtClientController queued invoke",
+            "  -> Qt main thread updates the video status overlay",
+        ],
+    )
+    add_bullet(doc, "PlayerController 新增 UI 无关的事件接口，Qt 和测试代码不直接依赖 libVLC 事件类型。")
+    add_bullet(doc, "LibVlcPlayer 订阅七类 media player 事件，并在 stop/release 前统一解绑，控制回调生命周期。")
+    add_bullet(doc, "事件回调只在锁内复制 std::function，在锁外执行，避免 UI 回调反向进入播放器时死锁。")
+    add_bullet(doc, "QtClientController 使用 queued invoke 回到主线程，并用 lifecycle generation 丢弃旧播放器迟到事件。")
+    add_bullet(doc, "媒体失败后主动离开房间，防止黑屏客户端继续发送无意义的 REPORT 并污染同步指标。")
+    add_bullet(doc, "Qt 视频区域展示打开、缓冲百分比、失败和播放结束；错误不再表现为无法解释的黑屏。")
+    add_body(
+        doc,
+        "验证分为两层：MockPlayer 回归测试锁住播放器事件抽象；Windows/libVLC 集成测试打开一个不存在的"
+        "媒体并等待异步 Error，确认第三方库线程到 PlayerEvent 的真实转换链路。Windows 两项测试与"
+        " Linux 核心测试均通过。CMake 同时兼容 Anaconda Qt 的非标准 _conda DLL 命名，构建后按 imported"
+        " target 精确复制 Qt Core、Gui 和 Widgets 运行库。",
+    )
+
     doc.add_heading("8. 面试表达模板", level=1)
     add_body(
         doc,
@@ -1308,12 +1338,22 @@ def build_document():
         "活跃房间拒绝不同媒体，最后一位用户离开后重置状态。这样从协议、Room 到 UI 都不会把一部电影的进度"
         "错误应用到另一部电影，也为后续带 epoch 的自动校正建立了正确边界。",
     )
+    add_body(
+        doc,
+        "第七段可以这样说明异步错误治理：最初 openMedia 返回成功后，错误 URL 仍会留下黑屏，因为 libVLC"
+        " 的网络和解码错误发生在内部线程。我在 PlayerController 层抽象 Opening、Buffering、Error 等事件，"
+        "LibVlcPlayer 负责订阅和生命周期解绑，QtClientController 再通过 queued invoke 回到主线程。"
+        "同时用 generation 隔离旧会话迟到事件，并在播放失败后离开房间，避免无效进度污染同步测量。",
+    )
 
     doc.add_heading("9. 后续学习重点", level=1)
     add_numbered(doc, "SyncClientSession：如何把 UI/CLI 与网络、协议、播放器并发解耦。")
     add_numbered(doc, "QtClientController：为什么慢操作放到 worker thread，QWidget 更新必须回到 UI 线程。")
     add_numbered(doc, "QObject signal、QMetaObject::invokeMethod 与 QueuedConnection 的线程边界。")
     add_numbered(doc, "libvlc_media_player_set_hwnd：第三方播放器如何嵌入 Qt 原生窗口。")
+    add_numbered(doc, "libvlc_event_attach/detach：异步第三方回调的订阅、线程边界和对象生命周期。")
+    add_numbered(doc, "PlayerEvent 抽象：为什么底层事件要先翻译成领域类型，再交给 Qt 展示。")
+    add_numbered(doc, "lifecycleGeneration：如何阻止旧播放器排队中的回调影响一次新的连接。")
     add_numbered(doc, "CMake 的可选目标、find_package、AUTOMOC 和 POST_BUILD runtime 部署。")
     add_numbered(doc, "evaluateSyncCorrection：如何用提前返回把安全门写成可读、可测试的纯决策函数。")
     add_numbered(doc, "calculateDirectionAgreementPercent：为什么偏差大小之外还必须验证方向稳定。")
@@ -1333,10 +1373,9 @@ def build_document():
     add_numbered(doc, "SyncClientSession 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
 
     doc.add_heading("10. 后续工程路线", level=1)
-    add_numbered(doc, "提交媒体会话身份阶段，并同步部署新版 server 与 client 做切换影片回归。")
-    add_numbered(doc, "打包完整 Qt/VLC runtime 目录，交给第二台电脑做真实用户验收。")
-    add_numbered(doc, "用两台真实设备采集 read_only 建议日志，统计建议频率、方向正确率和误触发场景。")
     add_numbered(doc, "设计专用校正协议：携带目标 client、room epoch、目标毫秒位置和命令 id，并要求应用结果回执。")
+    add_numbered(doc, "项目功能闭环后统一部署新版 server，并把完整 Qt/VLC runtime 目录交给第二台电脑验收。")
+    add_numbered(doc, "用两台真实设备采集 read_only 建议日志，统计建议频率、方向正确率和误触发场景。")
     add_numbered(doc, "加入最小闭环硬 seek：server 只向落后端发送，client 再次校验 epoch，执行后上报实际位置；失败时不连续重试。")
     add_numbered(doc, "为普通控制广播加入 epoch/命令 id，完善重连后的过期消息过滤和幂等语义。")
     add_numbered(doc, "云端闭环稳定后，再研究 250-750 ms 小偏差的温和校正；暂不贸然引入倍速控制。")
@@ -1347,9 +1386,9 @@ def build_document():
     add_callout(
         doc,
         "下一阶段入口",
-        "Qt 桌面客户端已作为 81ec949 发布。当前在独立分支补齐媒体 JOIN 握手、活跃房间一致性检查和"
-        "空房间状态重置。下一步完成 Windows/Linux 回归并部署新版 server/client，验证切换影片不会继承旧进度；"
-        "随后把完整运行目录交给第二台电脑测试，再用异地日志校准阈值并打开最小校正闭环。",
+        "媒体会话身份已作为 10a19af 发布，本阶段已补齐 libVLC 异步打开、缓冲、失败和结束反馈，"
+        "并用生命周期编号隔离旧播放器事件。下一步进入最小自动校正协议与执行回执；"
+        "待功能闭环，再统一部署云端并用第二台电脑完成真实用户验收。",
     )
 
     doc.save(OUTPUT_PATH)

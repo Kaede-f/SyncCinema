@@ -1,8 +1,28 @@
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "Protocol.h"
+
+enum class PlayerEventType
+{
+    Opening,
+    Buffering,
+    Playing,
+    Paused,
+    Stopped,
+    EndReached,
+    Error
+};
+
+struct PlayerEvent
+{
+    PlayerEventType type = PlayerEventType::Stopped;
+    int bufferingPercent = 0;
+};
+
+using PlayerEventCallback = std::function<void(const PlayerEvent&)>;
 
 // PlayerController 是“播放器控制接口”。
 // TCP 层只需要知道：播放器可以打开媒体、播放、暂停、跳转、查询进度。
@@ -12,6 +32,9 @@ class PlayerController
 public:
     virtual ~PlayerController();
 
+    // libVLC 的网络错误和缓冲状态发生在内部线程，不能只依赖 openMedia 的返回值。
+    // 统一事件接口让 Qt 层不需要认识任何 libVLC 类型，也便于 MockPlayer 做回归测试。
+    virtual void setEventCallback(PlayerEventCallback callback) = 0;
     virtual bool openMedia(const std::string& path) = 0;
     virtual bool play() = 0;
     virtual bool pause() = 0;

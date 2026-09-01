@@ -1,11 +1,24 @@
 #include "LibVlcPlayer.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <iostream>
 #include <string>
+#include <utility>
 
 namespace
 {
+    constexpr std::array<libvlc_event_type_t, 7> kObservedPlayerEvents{
+        libvlc_MediaPlayerOpening,
+        libvlc_MediaPlayerBuffering,
+        libvlc_MediaPlayerPlaying,
+        libvlc_MediaPlayerPaused,
+        libvlc_MediaPlayerStopped,
+        libvlc_MediaPlayerEndReached,
+        libvlc_MediaPlayerEncounteredError
+    };
+
     bool isNetworkMediaSource(const std::string& mediaSource)
     {
         return mediaSource.starts_with("http://") || mediaSource.starts_with("https://");
@@ -18,6 +31,12 @@ namespace
 #endif
         return path;
     }
+}
+
+void LibVlcPlayer::setEventCallback(PlayerEventCallback callback)
+{
+    std::lock_guard<std::mutex> lock(eventCallbackMutex_);
+    eventCallback_ = std::move(callback);
 }
 
 LibVlcPlayer::LibVlcPlayer()
@@ -68,10 +87,147 @@ bool LibVlcPlayer::openMedia(const std::string& mediaSource)
         return false;
     }
 
+    if (!attachPlayerEvents())
+    {
+        std::cout << "[LibVLC] failed to subscribe to player events.\n";
+        releaseCurrentMediaPlayer();
+        return false;
+    }
+
     applyVideoOutputWindow();
     mediaPath_ = mediaSource;
     std::cout << "[LibVLC] open: " << mediaPath_ << "\n";
     return true;
+}
+
+void LibVlcPlayer::handleLibVlcEvent(
+    const libvlc_event_t* event,
+    void* userData)
+{
+    if (event == nullptr || userData == nullptr)
+    {
+        return;
+    }
+
+    auto* player = static_cast<LibVlcPlayer*>(userData);
+    PlayerEvent translated;
+
+    switch (event->type)
+    {
+    case libvlc_MediaPlayerOpening:
+        translated.type = PlayerEventType::Opening;
+        break;
+    case libvlc_MediaPlayerBuffering:
+        translated.type = PlayerEventType::Buffering;
+        translated.bufferingPercent = std::clamp(
+            static_cast<int>(std::lround(
+                event->u.media_player_buffering.new_cache
+            )),
+            0,
+            100
+        );
+        break;
+    case libvlc_MediaPlayerPlaying:
+        translated.type = PlayerEventType::Playing;
+        break;
+    case libvlc_MediaPlayerPaused:
+        translated.type = PlayerEventType::Paused;
+        break;
+    case libvlc_MediaPlayerStopped:
+        translated.type = PlayerEventType::Stopped;
+        break;
+    case libvlc_MediaPlayerEndReached:
+        translated.type = PlayerEventType::EndReached;
+        break;
+    case libvlc_MediaPlayerEncounteredError:
+        translated.type = PlayerEventType::Error;
+        break;
+    default:
+        return;
+    }
+
+    player->dispatchPlayerEvent(translated);
+}
+
+bool LibVlcPlayer::attachPlayerEvents()
+{
+    if (mediaPlayer_ == nullptr)
+    {
+        return false;
+    }
+
+    libvlc_event_manager_t* eventManager =
+        libvlc_media_player_event_manager(mediaPlayer_);
+    if (eventManager == nullptr)
+    {
+        return false;
+    }
+
+    std::size_t attachedCount = 0;
+    for (libvlc_event_type_t eventType : kObservedPlayerEvents)
+    {
+        if (libvlc_event_attach(
+                eventManager,
+                eventType,
+                &LibVlcPlayer::handleLibVlcEvent,
+                this) != 0)
+        {
+            for (std::size_t index = 0; index < attachedCount; ++index)
+            {
+                libvlc_event_detach(
+                    eventManager,
+                    kObservedPlayerEvents[index],
+                    &LibVlcPlayer::handleLibVlcEvent,
+                    this
+                );
+            }
+            return false;
+        }
+        ++attachedCount;
+    }
+
+    playerEventsAttached_ = true;
+    return true;
+}
+
+void LibVlcPlayer::detachPlayerEvents()
+{
+    if (!playerEventsAttached_ || mediaPlayer_ == nullptr)
+    {
+        return;
+    }
+
+    libvlc_event_manager_t* eventManager =
+        libvlc_media_player_event_manager(mediaPlayer_);
+    if (eventManager != nullptr)
+    {
+        for (libvlc_event_type_t eventType : kObservedPlayerEvents)
+        {
+            libvlc_event_detach(
+                eventManager,
+                eventType,
+                &LibVlcPlayer::handleLibVlcEvent,
+                this
+            );
+        }
+    }
+
+    playerEventsAttached_ = false;
+}
+
+void LibVlcPlayer::dispatchPlayerEvent(const PlayerEvent& event)
+{
+    PlayerEventCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(eventCallbackMutex_);
+        callback = eventCallback_;
+    }
+
+    // 回调在锁外执行，避免 UI 处理过程中反向调用播放器导致死锁。
+    if (callback)
+    {
+        callback(event);
+    }
 }
 
 bool LibVlcPlayer::play()
@@ -213,6 +369,8 @@ void LibVlcPlayer::releaseCurrentMediaPlayer()
 {
     if (mediaPlayer_ != nullptr)
     {
+        // 先解绑再 stop/release，避免销毁流程产生的 Stopped 事件回调已释放对象。
+        detachPlayerEvents();
         libvlc_media_player_stop(mediaPlayer_);
         libvlc_media_player_release(mediaPlayer_);
         mediaPlayer_ = nullptr;

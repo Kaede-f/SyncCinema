@@ -175,25 +175,63 @@ if (BUILD_QT_CLIENT)
       "${Qt5_DIR}/../../../bin"
   )
   if (WINDEPLOYQT_EXECUTABLE)
+    set(SYNCCINEMA_WINDEPLOYQT_CONFIG --release)
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+      set(SYNCCINEMA_WINDEPLOYQT_CONFIG --debug)
+    endif()
+
+    set(SYNCCINEMA_WINDEPLOYQT_EXTRA_ARGS)
+    set(SYNCCINEMA_QT_CONDA_RUNTIME OFF)
+    if (SYNCCINEMA_QT_MAJOR_VERSION EQUAL 5)
+      get_target_property(
+        SYNCCINEMA_QT_WIDGETS_IMPLIB
+        ${SYNCCINEMA_QT_WIDGETS_TARGET}
+        IMPORTED_IMPLIB_RELEASE
+      )
+      if (SYNCCINEMA_QT_WIDGETS_IMPLIB MATCHES "_conda\\.lib$")
+        set(SYNCCINEMA_QT_CONDA_RUNTIME ON)
+        list(APPEND
+          SYNCCINEMA_WINDEPLOYQT_EXTRA_ARGS
+          --ignore-library-errors
+        )
+      endif()
+    endif()
+
     add_custom_command(TARGET SyncCinemaQt POST_BUILD
       COMMAND "${WINDEPLOYQT_EXECUTABLE}"
+        ${SYNCCINEMA_WINDEPLOYQT_CONFIG}
+        ${SYNCCINEMA_WINDEPLOYQT_EXTRA_ARGS}
         --no-translations
         --no-system-d3d-compiler
         "$<TARGET_FILE:SyncCinemaQt>"
       COMMENT "Deploying Qt runtime files next to SyncCinemaQt.exe"
     )
+
+    if (SYNCCINEMA_QT_CONDA_RUNTIME)
+      add_custom_command(TARGET SyncCinemaQt POST_BUILD
+      # Anaconda Qt uses a non-standard _conda DLL suffix that its own
+      # windeployqt misidentifies. Imported targets still expose exact paths,
+      # so copy the three direct runtime dependencies deterministically.
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:${SYNCCINEMA_QT_WIDGETS_TARGET}>"
+          "$<TARGET_FILE:Qt${SYNCCINEMA_QT_MAJOR_VERSION}::Gui>"
+          "$<TARGET_FILE:Qt${SYNCCINEMA_QT_MAJOR_VERSION}::Core>"
+          "$<TARGET_FILE_DIR:SyncCinemaQt>"
+        COMMENT "Copying Anaconda Qt runtime files"
+      )
+    endif()
   else()
     message(WARNING "windeployqt was not found. SyncCinemaQt will build, but its Qt runtime files must be deployed manually.")
   endif()
 endif()
 
 if (MSVC)
-  target_compile_options(SyncCinemaServer PRIVATE /utf-8)
+  target_compile_options(SyncCinemaServer PRIVATE /utf-8 /EHsc)
   if (TARGET SyncCinema)
-    target_compile_options(SyncCinema PRIVATE /utf-8)
+    target_compile_options(SyncCinema PRIVATE /utf-8 /EHsc)
   endif()
   if (TARGET SyncCinemaQt)
-    target_compile_options(SyncCinemaQt PRIVATE /utf-8)
+    target_compile_options(SyncCinemaQt PRIVATE /utf-8 /EHsc)
   endif()
 endif()
 
@@ -219,6 +257,10 @@ if (BUILD_TESTING)
     "tests/SyncCinemaCoreTests.cpp"
     "Protocol.h"
     "Protocol.cpp"
+    "PlayerController.h"
+    "PlayerController.cpp"
+    "MockPlayer.h"
+    "MockPlayer.cpp"
     "SyncCorrectionPolicy.h"
     "SyncCorrectionPolicy.cpp"
     "Room.h"
@@ -235,7 +277,7 @@ if (BUILD_TESTING)
   endif()
 
   if (MSVC)
-    target_compile_options(SyncCinemaCoreTests PRIVATE /utf-8)
+    target_compile_options(SyncCinemaCoreTests PRIVATE /utf-8 /EHsc)
   endif()
 
   if (CMAKE_VERSION VERSION_GREATER 3.12)
@@ -243,4 +285,36 @@ if (BUILD_TESTING)
   endif()
 
   add_test(NAME SyncCinemaCoreTests COMMAND SyncCinemaCoreTests)
+
+  if (WIN32 AND USE_LIBVLC)
+    add_executable(SyncCinemaPlayerEventTests
+      "tests/LibVlcPlayerEventTests.cpp"
+      "PlayerController.h"
+      "PlayerController.cpp"
+      "Protocol.h"
+    )
+    target_include_directories(
+      SyncCinemaPlayerEventTests
+      PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    configure_libvlc_target(SyncCinemaPlayerEventTests)
+
+    if (MSVC)
+      target_compile_options(
+        SyncCinemaPlayerEventTests
+        PRIVATE /utf-8 /EHsc
+      )
+    endif()
+    if (CMAKE_VERSION VERSION_GREATER 3.12)
+      set_property(
+        TARGET SyncCinemaPlayerEventTests
+        PROPERTY CXX_STANDARD 20
+      )
+    endif()
+
+    add_test(
+      NAME SyncCinemaPlayerEventTests
+      COMMAND SyncCinemaPlayerEventTests
+    )
+  endif()
 endif()

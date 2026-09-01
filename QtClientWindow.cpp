@@ -23,6 +23,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "PlayerController.h"
 #include "QtClientController.h"
 
 namespace
@@ -461,6 +462,12 @@ void QtClientWindow::connectSignals()
     );
     connect(
         controller_,
+        &QtClientController::mediaStatusChanged,
+        this,
+        &QtClientWindow::setMediaStatusUi
+    );
+    connect(
+        controller_,
         &QtClientController::errorOccurred,
         this,
         [this](const QString& message)
@@ -663,24 +670,28 @@ void QtClientWindow::setConnectedUi(bool connected)
 
     if (connected)
     {
-        videoStatusLabel_->setText(QStringLiteral("已连接"));
-        QTimer::singleShot(
-            1200,
-            videoStatusLabel_,
-            [this]()
-            {
-                if (connected_ && !busy_)
+        if (!mediaStatusVisible_)
+        {
+            videoStatusLabel_->setText(QStringLiteral("已连接"));
+            QTimer::singleShot(
+                1200,
+                videoStatusLabel_,
+                [this]()
                 {
-                    videoStatusLabel_->hide();
+                    if (connected_ && !busy_ && !mediaStatusVisible_)
+                    {
+                        videoStatusLabel_->hide();
+                    }
                 }
-            }
-        );
+            );
+        }
         // loadSettings 已恢复用户上次选择的音量；连接成功后把它应用到
         // 新创建的播放器，而不是用播放器默认值覆盖界面设置。
         controller_->setVolume(volumeSlider_->value());
     }
     else
     {
+        mediaStatusVisible_ = false;
         playbackState_ = PlaybackState::Stopped;
         playPauseButton_->setIcon(
             style()->standardIcon(QStyle::SP_MediaPlay)
@@ -690,6 +701,47 @@ void QtClientWindow::setConnectedUi(bool connected)
         videoStatusLabel_->setText(QStringLiteral("未连接"));
         videoStatusLabel_->show();
     }
+}
+
+void QtClientWindow::setMediaStatusUi(
+    int playerEventType,
+    int bufferingPercent)
+{
+    const auto eventType = static_cast<PlayerEventType>(playerEventType);
+    switch (eventType)
+    {
+    case PlayerEventType::Opening:
+        videoStatusLabel_->setText(QStringLiteral("正在打开媒体..."));
+        mediaStatusVisible_ = true;
+        break;
+    case PlayerEventType::Buffering:
+        videoStatusLabel_->setText(
+            QStringLiteral("正在缓冲... %1%").arg(bufferingPercent)
+        );
+        mediaStatusVisible_ = true;
+        break;
+    case PlayerEventType::Playing:
+    case PlayerEventType::Paused:
+        mediaStatusVisible_ = false;
+        videoStatusLabel_->hide();
+        return;
+    case PlayerEventType::Stopped:
+        videoStatusLabel_->setText(QStringLiteral("播放已停止"));
+        mediaStatusVisible_ = true;
+        break;
+    case PlayerEventType::EndReached:
+        videoStatusLabel_->setText(QStringLiteral("播放结束"));
+        mediaStatusVisible_ = true;
+        break;
+    case PlayerEventType::Error:
+        videoStatusLabel_->setText(
+            QStringLiteral("媒体播放失败，请检查地址或格式")
+        );
+        mediaStatusVisible_ = true;
+        break;
+    }
+
+    videoStatusLabel_->show();
 }
 
 void QtClientWindow::setBusyUi(

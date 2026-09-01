@@ -3,7 +3,9 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "MockPlayer.h"
 #include "Protocol.h"
 #include "Room.h"
 #include "SyncCorrectionPolicy.h"
@@ -238,6 +240,30 @@ namespace
         expect(
             !isPlaybackControlMessage(MessageType::Report),
             "REPORT is not a client control"
+        );
+    }
+
+    void testPlayerEventAbstraction()
+    {
+        ConsoleMockPlayer player;
+        std::vector<PlayerEventType> receivedEvents;
+        player.setEventCallback(
+            [&receivedEvents](const PlayerEvent& event)
+            {
+                receivedEvents.push_back(event.type);
+            }
+        );
+
+        expect(player.openMedia("movie.mp4"), "MockPlayer opens test media");
+        expect(player.play(), "MockPlayer starts playback");
+        expect(player.pause(), "MockPlayer pauses playback");
+        expect(
+            receivedEvents == std::vector<PlayerEventType>{
+                PlayerEventType::Opening,
+                PlayerEventType::Playing,
+                PlayerEventType::Paused
+            },
+            "player events stay independent from the libVLC implementation"
         );
     }
 
@@ -478,6 +504,7 @@ int main()
     testSnapshotProtocolRejectsMalformedInput();
     testMediaJoinProtocol();
     testPlaybackControlClassification();
+    testPlayerEventAbstraction();
     testRoomSnapshotAndEpoch();
     testRoomMediaSessionLifecycle();
     testCorrectionPolicySafetyGates();

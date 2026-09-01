@@ -1,6 +1,12 @@
 #include "MockPlayer.h"
 
 #include <iostream>
+#include <utility>
+
+void ConsoleMockPlayer::setEventCallback(PlayerEventCallback callback)
+{
+    eventCallback_ = std::move(callback);
+}
 
 bool ConsoleMockPlayer::openMedia(const std::string& path)
 {
@@ -8,18 +14,21 @@ bool ConsoleMockPlayer::openMedia(const std::string& path)
     positionSeconds_ = 0;
     positionMilliseconds_ = 0;
     std::cout << "[MockPlayer] open: " << mediaPath_ << "\n";
+    emitEvent(PlayerEventType::Opening);
     return true;
 }
 
 bool ConsoleMockPlayer::play()
 {
     std::cout << "[MockPlayer] play\n";
+    emitEvent(PlayerEventType::Playing);
     return true;
 }
 
 bool ConsoleMockPlayer::pause()
 {
     std::cout << "[MockPlayer] pause\n";
+    emitEvent(PlayerEventType::Paused);
     return true;
 }
 
@@ -88,4 +97,12 @@ bool ConsoleMockPlayer::setVolume(int volume)
 int ConsoleMockPlayer::getVolume() const
 {
     return volume_;
+}
+
+void ConsoleMockPlayer::emitEvent(PlayerEventType type)
+{
+    if (eventCallback_)
+    {
+        eventCallback_(PlayerEvent{ type, 0 });
+    }
 }

@@ -9,6 +9,7 @@
 class ConsoleMockPlayer : public PlayerController
 {
 public:
+    void setEventCallback(PlayerEventCallback callback) override;
     bool openMedia(const std::string& path) override;
     bool play() override;
     bool pause() override;
@@ -23,6 +24,9 @@ public:
     int getVolume() const override;
 
 private:
+    void emitEvent(PlayerEventType type);
+
+    PlayerEventCallback eventCallback_;
     std::string mediaPath_;
     int positionSeconds_ = 0;
     long long positionMilliseconds_ = 0;

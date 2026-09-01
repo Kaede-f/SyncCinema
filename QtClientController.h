@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -14,6 +15,7 @@
 
 class LibVlcPlayer;
 class SyncClientSession;
+struct PlayerEvent;
 
 // QtClientController 是 Qt 界面与纯 C++ 会话层之间的适配器。
 // 网络线程不会直接操作 QWidget，而是通过 queued signal 回到 UI 线程。
@@ -46,6 +48,7 @@ signals:
     void busyChanged(bool busy, const QString& message);
     void connectionChanged(bool connected);
     void playbackChanged(int playbackState, qint64 positionMs);
+    void mediaStatusChanged(int playerEventType, int bufferingPercent);
     void errorOccurred(const QString& message);
     void logMessage(const QString& message);
 
@@ -53,6 +56,10 @@ private:
     void sendControl(const SyncMessage& message);
     void postError(const std::string& message);
     void postLog(const std::string& message);
+    void postPlayerEvent(
+        const PlayerEvent& event,
+        std::uint64_t lifecycleGeneration
+    );
     void joinStartupThread();
     void releaseResources();
 
@@ -63,4 +70,5 @@ private:
     std::thread startupThread_;
     std::atomic_bool startupRunning_{ false };
     std::atomic_bool cancelStartup_{ false };
+    std::atomic<std::uint64_t> lifecycleGeneration_{ 0 };
 };

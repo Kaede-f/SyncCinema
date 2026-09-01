@@ -54,6 +54,10 @@ http://<server-ip>/videos/test.mp4
 - 如果房间仍有人观看另一媒体，连接会明确提示媒体不匹配。
 - 最后一个 client 离开后，本次媒体会话结束；下一部媒体不会继承旧进度。
 
+播放请求由 libVLC 异步处理，界面会在视频区域显示“正在打开媒体”和实时缓冲百分比。
+如果 URL 不存在、格式无法播放或媒体服务器异常，client 会显示明确错误并自动离开房间，
+避免黑屏客户端继续上报无效进度。播放结束时视频区域会显示“播放结束”。
+
 媒体地址、server 地址和音量会通过 `QSettings` 保存在本机，下次启动自动恢复。
 
 ## 4. 代码结构
@@ -62,7 +66,7 @@ http://<server-ip>/videos/test.mp4
 - `QtClientWindow.h/.cpp`：窗口布局、控件状态和用户交互。
 - `QtClientController.h/.cpp`：把 Qt 信号/槽适配到纯 C++ 会话层。
 - `SyncClientSession.h/.cpp`：TCP 生命周期、协议消息、播放器互斥和后台线程。
-- `PlayerController.h`：Qt 与命令行共同依赖的播放器抽象。
+- `PlayerController.h`：Qt 与命令行共同依赖的播放器控制和异步事件抽象。
 - `LibVlcPlayer.h/.cpp`：libVLC 播放、原生窗口嵌入、进度、时长和音量。
 
 ## 5. 当前边界
@@ -72,3 +76,4 @@ http://<server-ip>/videos/test.mp4
 - 同步校正策略仍是 server 端只读建议，不会自动改变客户端进度。
 - 当前媒体身份由规范化来源字符串的稳定哈希生成；它用于一致性判断，不是安全认证。
 - 当前 preset 使用本机已有 Qt/VLC SDK 路径；发布前应改为正式 Qt SDK 和可复现的打包流程。
+- `openMedia()` 只创建媒体对象；远端资源是否可播放，要在真正开始播放后由异步事件确认。

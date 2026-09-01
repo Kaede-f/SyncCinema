@@ -43,6 +43,7 @@ private:
     void updateTimeLabel(qint64 positionMs, qint64 durationMs);
     void setConnectedUi(bool connected);
     void setBusyUi(bool busy, const QString& message);
+    void setMediaStatusUi(int playerEventType, int bufferingPercent);
     QString formatTime(qint64 milliseconds) const;
 
     QtClientController* controller_ = nullptr;
@@ -70,4 +71,5 @@ private:
     PlaybackState playbackState_ = PlaybackState::Stopped;
     bool connected_ = false;
     bool busy_ = false;
+    bool mediaStatusVisible_ = false;
 };

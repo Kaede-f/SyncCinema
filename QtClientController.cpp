@@ -36,6 +36,7 @@ void QtClientController::connectToRoom(
     releaseResources();
     cancelStartup_ = false;
     startupRunning_ = true;
+    const std::uint64_t lifecycleGeneration = ++lifecycleGeneration_;
     emit busyChanged(true, QStringLiteral("正在准备播放器..."));
 
     std::string media = mediaSource.toUtf8().toStdString();
@@ -43,9 +44,21 @@ void QtClientController::connectToRoom(
     void* nativeWindow = reinterpret_cast<void*>(videoWindowId);
 
     startupThread_ = std::thread(
-        [this, media = std::move(media), server = std::move(server), nativeWindow]()
+        [
+            this,
+            media = std::move(media),
+            server = std::move(server),
+            nativeWindow,
+            lifecycleGeneration
+        ]()
         {
             auto player = std::make_unique<LibVlcPlayer>();
+            player->setEventCallback(
+                [this, lifecycleGeneration](const PlayerEvent& event)
+                {
+                    postPlayerEvent(event, lifecycleGeneration);
+                }
+            );
             if (cancelStartup_)
             {
                 startupRunning_ = false;
@@ -175,8 +188,13 @@ void QtClientController::connectToRoom(
             startupRunning_ = false;
             QMetaObject::invokeMethod(
                 this,
-                [this, metrics]()
+                [this, metrics, lifecycleGeneration]()
                 {
+                    if (lifecycleGeneration != lifecycleGeneration_)
+                    {
+                        return;
+                    }
+
                     emit logMessage(
                         QStringLiteral(
                             "[metric] connect_server_ms=%1 initial_sync_ms=%2"
@@ -195,6 +213,7 @@ void QtClientController::connectToRoom(
 
 void QtClientController::disconnectFromRoom()
 {
+    ++lifecycleGeneration_;
     cancelStartup_ = true;
     releaseResources();
     emit connectionChanged(false);
@@ -320,6 +339,45 @@ void QtClientController::postLog(const std::string& message)
     );
 }
 
+void QtClientController::postPlayerEvent(
+    const PlayerEvent& event,
+    std::uint64_t lifecycleGeneration)
+{
+    QMetaObject::invokeMethod(
+        this,
+        [this, event, lifecycleGeneration]()
+        {
+            if (lifecycleGeneration != lifecycleGeneration_)
+            {
+                return;
+            }
+
+            if (event.type == PlayerEventType::Error)
+            {
+                // 播放器失败后继续留在房间会持续上报无效进度，污染同步测量。
+                // 先断开会话，再保留明确的媒体错误提示供用户处理。
+                disconnectFromRoom();
+                emit mediaStatusChanged(
+                    static_cast<int>(event.type),
+                    event.bufferingPercent
+                );
+                emit errorOccurred(
+                    QStringLiteral(
+                        "媒体播放失败，请检查地址、文件格式或媒体服务器状态。"
+                    )
+                );
+                return;
+            }
+
+            emit mediaStatusChanged(
+                static_cast<int>(event.type),
+                event.bufferingPercent
+            );
+        },
+        Qt::QueuedConnection
+    );
+}
+
 void QtClientController::joinStartupThread()
 {
     if (startupThread_.joinable() &&
@@ -337,6 +395,11 @@ void QtClientController::releaseResources()
         std::lock_guard<std::mutex> lock(resourcesMutex_);
         session = std::move(session_);
         player = std::move(player_);
+    }
+
+    if (player)
+    {
+        player->setEventCallback({});
     }
 
     if (session)

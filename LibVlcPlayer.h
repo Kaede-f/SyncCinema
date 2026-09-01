@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <string>
 
 #include <vlc/vlc.h>
@@ -14,6 +15,7 @@ public:
     LibVlcPlayer();
     ~LibVlcPlayer() override;
 
+    void setEventCallback(PlayerEventCallback callback) override;
     bool openMedia(const std::string& mediaSource) override;
     bool play() override;
     bool pause() override;
@@ -28,6 +30,11 @@ public:
     int getVolume() const override;
 
 private:
+    static void handleLibVlcEvent(const libvlc_event_t* event, void* userData);
+
+    bool attachPlayerEvents();
+    void detachPlayerEvents();
+    void dispatchPlayerEvent(const PlayerEvent& event);
     void releaseCurrentMediaPlayer();
     libvlc_media_t* createMediaFromSource(const std::string& mediaSource);
     void applyVideoOutputWindow();
@@ -36,4 +43,7 @@ private:
     libvlc_media_player_t* mediaPlayer_ = nullptr;
     void* videoOutputWindow_ = nullptr;
     std::string mediaPath_;
+    mutable std::mutex eventCallbackMutex_;
+    PlayerEventCallback eventCallback_;
+    bool playerEventsAttached_ = false;
 };
