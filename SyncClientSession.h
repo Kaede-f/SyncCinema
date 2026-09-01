@@ -17,7 +17,8 @@ enum class SyncClientCommandSource
 {
     InitialSnapshot,
     LocalCommand,
-    RemoteCommand
+    RemoteCommand,
+    Correction
 };
 
 struct SyncClientPlaybackSnapshot
@@ -106,6 +107,10 @@ private:
         SyncClientCommandSource source,
         std::string& errorMessage
     );
+    bool executeCorrectionMessage(
+        const SyncMessage& message,
+        std::string& errorMessage
+    );
     bool sendProtocolMessage(
         const SyncMessage& message,
         std::string& errorMessage
@@ -139,6 +144,7 @@ private:
     std::atomic_bool connected_{ false };
 
     SyncState localState_;
+    long long currentControlEpoch_ = 0;
     std::string mediaIdentity_;
     std::thread receiverThread_;
     std::thread progressReportThread_;

@@ -75,7 +75,7 @@ SyncCorrectionDecision evaluateSyncCorrection(
         return decision;
     }
 
-    decision.action = SyncCorrectionAction::WouldSeekForward;
+    decision.action = SyncCorrectionAction::SeekForward;
     decision.reason = SyncCorrectionReason::PersistentSkew;
     decision.suggestedForwardMs = absoluteValue(input.medianDiffMs);
 
@@ -99,8 +99,8 @@ const char* syncCorrectionActionToString(SyncCorrectionAction action)
 {
     switch (action)
     {
-    case SyncCorrectionAction::WouldSeekForward:
-        return "would_seek_forward";
+    case SyncCorrectionAction::SeekForward:
+        return "seek_forward";
     case SyncCorrectionAction::Hold:
     default:
         return "hold";

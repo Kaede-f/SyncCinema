@@ -4,6 +4,8 @@
 #include <iostream>
 #include <vector>
 
+#include "MetricLogger.h"
+
 namespace
 {
     constexpr std::size_t kMaxPendingPingsPerClient = 64;
@@ -12,8 +14,8 @@ namespace
     constexpr std::size_t kPairWindowSize = 12;
     constexpr std::size_t kMinReadyPairWindowSamples = 6;
     constexpr SyncCorrectionPolicyConfig kCorrectionPolicyConfig{};
-    constexpr auto kCorrectionAdviceCooldown = std::chrono::milliseconds(5000);
-    constexpr auto kCorrectionAdviceLogInterval = std::chrono::milliseconds(5000);
+    constexpr auto kCorrectionCooldown = std::chrono::milliseconds(5000);
+    constexpr auto kCorrectionDecisionLogInterval = std::chrono::milliseconds(5000);
     constexpr long long kSeverePairSkewMs =
         kCorrectionPolicyConfig.seekEnterThresholdMs;
 
@@ -47,7 +49,8 @@ namespace
         bool hasRttB = false;
         long long cooldownRemainingMs = 0;
         SyncCorrectionDecision correctionDecision;
-        bool emitCorrectionAdvice = false;
+        bool emitCorrectionDecision = false;
+        bool selectedForExecution = false;
     };
 
     long long absLongLong(long long value)
@@ -231,7 +234,7 @@ void SyncMetricsCollector::recordPongReceived(
 
     if (!matchedPong)
     {
-        std::lock_guard<std::mutex> logLock(logMutex_);
+        std::lock_guard<std::mutex> logLock(metricLogMutex());
 
         std::cout << "[metric] type=rtt_sample"
             << " client=" << clientId
@@ -243,7 +246,7 @@ void SyncMetricsCollector::recordPongReceived(
     // RTT 使用 server 自己的发送时间和接收时间计算，不依赖 client/server 时钟同步。
     // 后续估算单向延迟时，先用 min_rtt/2 作为保守估计。
     {
-        std::lock_guard<std::mutex> logLock(logMutex_);
+        std::lock_guard<std::mutex> logLock(metricLogMutex());
 
         std::cout << "[metric] type=rtt_sample"
             << " client=" << clientId
@@ -278,6 +281,7 @@ void SyncMetricsCollector::beginControlEpoch(
         hasControlEpochStart_ = true;
         controlEpochStartedAt_ = now;
         pairStatsByKey_.clear();
+        lastCorrectionByClient_.clear();
 
         for (auto& [clientId, stats] : statsByClient_)
         {
@@ -301,7 +305,7 @@ void SyncMetricsCollector::beginControlEpoch(
     }
 
     {
-        std::lock_guard<std::mutex> logLock(logMutex_);
+        std::lock_guard<std::mutex> logLock(metricLogMutex());
         std::cout << "[metric] type=control_epoch"
             << " epoch=" << newEpoch
             << " command=" << messageTypeToString(controlMessage.type)
@@ -310,7 +314,8 @@ void SyncMetricsCollector::beginControlEpoch(
     }
 }
 
-void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
+std::optional<SyncCorrectionProposal>
+SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
 {
     Clock::time_point now = Clock::now();
     long long diffMs = sample.clientPositionMs - sample.roomPositionMs;
@@ -332,6 +337,8 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
     long long controlEpoch = 0;
     bool settling = false;
     std::vector<PairProgressMetric> pairMetrics;
+    std::optional<SyncCorrectionProposal> selectedProposal;
+    std::size_t selectedMetricIndex = 0;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -565,17 +572,24 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             correctionInput.hasRttA = pairMetric.hasRttA;
             correctionInput.hasRttB = pairMetric.hasRttB;
 
-            if (pairStats.hasLastWouldCorrectTime)
+            // target 尚未由策略选出时，先用 pair 的符号确定潜在落后端。
+            int potentialTargetClientId = pairMetric.medianDiffMs > 0
+                ? pairMetric.clientBId
+                : pairMetric.clientAId;
+            auto lastCorrectionIt = lastCorrectionByClient_.find(
+                potentialTargetClientId
+            );
+            if (lastCorrectionIt != lastCorrectionByClient_.end())
             {
-                long long elapsedSinceAdviceMs = elapsedMilliseconds(
-                    pairStats.lastWouldCorrectTime,
+                long long elapsedSinceCorrectionMs = elapsedMilliseconds(
+                    lastCorrectionIt->second,
                     now
                 );
-                if (elapsedSinceAdviceMs < kCorrectionAdviceCooldown.count())
+                if (elapsedSinceCorrectionMs < kCorrectionCooldown.count())
                 {
                     correctionInput.cooldownActive = true;
                     correctionInput.cooldownRemainingMs =
-                        kCorrectionAdviceCooldown.count() - elapsedSinceAdviceMs;
+                        kCorrectionCooldown.count() - elapsedSinceCorrectionMs;
                 }
             }
 
@@ -587,12 +601,29 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             );
 
             if (pairMetric.correctionDecision.action ==
-                SyncCorrectionAction::WouldSeekForward)
+                SyncCorrectionAction::SeekForward)
             {
-                // 这里只记录“如果闭环已经启用，本次会执行校正”。
-                // 记录时间用于模拟未来控制器的冷却，但绝不调用 seek。
-                pairStats.hasLastWouldCorrectTime = true;
-                pairStats.lastWouldCorrectTime = now;
+                // 一次 REPORT 可能形成多个 client pair。只选择偏差最大的一个，
+                // 将实际命令节流和生命周期管理留给 server 协调器。
+                if (!selectedProposal.has_value() ||
+                    pairMetric.correctionDecision.suggestedForwardMs >
+                        selectedProposal->forwardMilliseconds)
+                {
+                    SyncCorrectionProposal proposal;
+                    proposal.targetClientId =
+                        pairMetric.correctionDecision.targetClientId;
+                    proposal.referenceClientId =
+                        pairMetric.correctionDecision.referenceClientId;
+                    proposal.controlEpoch = pairMetric.controlEpoch;
+                    proposal.playbackState = pairMetric.playbackState;
+                    proposal.forwardMilliseconds =
+                        pairMetric.correctionDecision.suggestedForwardMs;
+                    proposal.medianDiffMs = pairMetric.medianDiffMs;
+                    proposal.medianAbsDiffMs = pairMetric.medianAbsDiffMs;
+                    proposal.p95AbsDiffMs = pairMetric.p95AbsDiffMs;
+                    selectedProposal = proposal;
+                    selectedMetricIndex = pairMetrics.size();
+                }
             }
 
             bool decisionChanged =
@@ -604,12 +635,12 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             bool periodicSummaryDue =
                 !pairStats.hasLastLoggedDecision ||
                 elapsedMilliseconds(pairStats.lastDecisionLoggedAt, now) >=
-                    kCorrectionAdviceLogInterval.count();
+                    kCorrectionDecisionLogInterval.count();
 
-            pairMetric.emitCorrectionAdvice =
+            pairMetric.emitCorrectionDecision =
                 decisionChanged || periodicSummaryDue;
 
-            if (pairMetric.emitCorrectionAdvice)
+            if (pairMetric.emitCorrectionDecision)
             {
                 pairStats.hasLastLoggedDecision = true;
                 pairStats.lastLoggedAction =
@@ -620,6 +651,12 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             }
 
             pairMetrics.push_back(pairMetric);
+        }
+
+        if (selectedProposal.has_value())
+        {
+            pairMetrics[selectedMetricIndex].selectedForExecution = true;
+            pairMetrics[selectedMetricIndex].emitCorrectionDecision = true;
         }
     }
 
@@ -634,9 +671,9 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
     // 这一行是后续同步算法的数据基础：
     // raw_diff_ms 是未补偿网络上报延迟的偏差；
     // compensated_diff_ms 会在 client 正在播放时加上估算单向延迟。
-    // 当前阶段只打印，不做 seek 或倍速校正。
+    // 真正的 seek 由 client 收到带 epoch 的 CORRECT 后执行。
     {
-        std::lock_guard<std::mutex> logLock(logMutex_);
+        std::lock_guard<std::mutex> logLock(metricLogMutex());
 
         std::cout << "[metric] type=progress_report"
             << " client=" << sample.clientId
@@ -699,19 +736,21 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 )
                 << "\n";
 
-            if (pairMetric.emitCorrectionAdvice)
+            if (pairMetric.emitCorrectionDecision)
             {
                 const SyncCorrectionDecision& decision =
                     pairMetric.correctionDecision;
 
-                std::cout << "[metric] type=correction_advice"
-                    << " mode=read_only"
+                std::cout << "[metric] type=correction_decision"
+                    << " mode=active"
                     << " client_a=" << pairMetric.clientAId
                     << " client_b=" << pairMetric.clientBId
                     << " epoch=" << pairMetric.controlEpoch
                     << " state=" << stateToString(pairMetric.playbackState)
                     << " action="
                     << syncCorrectionActionToString(decision.action)
+                    << " selected="
+                    << (pairMetric.selectedForExecution ? 1 : 0)
                     << " reason="
                     << syncCorrectionReasonToString(decision.reason)
                     << " target_client=" << decision.targetClientId
@@ -737,12 +776,29 @@ void SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             }
         }
     }
+
+    return selectedProposal;
+}
+
+void SyncMetricsCollector::recordCorrectionDispatched(
+    const SyncCorrectionProposal& proposal)
+{
+    if (proposal.targetClientId <= 0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 只有命令真正写入 socket 后才开始冷却。创建或发送失败不会压制重试。
+    // 冷却以目标 client 为单位，避免多人房间通过不同 pair 重复校正同一端。
+    lastCorrectionByClient_[proposal.targetClientId] = Clock::now();
 }
 
 void SyncMetricsCollector::removeClient(int clientId)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     statsByClient_.erase(clientId);
+    lastCorrectionByClient_.erase(clientId);
 
     for (auto it = pairStatsByKey_.begin(); it != pairStatsByKey_.end();)
     {

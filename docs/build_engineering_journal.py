@@ -1225,7 +1225,7 @@ def build_document():
     add_bullet(doc, "当前尚未在第二台真实电脑上完成 Qt 客户端的完整播放、暂停和 seek 验收。")
     add_bullet(doc, "server 端口仍固定为 9000，界面尚无房间码、用户身份和在线成员列表。")
     add_bullet(doc, "聊天、弹幕、安装器、自动更新、日志文件和崩溃收集均不属于第一版。")
-    add_bullet(doc, "只读校正建议仍未闭环执行；UI 不会自动 seek 用户播放器。")
+    add_bullet(doc, "自动硬 seek 已形成代码闭环，但尚未部署公网 server 并用两台真实电脑验证校正频率、方向和用户体感。")
     add_bullet(doc, "公开发布前应换用正式 Qt SDK，并建立可复现的 Release 打包与签名流程。")
 
     doc.add_heading("7.9 媒体会话身份与旧进度隔离", level=2)
@@ -1287,6 +1287,45 @@ def build_document():
         " target 精确复制 Qt Core、Gui 和 Widgets 运行库。",
     )
 
+    doc.add_heading("7.11 最小自动同步校正闭环", level=2)
+    add_body(
+        doc,
+        "只读 correction_advice 已经能判断谁落后、偏差是否持续，但它无法改变真实播放器。"
+        "直接把 would_seek_forward 改成 player.seek 又不安全：多个 client 同时操作时，本地先执行会让每台设备"
+        "看到不同顺序；旧窗口产生的校正也可能在一次新的 PAUSE/SEEK 后误伤播放器。"
+        "因此本阶段先建立权威控制顺序和可确认的命令生命周期，再启用最保守的单向硬 seek。",
+    )
+    add_code_block(
+        doc,
+        [
+            "client user command: PLAY / PAUSE / SEEK",
+            "  -> server Room allocates control_epoch",
+            "  -> server broadcasts CONTROL <epoch> ... to every client",
+            "  -> clients execute the same authoritative order",
+            "",
+            "REPORT windows -> SyncCorrectionProposal",
+            "  -> CORRECT <command_id> <epoch> <state> <forward_ms>",
+            "  -> target client validates and seeks forward",
+            "  -> CORRECT_RESULT <command_id> <epoch> <status> <position_ms> <reason>",
+        ],
+    )
+    add_bullet(doc, "普通控制不再由发起端立即本地执行，而是等待 server 回显 CONTROL；epoch 连续才执行，出现缺口则断开，避免明知状态已分叉仍继续播放。")
+    add_bullet(doc, "SyncMetricsCollector 一次 REPORT 最多选择一个提案，并按目标 client 冷却；三人以上房间不会因不同 pair 连续校正同一落后端。")
+    add_bullet(doc, "SyncCorrectionCoordinator 分配单调 command id，维护 10 秒 pending 表，严格匹配目标 client 与 epoch；错误来源、旧 epoch 和重复 ACK 都不能消费真实命令。")
+    add_bullet(doc, "SyncCorrectionExecutor 在 playerMutex 内复核 epoch、播放状态、seekable、目标范围和媒体时长，只允许落后端向前 seek；所有成功或拒绝路径都返回稳定 reason。")
+    add_bullet(doc, "新的用户控制会使旧 epoch pending 命令失效；同一目标只允许一条未确认命令，发送失败不进入冷却，ACK 丢失也不会叠加 seek。")
+    add_bullet(doc, "REPORT 协议显式携带 client 已应用的 control epoch；server 只接受与当前 Room epoch 完全一致的样本，防止网络中迟到的旧进度进入新窗口并误触发校正。")
+    add_bullet(doc, "心跳、JOIN、断开和主动校正发送共用连接顺序锁，避免旧 socket 关闭并复用后被心跳线程误发；所有 server-side metric 行共用一把日志锁。")
+    add_bullet(doc, "Qt、CLI 和播放器集成测试共享一个 SyncCinemaVlcRuntime 构建目标，由它统一复制 DLL 与 plugins；避免 Ninja 并行构建时多个 POST_BUILD 同时写同一目录而偶发 Permission denied。")
+    add_body(
+        doc,
+        "测试新增 CONTROL/CORRECT/CORRECT_RESULT 协议边界、协调器完整生命周期和 MockPlayer 执行器安全门。"
+        "Windows 完整构建 Qt、CLI、server 与两项测试，CTest 2/2 通过；WSL Linux server 与核心测试通过。"
+        "本机双 TCP 端烟雾测试还验证了两端收到相同 CONTROL 1 PLAY，旧 epoch REPORT 被明确拒绝，"
+        "持续约 1.2 秒偏差触发一次定向 CORRECT，server 最终匹配到 APPLIED 回执。"
+        "本阶段尚未部署云端，因此结论是‘工程闭环与跨平台回归成立’，不能提前声称真实异地同步效果已经改善。",
+    )
+
     doc.add_heading("8. 面试表达模板", level=1)
     add_body(
         doc,
@@ -1318,9 +1357,9 @@ def build_document():
         doc,
         "第四段可以这样说明控制安全性：有了相对偏差后我没有直接 seek，而是把测量、决策和执行拆成三层。"
         "纯策略层按稳定期、窗口、状态、RTT、阈值、方向一致率、连续异常和冷却逐层放行，"
-        "只输出 would_seek_forward 及可解释 reason。它只让落后端向前追赶，并通过跨平台单元测试和双客户端集成测试"
-        "验证 window_not_ready、persistent_skew、cooldown 的状态序列。当前仍是 read_only，"
-        "先用公网数据验证误触发率，再接入真正的命令执行和回执。"
+        "先用 read_only 建议验证 window_not_ready、persistent_skew、cooldown 的状态序列，再升级为最小执行闭环。"
+        "server 用权威 CONTROL epoch 统一普通操作顺序，协调器为校正分配 command id 并匹配 ACK；"
+        "client 再次验证 epoch、状态和 seek 能力后只让落后端向前追赶。这样旧命令、重复回执和 ACK 丢失都不会造成连续误跳。"
     )
 
     add_body(
@@ -1371,14 +1410,18 @@ def build_document():
     add_numbered(doc, "Room::getEstimatedStateLocked：服务器如何用基准位置与 steady_clock 维护权威状态。")
     add_numbered(doc, "SyncMetricsCollector::recordPongReceived：为什么 RTT 可以只用 server 自己的时钟计算。")
     add_numbered(doc, "SyncClientSession 的 playerMutex/sendMutex：多个线程如何安全共享播放器和同一个 TCP 字节流。")
+    add_numbered(doc, "SyncCorrectionCoordinator：pending 命令、超时、错误 client/epoch、重复 ACK 和断开清理如何构成命令生命周期。")
+    add_numbered(doc, "SyncCorrectionExecutor：为什么把播放器安全门从 Windows 会话层抽出，才能用 MockPlayer 做 Linux/Windows 同一套回归。")
+    add_numbered(doc, "CONTROL epoch：为什么本地操作也要等待 server 回显，以及 epoch gap 为什么应视为不可继续的协议错误。")
+    add_numbered(doc, "目标 client 级冷却：为什么多人房间不能只按 pair 冷却。")
+    add_numbered(doc, "MetricLogger：当指标跨多个 cpp 产生时，为什么每个类各自一把日志锁仍然不够。")
 
     doc.add_heading("10. 后续工程路线", level=1)
-    add_numbered(doc, "设计专用校正协议：携带目标 client、room epoch、目标毫秒位置和命令 id，并要求应用结果回执。")
-    add_numbered(doc, "项目功能闭环后统一部署新版 server，并把完整 Qt/VLC runtime 目录交给第二台电脑验收。")
-    add_numbered(doc, "用两台真实设备采集 read_only 建议日志，统计建议频率、方向正确率和误触发场景。")
-    add_numbered(doc, "加入最小闭环硬 seek：server 只向落后端发送，client 再次校验 epoch，执行后上报实际位置；失败时不连续重试。")
-    add_numbered(doc, "为普通控制广播加入 epoch/命令 id，完善重连后的过期消息过滤和幂等语义。")
-    add_numbered(doc, "云端闭环稳定后，再研究 250-750 ms 小偏差的温和校正；暂不贸然引入倍速控制。")
+    add_numbered(doc, "提交并推送最小自动校正闭环，随后统一部署新版 Linux server，避免客户端与旧协议 server 混用。")
+    add_numbered(doc, "用两台真实电脑完成同媒体、相同公网 server 的验收，采集 correction_decision、correction_command、correction_execution 和 correction_result 全链路日志。")
+    add_numbered(doc, "制造持续 750 ms 以上落后，验证只校正落后端、ACK 能匹配、5 秒冷却生效，并观察是否出现过冲或反复 seek。")
+    add_numbered(doc, "统计校正前后 pair median/P95、命令成功率、拒绝原因和用户可见跳转频率，再决定是否调整阈值。")
+    add_numbered(doc, "公网硬 seek 闭环稳定后，再研究 250-750 ms 小偏差的温和校正；暂不贸然引入倍速控制。")
     add_numbered(doc, "进一步同步 server/client 时钟并支持未来执行时间，让两端在约定时刻执行控制，降低广播到达差。")
     add_numbered(doc, "在 Qt 客户端上继续增加房间信息、聊天与弹幕，但不让 UI 直接处理协议字符串。")
     add_numbered(doc, "补齐 systemd 服务、配置文件、日志轮转、自动构建测试和发布包。")
@@ -1386,9 +1429,9 @@ def build_document():
     add_callout(
         doc,
         "下一阶段入口",
-        "媒体会话身份已作为 10a19af 发布，本阶段已补齐 libVLC 异步打开、缓冲、失败和结束反馈，"
-        "并用生命周期编号隔离旧播放器事件。下一步进入最小自动校正协议与执行回执；"
-        "待功能闭环，再统一部署云端并用第二台电脑完成真实用户验收。",
+        "最小自动校正已经完成代码闭环与 Windows/Linux 回归：普通控制具备权威 epoch，server 能定向派发"
+        "带 command id 的 CORRECT，client 安全执行并返回结构化结果。下一步不再扩功能，而是 review/提交后"
+        "统一部署云端，用两台真实电脑验证校正方向、频率、回执和体感，再根据数据调整阈值。",
     )
 
     doc.save(OUTPUT_PATH)

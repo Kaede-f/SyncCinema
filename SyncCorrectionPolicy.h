@@ -4,7 +4,7 @@
 
 #include "Protocol.h"
 
-// 只读校正策略的输入。
+// 同步校正策略的输入。
 //
 // 这些字段全部来自 SyncMetricsCollector 已经完成时间归一化后的稳健窗口，
 // 策略层不访问 socket、Room 或播放器，因此可以独立测试。
@@ -44,7 +44,7 @@ struct SyncCorrectionPolicyConfig
 enum class SyncCorrectionAction
 {
     Hold,
-    WouldSeekForward
+    SeekForward
 };
 
 enum class SyncCorrectionReason
@@ -66,11 +66,25 @@ struct SyncCorrectionDecision
     SyncCorrectionAction action = SyncCorrectionAction::Hold;
     SyncCorrectionReason reason = SyncCorrectionReason::WindowNotReady;
 
-    // 只建议让落后的 client 向前追赶，不建议把领先端向后拉。
-    // 这样未来接入真实控制时，可以减少用户可见的重复画面。
+    // 只让落后的 client 向前追赶，不把领先端向后拉，
+    // 避免用户看到已经播放过的画面。
     int targetClientId = 0;
     int referenceClientId = 0;
     long long suggestedForwardMs = 0;
+};
+
+// Metrics 层只负责从观测窗口中选出一个可信的校正目标。
+// command id、发送、超时和回执匹配由 server 的协调器负责。
+struct SyncCorrectionProposal
+{
+    int targetClientId = 0;
+    int referenceClientId = 0;
+    long long controlEpoch = 0;
+    PlaybackState playbackState = PlaybackState::Stopped;
+    long long forwardMilliseconds = 0;
+    long long medianDiffMs = 0;
+    long long medianAbsDiffMs = 0;
+    long long p95AbsDiffMs = 0;
 };
 
 SyncCorrectionDecision evaluateSyncCorrection(

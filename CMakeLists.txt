@@ -49,16 +49,29 @@ function(configure_libvlc_target target_name)
   endif()
 
   if (VLC_RUNTIME_DIR)
-    add_custom_command(TARGET ${target_name} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${VLC_RUNTIME_DIR}/libvlc.dll"
-        "${VLC_RUNTIME_DIR}/libvlccore.dll"
-        "$<TARGET_FILE_DIR:${target_name}>"
-      COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${VLC_RUNTIME_DIR}/plugins"
-        "$<TARGET_FILE_DIR:${target_name}>/plugins"
-      COMMENT "Copying VLC runtime files next to ${target_name}"
-    )
+    # CLI、Qt 和集成测试位于同一输出目录。若每个目标都在 POST_BUILD
+    # 并行复制 plugins，Ninja 会让多个 copy_directory 互相争用。
+    # 共享依赖目标在一次构建中只执行一次，所有播放器目标再并行链接。
+    if (NOT TARGET SyncCinemaVlcRuntime)
+      get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+      if (is_multi_config)
+        set(vlc_runtime_output_dir "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>")
+      else()
+        set(vlc_runtime_output_dir "${CMAKE_CURRENT_BINARY_DIR}")
+      endif()
+
+      add_custom_target(SyncCinemaVlcRuntime
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${VLC_RUNTIME_DIR}/libvlc.dll"
+          "${VLC_RUNTIME_DIR}/libvlccore.dll"
+          "${vlc_runtime_output_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${VLC_RUNTIME_DIR}/plugins"
+          "${vlc_runtime_output_dir}/plugins"
+        COMMENT "Copying shared VLC runtime files"
+      )
+    endif()
+    add_dependencies(${target_name} SyncCinemaVlcRuntime)
   endif()
 endfunction()
 
@@ -72,8 +85,11 @@ add_executable(SyncCinemaServer
   "Room.cpp"
   "SyncMetrics.h"
   "SyncMetrics.cpp"
+  "MetricLogger.h"
   "SyncCorrectionPolicy.h"
   "SyncCorrectionPolicy.cpp"
+  "SyncCorrectionCoordinator.h"
+  "SyncCorrectionCoordinator.cpp"
   "SyncServer.h"
   "SyncServer.cpp"
   "NetSocket.h"
@@ -101,8 +117,11 @@ if (WIN32)
     "Room.cpp"
     "SyncMetrics.h"
     "SyncMetrics.cpp"
+    "MetricLogger.h"
     "SyncCorrectionPolicy.h"
     "SyncCorrectionPolicy.cpp"
+    "SyncCorrectionCoordinator.h"
+    "SyncCorrectionCoordinator.cpp"
     "SyncServer.h"
     "SyncServer.cpp"
     "NetSocket.h"
@@ -111,6 +130,8 @@ if (WIN32)
     "Client.cpp"
     "SyncClientSession.h"
     "SyncClientSession.cpp"
+    "SyncCorrectionExecutor.h"
+    "SyncCorrectionExecutor.cpp"
   )
 
   # Link Windows socket library.
@@ -147,6 +168,8 @@ if (BUILD_QT_CLIENT)
     "QtMsvcCompatibility.h"
     "SyncClientSession.h"
     "SyncClientSession.cpp"
+    "SyncCorrectionExecutor.h"
+    "SyncCorrectionExecutor.cpp"
     "Protocol.h"
     "Protocol.cpp"
     "PlayerController.h"
@@ -263,6 +286,10 @@ if (BUILD_TESTING)
     "MockPlayer.cpp"
     "SyncCorrectionPolicy.h"
     "SyncCorrectionPolicy.cpp"
+    "SyncCorrectionCoordinator.h"
+    "SyncCorrectionCoordinator.cpp"
+    "SyncCorrectionExecutor.h"
+    "SyncCorrectionExecutor.cpp"
     "Room.h"
     "Room.cpp"
     "NetSocket.h"

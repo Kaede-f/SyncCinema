@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "Protocol.h"
@@ -21,7 +22,7 @@ struct SyncMetricSample
     PlaybackState roomState = PlaybackState::Stopped;
 };
 
-// SyncMetricsCollector 只做日志分析和只读校正建议，不控制真实播放器。
+// SyncMetricsCollector 负责日志分析，并从可信窗口中产出校正提案。
 //
 // 当前同时观察两类偏差：
 //   1. client 与 Room 理论进度的偏差，用于发现播放器整体落后于房间时钟；
@@ -42,7 +43,10 @@ public:
     // controlEpoch 由 Room 生成，metrics 只消费它，避免出现两套版本号各自递增。
     void beginControlEpoch(long long controlEpoch, const SyncMessage& controlMessage);
 
-    void recordProgressReport(const SyncMetricSample& sample);
+    std::optional<SyncCorrectionProposal> recordProgressReport(
+        const SyncMetricSample& sample
+    );
+    void recordCorrectionDispatched(const SyncCorrectionProposal& proposal);
     void removeClient(int clientId);
 
 private:
@@ -80,12 +84,7 @@ private:
         std::deque<long long> recentDiffMs;
         int consecutiveSevereSamples = 0;
 
-        // 只读阶段也模拟未来控制器的冷却状态。
-        // 它只限制 would_seek 日志频率，不会调用任何播放器 API。
-        bool hasLastWouldCorrectTime = false;
-        Clock::time_point lastWouldCorrectTime{};
-
-        // 相同建议只在状态变化或定期摘要时输出，避免每秒重复刷屏。
+        // 相同决策只在状态变化或定期摘要时输出，避免每秒重复刷屏。
         bool hasLastLoggedDecision = false;
         SyncCorrectionAction lastLoggedAction = SyncCorrectionAction::Hold;
         SyncCorrectionReason lastLoggedReason = SyncCorrectionReason::WindowNotReady;
@@ -93,9 +92,9 @@ private:
     };
 
     std::mutex mutex_;
-    std::mutex logMutex_; // 保护指标日志输出
     std::unordered_map<int, ClientStats> statsByClient_;
     std::unordered_map<std::uint64_t, PairWindowStats> pairStatsByKey_;
+    std::unordered_map<int, Clock::time_point> lastCorrectionByClient_;
 
     long long currentControlEpoch_ = 0;
     bool hasControlEpochStart_ = false;

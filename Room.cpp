@@ -103,7 +103,7 @@ void Room::removeClient(SocketHandle clientSocket)
     }
 }
 
-bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message)
+bool Room::broadcastControlMessage(const SyncMessage& message)
 {
     if (!isPlaybackControlMessage(message.type))
     {
@@ -111,10 +111,9 @@ bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage&
         return false;
     }
 
-    std::string tcpMessage = messageToString(message);
-
     std::vector<ClientConnection> targets;
     SyncState stateSnapshot;
+    SyncMessage authoritativeMessage = message;
 
     {
         // 只在访问共享数据时持有锁。
@@ -124,16 +123,12 @@ bool Room::broadcastControlMessage(SocketHandle senderSocket, const SyncMessage&
         Clock::time_point now = Clock::now();
         applyControlMessageLocked(message, now);
         ++controlEpoch_;
+        authoritativeMessage.controlEpoch = controlEpoch_;
         stateSnapshot = getEstimatedStateLocked(now);
-
-        for (const ClientConnection& client : clients_)
-        {
-            if (client.socket != senderSocket)
-            {
-                targets.push_back(client);
-            }
-        }
+        targets = clients_;
     }
+
+    std::string tcpMessage = messageToString(authoritativeMessage);
 
     std::cout << "room state: " << syncStateToString(stateSnapshot) << "\n";
     std::cout << "broadcasting to " << targets.size() << " client(s): " << tcpMessage;
@@ -159,6 +154,29 @@ bool Room::sendMessageToClient(SocketHandle clientSocket, const SyncMessage& mes
     }
 
     return sendRawMessage(clientSocket, tcpMessage);
+}
+
+bool Room::sendMessageToClientId(int clientId, const SyncMessage& message)
+{
+    SocketHandle targetSocket = kInvalidSocket;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto target = std::find_if(
+            clients_.begin(),
+            clients_.end(),
+            [clientId](const ClientConnection& client)
+            {
+                return client.id == clientId;
+            }
+        );
+        if (target == clients_.end())
+        {
+            return false;
+        }
+        targetSocket = target->socket;
+    }
+
+    return sendMessageToClient(targetSocket, message);
 }
 
 SyncState Room::getState() const
@@ -250,6 +268,8 @@ void Room::applyControlMessageLocked(const SyncMessage& message, Clock::time_poi
     case MessageType::Join:
     case MessageType::JoinRejected:
     case MessageType::Snapshot:
+    case MessageType::Correction:
+    case MessageType::CorrectionResult:
     case MessageType::Unknown:
         break;
     }

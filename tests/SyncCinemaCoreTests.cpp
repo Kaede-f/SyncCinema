@@ -9,6 +9,8 @@
 #include "Protocol.h"
 #include "Room.h"
 #include "SyncCorrectionPolicy.h"
+#include "SyncCorrectionCoordinator.h"
+#include "SyncCorrectionExecutor.h"
 
 namespace
 {
@@ -175,9 +177,14 @@ namespace
         seek.type = MessageType::Seek;
         seek.positionSeconds = 95;
         seek.positionMilliseconds = 95000;
+        // 这里使用的是测试用伪 socket，权威 CONTROL 回显会发送失败；
+        // Room 的状态更新和网络写入是两个独立结果，生命周期测试只验证前者。
+        room.broadcastControlMessage(seek);
+        RoomSnapshot afterSeek = room.getSnapshot();
         expect(
-            room.broadcastControlMessage(firstSocket, seek),
-            "active media session accepts playback controls"
+            afterSeek.controlEpoch == 1 &&
+                afterSeek.state.positionMilliseconds == 95000,
+            "active media session applies playback controls"
         );
 
         RoomJoinResult mismatchedJoin = room.joinClient(
@@ -243,6 +250,114 @@ namespace
         );
     }
 
+    void testProgressReportCarriesControlEpoch()
+    {
+        SyncMessage report;
+        report.type = MessageType::Report;
+        report.controlEpoch = 8;
+        report.positionMilliseconds = 65432;
+        report.positionSeconds = 65;
+        report.playbackState = PlaybackState::Playing;
+
+        std::string wireText = messageToString(report);
+        expect(
+            wireText == "REPORT 8 65432 Playing\n",
+            "REPORT serializes its authoritative control epoch"
+        );
+
+        SyncMessage parsed = stringToMessage(wireText);
+        expect(
+            parsed.type == MessageType::Report &&
+                parsed.controlEpoch == 8 &&
+                parsed.positionMilliseconds == 65432 &&
+                parsed.playbackState == PlaybackState::Playing,
+            "REPORT epoch, position and state round-trip"
+        );
+        expect(
+            stringToMessage("REPORT 65432 Playing").type ==
+                MessageType::Unknown,
+            "legacy REPORT without an epoch is rejected"
+        );
+        expect(
+            stringToMessage("REPORT -1 65432 Playing").type ==
+                MessageType::Unknown,
+            "REPORT rejects a negative control epoch"
+        );
+    }
+
+    void testAuthoritativeControlAndCorrectionProtocol()
+    {
+        SyncMessage authoritativeSeek;
+        authoritativeSeek.type = MessageType::Seek;
+        authoritativeSeek.controlEpoch = 9;
+        authoritativeSeek.positionMilliseconds = 123456;
+        authoritativeSeek.positionSeconds = 123;
+
+        std::string controlWire = messageToString(authoritativeSeek);
+        expect(
+            controlWire == "CONTROL 9 SEEK 123456\n",
+            "authoritative SEEK carries epoch and millisecond position"
+        );
+        SyncMessage parsedControl = stringToMessage(controlWire);
+        expect(
+            parsedControl.type == MessageType::Seek &&
+                parsedControl.controlEpoch == 9 &&
+                parsedControl.positionMilliseconds == 123456,
+            "authoritative CONTROL round-trips"
+        );
+
+        SyncMessage correction;
+        correction.type = MessageType::Correction;
+        correction.commandId = 42;
+        correction.controlEpoch = 9;
+        correction.playbackState = PlaybackState::Playing;
+        correction.correctionForwardMilliseconds = 875;
+        SyncMessage parsedCorrection = stringToMessage(
+            messageToString(correction)
+        );
+        expect(
+            parsedCorrection.type == MessageType::Correction &&
+                parsedCorrection.commandId == 42 &&
+                parsedCorrection.controlEpoch == 9 &&
+                parsedCorrection.playbackState == PlaybackState::Playing &&
+                parsedCorrection.correctionForwardMilliseconds == 875,
+            "CORRECT round-trips with command, epoch, state and offset"
+        );
+
+        SyncMessage result;
+        result.type = MessageType::CorrectionResult;
+        result.commandId = 42;
+        result.controlEpoch = 9;
+        result.correctionResultStatus = CorrectionResultStatus::Applied;
+        result.positionMilliseconds = 124331;
+        result.correctionReason = "OK";
+        SyncMessage parsedResult = stringToMessage(messageToString(result));
+        expect(
+            parsedResult.type == MessageType::CorrectionResult &&
+                parsedResult.commandId == 42 &&
+                parsedResult.correctionResultStatus ==
+                    CorrectionResultStatus::Applied &&
+                parsedResult.positionMilliseconds == 124331 &&
+                parsedResult.correctionReason == "OK",
+            "CORRECT_RESULT round-trips an applied acknowledgement"
+        );
+
+        expect(
+            stringToMessage("CONTROL 0 PLAY").type == MessageType::Unknown,
+            "CONTROL rejects a non-positive epoch"
+        );
+        expect(
+            stringToMessage("CORRECT 1 2 Stopped 800").type ==
+                MessageType::Unknown,
+            "CORRECT rejects inactive playback"
+        );
+        expect(
+            stringToMessage("CORRECT_RESULT 1 2 APPLIED 1000 FAILED").type ==
+                MessageType::Unknown,
+            "applied CORRECT_RESULT requires the OK reason"
+        );
+    }
+
     void testPlayerEventAbstraction()
     {
         ConsoleMockPlayer player;
@@ -287,7 +402,7 @@ namespace
         seek.positionSeconds = 12;
         seek.positionMilliseconds = 12000;
         expect(
-            room.broadcastControlMessage(kInvalidSocket, seek),
+            room.broadcastControlMessage(seek),
             "Room accepts SEEK without connected clients"
         );
 
@@ -301,7 +416,7 @@ namespace
         SyncMessage play;
         play.type = MessageType::Play;
         expect(
-            room.broadcastControlMessage(kInvalidSocket, play),
+            room.broadcastControlMessage(play),
             "Room accepts PLAY without connected clients"
         );
 
@@ -320,7 +435,7 @@ namespace
         SyncMessage pause;
         pause.type = MessageType::Pause;
         expect(
-            room.broadcastControlMessage(kInvalidSocket, pause),
+            room.broadcastControlMessage(pause),
             "Room accepts PAUSE without connected clients"
         );
 
@@ -338,7 +453,7 @@ namespace
         forgedSnapshot.positionMilliseconds = 999000;
 
         expect(
-            !room.broadcastControlMessage(kInvalidSocket, forgedSnapshot),
+            !room.broadcastControlMessage(forgedSnapshot),
             "Room refuses a forged SNAPSHOT as a control"
         );
         expect(
@@ -423,7 +538,7 @@ namespace
         input.medianAbsDiffMs = 750;
         expect(
             evaluateSyncCorrection(input).action ==
-                SyncCorrectionAction::WouldSeekForward,
+                SyncCorrectionAction::SeekForward,
             "the hard-seek entry threshold uses an inclusive boundary"
         );
 
@@ -458,7 +573,7 @@ namespace
         input.hasRttB = false;
         expect(
             evaluateSyncCorrection(input).action ==
-                SyncCorrectionAction::WouldSeekForward,
+                SyncCorrectionAction::SeekForward,
             "paused positions can be compared without an RTT projection"
         );
     }
@@ -468,8 +583,8 @@ namespace
         SyncCorrectionInput input = makePersistentSkewInput();
         SyncCorrectionDecision decision = evaluateSyncCorrection(input);
         expect(
-            decision.action == SyncCorrectionAction::WouldSeekForward,
-            "persistent stable skew produces a read-only seek suggestion"
+            decision.action == SyncCorrectionAction::SeekForward,
+            "persistent stable skew produces a forward seek decision"
         );
         expect(
             decision.reason == SyncCorrectionReason::PersistentSkew,
@@ -496,6 +611,212 @@ namespace
             "negative pair diff becomes a positive forward offset"
         );
     }
+
+    SyncCorrectionProposal makeCorrectionProposal()
+    {
+        SyncCorrectionProposal proposal;
+        proposal.targetClientId = 2;
+        proposal.referenceClientId = 1;
+        proposal.controlEpoch = 7;
+        proposal.playbackState = PlaybackState::Playing;
+        proposal.forwardMilliseconds = 900;
+        proposal.medianAbsDiffMs = 900;
+        proposal.p95AbsDiffMs = 1050;
+        return proposal;
+    }
+
+    SyncMessage makeAppliedCorrectionResult(const SyncMessage& command)
+    {
+        SyncMessage result;
+        result.type = MessageType::CorrectionResult;
+        result.commandId = command.commandId;
+        result.controlEpoch = command.controlEpoch;
+        result.correctionResultStatus = CorrectionResultStatus::Applied;
+        result.positionMilliseconds = 120900;
+        result.correctionReason = "OK";
+        return result;
+    }
+
+    void testCorrectionCoordinatorLifecycle()
+    {
+        SyncCorrectionCoordinator coordinator;
+        SyncCorrectionCoordinator::Clock::time_point startedAt{};
+        std::optional<SyncMessage> command = coordinator.createCommand(
+            makeCorrectionProposal(),
+            startedAt
+        );
+        expect(command.has_value(), "coordinator creates a valid command");
+        expect(
+            command->commandId == 1 && command->type == MessageType::Correction,
+            "coordinator assigns a monotonic command id"
+        );
+        expect(
+            coordinator.pendingCommandCount() == 1,
+            "created correction remains pending until acknowledgement"
+        );
+        expect(
+            !coordinator.createCommand(
+                makeCorrectionProposal(),
+                startedAt + std::chrono::milliseconds(1)
+            ).has_value(),
+            "one client cannot have two pending correction commands"
+        );
+
+        SyncMessage result = makeAppliedCorrectionResult(*command);
+        CorrectionResultRecord wrongClient = coordinator.recordResult(
+            3,
+            result,
+            startedAt + std::chrono::milliseconds(10)
+        );
+        expect(
+            wrongClient.matchStatus == CorrectionResultMatchStatus::WrongClient &&
+                coordinator.pendingCommandCount() == 1,
+            "wrong client cannot consume another client's command"
+        );
+
+        result.controlEpoch = 8;
+        CorrectionResultRecord wrongEpoch = coordinator.recordResult(
+            2,
+            result,
+            startedAt + std::chrono::milliseconds(20)
+        );
+        expect(
+            wrongEpoch.matchStatus == CorrectionResultMatchStatus::EpochMismatch &&
+                coordinator.pendingCommandCount() == 1,
+            "wrong epoch cannot consume the pending command"
+        );
+
+        result.controlEpoch = command->controlEpoch;
+        CorrectionResultRecord matched = coordinator.recordResult(
+            2,
+            result,
+            startedAt + std::chrono::milliseconds(37)
+        );
+        expect(
+            matched.matchStatus == CorrectionResultMatchStatus::Matched &&
+                matched.acknowledgementLatencyMs == 37 &&
+                coordinator.pendingCommandCount() == 0,
+            "matching result completes the command and records latency"
+        );
+        expect(
+            coordinator.recordResult(2, result).matchStatus ==
+                CorrectionResultMatchStatus::UnknownCommand,
+            "duplicate acknowledgement is reported as unknown"
+        );
+
+        std::optional<SyncMessage> failedDispatch = coordinator.createCommand(
+            makeCorrectionProposal()
+        );
+        expect(
+            failedDispatch.has_value() &&
+                coordinator.markDispatchFailed(failedDispatch->commandId) &&
+                coordinator.pendingCommandCount() == 0,
+            "failed socket dispatch removes the pending command"
+        );
+
+        std::optional<SyncMessage> removedClientCommand =
+            coordinator.createCommand(makeCorrectionProposal());
+        coordinator.removeClient(1);
+        expect(
+            removedClientCommand.has_value() &&
+                coordinator.pendingCommandCount() == 0,
+            "disconnecting either endpoint clears related commands"
+        );
+    }
+
+    void testCorrectionCoordinatorInvalidatesOldEpochs()
+    {
+        SyncCorrectionCoordinator coordinator;
+        SyncCorrectionProposal epochSeven = makeCorrectionProposal();
+        SyncCorrectionProposal epochEight = epochSeven;
+        epochEight.controlEpoch = 8;
+        epochEight.targetClientId = 3;
+
+        expect(
+            coordinator.createCommand(epochSeven).has_value() &&
+                coordinator.createCommand(epochEight).has_value(),
+            "coordinator accepts commands from test epochs"
+        );
+        coordinator.retainControlEpoch(8);
+        expect(
+            coordinator.pendingCommandCount() == 1,
+            "new authoritative control invalidates older correction commands"
+        );
+
+        SyncCorrectionCoordinator timeoutCoordinator;
+        SyncCorrectionCoordinator::Clock::time_point startedAt{};
+        expect(
+            timeoutCoordinator.createCommand(epochSeven, startedAt).has_value(),
+            "timeout test creates an initial command"
+        );
+        expect(
+            timeoutCoordinator.createCommand(
+                epochSeven,
+                startedAt + std::chrono::seconds(11)
+            ).has_value(),
+            "expired unacknowledged command no longer blocks retry"
+        );
+    }
+
+    void testCorrectionExecutorSafetyAndApplication()
+    {
+        ConsoleMockPlayer player;
+        expect(player.openMedia("movie.mp4"), "executor test opens media");
+
+        SyncState localState;
+        localState.state = PlaybackState::Playing;
+
+        SyncMessage command;
+        command.type = MessageType::Correction;
+        command.commandId = 1;
+        command.controlEpoch = 4;
+        command.playbackState = PlaybackState::Playing;
+        command.correctionForwardMilliseconds = 900;
+
+        SyncCorrectionExecution applied = executeSyncCorrection(
+            command,
+            4,
+            localState,
+            player
+        );
+        expect(
+            applied.applied &&
+                applied.resultMessage.correctionResultStatus ==
+                    CorrectionResultStatus::Applied &&
+                applied.resultMessage.positionMilliseconds == 900,
+            "matching correction seeks the lagging player forward"
+        );
+
+        command.commandId = 2;
+        command.controlEpoch = 3;
+        SyncCorrectionExecution stale = executeSyncCorrection(
+            command,
+            4,
+            localState,
+            player
+        );
+        expect(
+            !stale.applied &&
+                stale.resultMessage.correctionReason == "EPOCH_MISMATCH" &&
+                player.getPositionMilliseconds() == 900,
+            "stale correction cannot move the player"
+        );
+
+        ConsoleMockPlayer unopenedPlayer;
+        command.commandId = 3;
+        command.controlEpoch = 4;
+        SyncCorrectionExecution notSeekable = executeSyncCorrection(
+            command,
+            4,
+            localState,
+            unopenedPlayer
+        );
+        expect(
+            !notSeekable.applied &&
+                notSeekable.resultMessage.correctionReason == "NOT_SEEKABLE",
+            "correction reports a stable reason when media is not seekable"
+        );
+    }
 }
 
 int main()
@@ -504,11 +825,16 @@ int main()
     testSnapshotProtocolRejectsMalformedInput();
     testMediaJoinProtocol();
     testPlaybackControlClassification();
+    testProgressReportCarriesControlEpoch();
+    testAuthoritativeControlAndCorrectionProtocol();
     testPlayerEventAbstraction();
     testRoomSnapshotAndEpoch();
     testRoomMediaSessionLifecycle();
     testCorrectionPolicySafetyGates();
     testCorrectionPolicySelectsLaggingClient();
+    testCorrectionCoordinatorLifecycle();
+    testCorrectionCoordinatorInvalidatesOldEpochs();
+    testCorrectionExecutorSafetyAndApplication();
 
     if (failureCount != 0)
     {

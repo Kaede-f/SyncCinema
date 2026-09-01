@@ -76,6 +76,23 @@ namespace
             }
         );
     }
+
+    bool stringToCorrectionResultStatus(
+        const std::string& text,
+        CorrectionResultStatus& status)
+    {
+        if (text == "APPLIED")
+        {
+            status = CorrectionResultStatus::Applied;
+            return true;
+        }
+        if (text == "REJECTED")
+        {
+            status = CorrectionResultStatus::Rejected;
+            return true;
+        }
+        return false;
+    }
 }
 
 std::string stateToString(PlaybackState state)
@@ -115,8 +132,26 @@ std::string messageTypeToString(MessageType type)
         return "REJECT";
     case MessageType::Snapshot:
         return "SNAPSHOT";
+    case MessageType::Correction:
+        return "CORRECT";
+    case MessageType::CorrectionResult:
+        return "CORRECT_RESULT";
     default:
         return "UNKNOWN";
+    }
+}
+
+std::string correctionResultStatusToString(CorrectionResultStatus status)
+{
+    switch (status)
+    {
+    case CorrectionResultStatus::Applied:
+        return "APPLIED";
+    case CorrectionResultStatus::Rejected:
+        return "REJECTED";
+    case CorrectionResultStatus::None:
+    default:
+        return "NONE";
     }
 }
 
@@ -156,13 +191,30 @@ std::string messageToString(const SyncMessage& message)
     switch (message.type)
     {
     case MessageType::Play:
+        if (message.controlEpoch > 0)
+        {
+            return "CONTROL " + std::to_string(message.controlEpoch) +
+                " PLAY\n";
+        }
         return "PLAY\n";
     case MessageType::Pause:
+        if (message.controlEpoch > 0)
+        {
+            return "CONTROL " + std::to_string(message.controlEpoch) +
+                " PAUSE\n";
+        }
         return "PAUSE\n";
     case MessageType::Seek:
+        if (message.controlEpoch > 0)
+        {
+            return "CONTROL " + std::to_string(message.controlEpoch) +
+                " SEEK " + std::to_string(message.positionMilliseconds) +
+                "\n";
+        }
         return "SEEK " + std::to_string(message.positionSeconds) + "\n";
     case MessageType::Report:
-        return "REPORT " + std::to_string(message.positionMilliseconds) +
+        return "REPORT " + std::to_string(message.controlEpoch) +
+            " " + std::to_string(message.positionMilliseconds) +
             " " + stateToString(message.playbackState) + "\n";
     case MessageType::Ping:
         return "PING " + std::to_string(message.sequenceNumber) + "\n";
@@ -177,6 +229,20 @@ std::string messageToString(const SyncMessage& message)
             " " + stateToString(message.playbackState) +
             " " + std::to_string(message.positionMilliseconds) +
             " " + message.mediaIdentity + "\n";
+    case MessageType::Correction:
+        return "CORRECT " + std::to_string(message.commandId) +
+            " " + std::to_string(message.controlEpoch) +
+            " " + stateToString(message.playbackState) +
+            " " + std::to_string(message.correctionForwardMilliseconds) +
+            "\n";
+    case MessageType::CorrectionResult:
+        return "CORRECT_RESULT " + std::to_string(message.commandId) +
+            " " + std::to_string(message.controlEpoch) +
+            " " + correctionResultStatusToString(
+                message.correctionResultStatus
+            ) +
+            " " + std::to_string(message.positionMilliseconds) +
+            " " + message.correctionReason + "\n";
     default:
         return "UNKNOWN\n";
     }
@@ -202,6 +268,51 @@ SyncMessage stringToMessage(const std::string& tcpString)
         }
 
         message.type = MessageType::Play;
+        return message;
+    }
+
+    if (command == "CONTROL")
+    {
+        long long controlEpoch = 0;
+        std::string controlType;
+        std::string extra;
+        if (!(iss >> controlEpoch) || controlEpoch <= 0 ||
+            !(iss >> controlType))
+        {
+            return message;
+        }
+
+        if (controlType == "PLAY" || controlType == "PAUSE")
+        {
+            if (iss >> extra)
+            {
+                return message;
+            }
+            message.type = controlType == "PLAY"
+                ? MessageType::Play
+                : MessageType::Pause;
+        }
+        else if (controlType == "SEEK")
+        {
+            long long positionMilliseconds = 0;
+            if (!(iss >> positionMilliseconds) ||
+                !isValidPositionMilliseconds(positionMilliseconds) ||
+                (iss >> extra))
+            {
+                return message;
+            }
+            message.type = MessageType::Seek;
+            message.positionMilliseconds = positionMilliseconds;
+            message.positionSeconds = static_cast<int>(
+                positionMilliseconds / 1000
+            );
+        }
+        else
+        {
+            return message;
+        }
+
+        message.controlEpoch = controlEpoch;
         return message;
     }
 
@@ -235,12 +346,14 @@ SyncMessage stringToMessage(const std::string& tcpString)
 
     if (command == "REPORT")
     {
+        long long controlEpoch = 0;
         long long milliseconds = 0;
         std::string stateText;
         std::string extra;
         PlaybackState playbackState = PlaybackState::Stopped;
 
-        if (!(iss >> milliseconds) ||
+        if (!(iss >> controlEpoch) || controlEpoch < 0 ||
+            !(iss >> milliseconds) ||
             !isValidPositionMilliseconds(milliseconds) ||
             !(iss >> stateText) ||
             !stringToPlaybackState(stateText, playbackState) ||
@@ -250,6 +363,7 @@ SyncMessage stringToMessage(const std::string& tcpString)
         }
 
         message.type = MessageType::Report;
+        message.controlEpoch = controlEpoch;
         message.positionMilliseconds = milliseconds;
         message.positionSeconds = static_cast<int>(milliseconds / 1000);
         message.playbackState = playbackState;
@@ -334,6 +448,71 @@ SyncMessage stringToMessage(const std::string& tcpString)
         return message;
     }
 
+    if (command == "CORRECT")
+    {
+        long long commandId = 0;
+        long long controlEpoch = 0;
+        long long forwardMilliseconds = 0;
+        std::string stateText;
+        std::string extra;
+        PlaybackState playbackState = PlaybackState::Stopped;
+
+        if (!(iss >> commandId) || commandId <= 0 ||
+            !(iss >> controlEpoch) || controlEpoch <= 0 ||
+            !(iss >> stateText) ||
+            !stringToPlaybackState(stateText, playbackState) ||
+            playbackState == PlaybackState::Stopped ||
+            !(iss >> forwardMilliseconds) || forwardMilliseconds <= 0 ||
+            !isValidPositionMilliseconds(forwardMilliseconds) ||
+            (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = MessageType::Correction;
+        message.commandId = commandId;
+        message.controlEpoch = controlEpoch;
+        message.playbackState = playbackState;
+        message.correctionForwardMilliseconds = forwardMilliseconds;
+        return message;
+    }
+
+    if (command == "CORRECT_RESULT")
+    {
+        long long commandId = 0;
+        long long controlEpoch = 0;
+        long long actualPositionMilliseconds = 0;
+        std::string statusText;
+        std::string reason;
+        std::string extra;
+        CorrectionResultStatus status = CorrectionResultStatus::None;
+
+        if (!(iss >> commandId) || commandId <= 0 ||
+            !(iss >> controlEpoch) || controlEpoch <= 0 ||
+            !(iss >> statusText) ||
+            !stringToCorrectionResultStatus(statusText, status) ||
+            !(iss >> actualPositionMilliseconds) ||
+            !isValidPositionMilliseconds(actualPositionMilliseconds) ||
+            !(iss >> reason) || !isValidRejectionReason(reason) ||
+            (status == CorrectionResultStatus::Applied && reason != "OK") ||
+            (status == CorrectionResultStatus::Rejected && reason == "OK") ||
+            (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = MessageType::CorrectionResult;
+        message.commandId = commandId;
+        message.controlEpoch = controlEpoch;
+        message.correctionResultStatus = status;
+        message.positionMilliseconds = actualPositionMilliseconds;
+        message.positionSeconds = static_cast<int>(
+            actualPositionMilliseconds / 1000
+        );
+        message.correctionReason = reason;
+        return message;
+    }
+
     return message;
 }
 
@@ -362,6 +541,8 @@ void applyMessageToState(const SyncMessage& message, SyncState& state)
         state.positionMilliseconds = message.positionMilliseconds;
         state.positionSeconds = static_cast<int>(message.positionMilliseconds / 1000);
         break;
+    case MessageType::Correction:
+    case MessageType::CorrectionResult:
     case MessageType::Unknown:
         break;
     }

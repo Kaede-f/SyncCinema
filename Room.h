@@ -49,10 +49,11 @@ public:
     );
     void removeClient(SocketHandle clientSocket);
 
-    // senderSocket 是发起命令的 client。
-    // 广播时会跳过它，避免发送方重复执行自己的命令。
-    bool broadcastControlMessage(SocketHandle senderSocket, const SyncMessage& message);
+    // server 为控制命令分配 epoch 后回显给所有 client（包括发起者）。
+    // 所有人都按同一条权威消息执行，才能维护完全一致的控制顺序。
+    bool broadcastControlMessage(const SyncMessage& message);
     bool sendMessageToClient(SocketHandle clientSocket, const SyncMessage& message);
+    bool sendMessageToClientId(int clientId, const SyncMessage& message);
 
     SyncState getState() const;
     RoomSnapshot getSnapshot() const;

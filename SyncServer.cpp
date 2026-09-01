@@ -9,8 +9,10 @@
 #include <utility>
 
 #include "Protocol.h"
+#include "MetricLogger.h"
 #include "NetSocket.h"
 #include "Room.h"
+#include "SyncCorrectionCoordinator.h"
 #include "SyncMetrics.h"
 
 namespace
@@ -127,10 +129,10 @@ namespace
     }
 
     void processLine(
-        SocketHandle clientSocket,
         int clientId,
         Room& room,
         SyncMetricsCollector& metrics,
+        SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         const std::string& line)
     {
@@ -159,11 +161,12 @@ namespace
             return;
         }
 
-        if (message.type == MessageType::Snapshot)
+        if (message.type == MessageType::Snapshot ||
+            message.type == MessageType::Correction)
         {
             // SNAPSHOT 是 server -> client 的单向消息。
             // client 伪造快照不能改变房间权威状态。
-            std::cout << "server ignored client snapshot message\n";
+            std::cout << "server ignored server-only message\n";
             return;
         }
 
@@ -183,15 +186,122 @@ namespace
             // 或“旧 Room + 新 epoch”这种不一致快照。
             std::lock_guard<std::mutex> controlLock(controlCommandMutex);
 
-            SyncState roomState = room.getState();
+            RoomSnapshot roomSnapshot = room.getSnapshot();
+            if (message.controlEpoch != roomSnapshot.controlEpoch)
+            {
+                std::lock_guard<std::mutex> logLock(metricLogMutex());
+                std::cout << "[metric] type=progress_report"
+                    << " client=" << clientId
+                    << " report_epoch=" << message.controlEpoch
+                    << " room_epoch=" << roomSnapshot.controlEpoch
+                    << " status=stale_epoch"
+                    << "\n";
+                return;
+            }
+
             SyncMetricSample sample;
             sample.clientId = clientId;
             sample.clientPositionMs = message.positionMilliseconds;
-            sample.roomPositionMs = roomState.positionMilliseconds;
+            sample.roomPositionMs = roomSnapshot.state.positionMilliseconds;
             sample.clientState = message.playbackState;
-            sample.roomState = roomState.state;
+            sample.roomState = roomSnapshot.state.state;
 
-            metrics.recordProgressReport(sample);
+            std::optional<SyncCorrectionProposal> proposal =
+                metrics.recordProgressReport(sample);
+            if (!proposal.has_value())
+            {
+                return;
+            }
+
+            // Metrics 观察窗口和 Room 使用同一个 epoch 才允许执行。
+            // 用户刚刚 PAUSE/SEEK 时，旧窗口产生的提案会在这里被安全丢弃。
+            if (proposal->controlEpoch != roomSnapshot.controlEpoch ||
+                proposal->playbackState != roomSnapshot.state.state ||
+                roomSnapshot.mediaIdentity.empty())
+            {
+                std::lock_guard<std::mutex> logLock(metricLogMutex());
+                std::cout << "[metric] type=correction_command"
+                    << " status=stale_proposal"
+                    << " target_client=" << proposal->targetClientId
+                    << " proposal_epoch=" << proposal->controlEpoch
+                    << " room_epoch=" << roomSnapshot.controlEpoch
+                    << "\n";
+                return;
+            }
+
+            std::optional<SyncMessage> command =
+                correctionCoordinator.createCommand(*proposal);
+            if (!command.has_value())
+            {
+                std::lock_guard<std::mutex> logLock(metricLogMutex());
+                std::cout << "[metric] type=correction_command"
+                    << " status=create_failed"
+                    << " target_client=" << proposal->targetClientId
+                    << " epoch=" << proposal->controlEpoch
+                    << "\n";
+                return;
+            }
+
+            bool sent = room.sendMessageToClientId(
+                proposal->targetClientId,
+                *command
+            );
+            if (sent)
+            {
+                metrics.recordCorrectionDispatched(*proposal);
+            }
+            else
+            {
+                correctionCoordinator.markDispatchFailed(command->commandId);
+            }
+
+            {
+                std::lock_guard<std::mutex> logLock(metricLogMutex());
+                std::cout << "[metric] type=correction_command"
+                    << " command_id=" << command->commandId
+                    << " epoch=" << command->controlEpoch
+                    << " target_client=" << proposal->targetClientId
+                    << " reference_client=" << proposal->referenceClientId
+                    << " state=" << stateToString(proposal->playbackState)
+                    << " forward_ms=" << proposal->forwardMilliseconds
+                    << " median_abs_diff_ms=" << proposal->medianAbsDiffMs
+                    << " p95_abs_diff_ms=" << proposal->p95AbsDiffMs
+                    << " sent=" << (sent ? 1 : 0)
+                    << "\n";
+            }
+            return;
+        }
+
+        if (message.type == MessageType::CorrectionResult)
+        {
+            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+            CorrectionResultRecord result = correctionCoordinator.recordResult(
+                clientId,
+                message
+            );
+            {
+                std::lock_guard<std::mutex> logLock(metricLogMutex());
+                std::cout << "[metric] type=correction_result"
+                    << " match="
+                    << correctionResultMatchStatusToString(result.matchStatus)
+                    << " client=" << clientId
+                    << " command_id=" << result.commandId
+                    << " epoch=" << result.controlEpoch
+                    << " status="
+                    << correctionResultStatusToString(result.resultStatus)
+                    << " actual_pos_ms=" << result.actualPositionMilliseconds
+                    << " forward_ms=" << result.forwardMilliseconds
+                    << " ack_latency_ms=" << result.acknowledgementLatencyMs
+                    << " reason=" << result.reason
+                    << "\n";
+            }
+            return;
+        }
+
+        if (!isPlaybackControlMessage(message.type) ||
+            message.controlEpoch != 0)
+        {
+            std::cout << "server ignored invalid client control: " << line << "\n";
             return;
         }
 
@@ -203,9 +313,10 @@ namespace
         // 多个 client 可能同时发控制命令。这把锁保证 Room 应用顺序、广播顺序和
         // metrics epoch 顺序完全一致，后续同步算法才有稳定的“先后”语义。
         std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-        room.broadcastControlMessage(clientSocket, message);
+        room.broadcastControlMessage(message);
         RoomSnapshot snapshot = room.getSnapshot();
         metrics.beginControlEpoch(snapshot.controlEpoch, message);
+        correctionCoordinator.retainControlEpoch(snapshot.controlEpoch);
     }
 
     void handleClient(
@@ -213,6 +324,7 @@ namespace
         int clientId,
         Room& room,
         SyncMetricsCollector& metrics,
+        SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         std::string receiveBuffer)
     {
@@ -224,10 +336,10 @@ namespace
             while (tryTakeProtocolLine(receiveBuffer, line))
             {
                 processLine(
-                    clientSocket,
                     clientId,
                     room,
                     metrics,
+                    correctionCoordinator,
                     controlCommandMutex,
                     line
                 );
@@ -254,8 +366,14 @@ namespace
             }
         }
 
-        room.removeClient(clientSocket);
-        metrics.removeClient(clientId);
+        {
+            // client 移除与 server 主动发送校正共用顺序锁，避免通过旧 id
+            // 找到一个正被关闭、甚至已被系统复用的 socket。
+            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+            room.removeClient(clientSocket);
+            metrics.removeClient(clientId);
+            correctionCoordinator.removeClient(clientId);
+        }
         closeSocket(clientSocket);
         std::cout << "client removed. online clients: " << room.getClientCount() << "\n";
     }
@@ -264,6 +382,7 @@ namespace
         SocketHandle clientSocket,
         Room& room,
         SyncMetricsCollector& metrics,
+        SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex)
     {
         std::string receiveBuffer;
@@ -317,8 +436,12 @@ namespace
         {
             std::cout << "initial snapshot send failed for client #"
                 << joinResult.clientId << "\n";
-            room.removeClient(clientSocket);
-            metrics.removeClient(joinResult.clientId);
+            {
+                std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+                room.removeClient(clientSocket);
+                metrics.removeClient(joinResult.clientId);
+                correctionCoordinator.removeClient(joinResult.clientId);
+            }
             closeSocket(clientSocket);
             return;
         }
@@ -335,34 +458,49 @@ namespace
             joinResult.clientId,
             room,
             metrics,
+            correctionCoordinator,
             controlCommandMutex,
             std::move(receiveBuffer)
         );
     }
 
-    void heartbeatLoop(Room& room, SyncMetricsCollector& metrics, std::atomic_bool& running)
+    void heartbeatLoop(
+        Room& room,
+        SyncMetricsCollector& metrics,
+        std::mutex& controlCommandMutex,
+        std::atomic_bool& running)
     {
         int nextSeq = 1;
 
         while (running)
         {
-            std::vector<ClientConnection> clients = room.getClientSnapshot();
-            if (!clients.empty())
             {
-                SyncMessage ping;
-                ping.type = MessageType::Ping;
-                ping.sequenceNumber = nextSeq++;
-
-                for (const ClientConnection& client : clients)
+                // 与 JOIN/断开/校正发送串行化，避免旧 socket 在关闭并被
+                // 操作系统复用后，心跳误发给一条新连接。
+                std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+                std::vector<ClientConnection> clients = room.getClientSnapshot();
+                if (!clients.empty())
                 {
-                    // 先登记 pending，再发送 PING。
-                    // 这样即使 client 很快回 PONG，server 也一定能找到对应的发送时间。
-                    Clock::time_point sentAt = Clock::now();
-                    metrics.recordPingSent(client.id, ping.sequenceNumber, sentAt);
+                    SyncMessage ping;
+                    ping.type = MessageType::Ping;
+                    ping.sequenceNumber = nextSeq++;
 
-                    if (!room.sendMessageToClient(client.socket, ping))
+                    for (const ClientConnection& client : clients)
                     {
-                        std::cout << "heartbeat send failed for client #" << client.id << "\n";
+                        // 先登记 pending，再发送 PING。即使 client 很快回 PONG，
+                        // server 也一定能找到对应的发送时间。
+                        Clock::time_point sentAt = Clock::now();
+                        metrics.recordPingSent(
+                            client.id,
+                            ping.sequenceNumber,
+                            sentAt
+                        );
+
+                        if (!room.sendMessageToClient(client.socket, ping))
+                        {
+                            std::cout << "heartbeat send failed for client #"
+                                << client.id << "\n";
+                        }
                     }
                 }
             }
@@ -414,6 +552,7 @@ void runSyncServer()
 
     Room room;
     SyncMetricsCollector metrics;
+    SyncCorrectionCoordinator correctionCoordinator;
     std::mutex controlCommandMutex;
     std::atomic_bool serverRunning{ true };
 
@@ -425,6 +564,7 @@ void runSyncServer()
         heartbeatLoop,
         std::ref(room),
         std::ref(metrics),
+        std::ref(controlCommandMutex),
         std::ref(serverRunning)
     );
 
@@ -445,6 +585,7 @@ void runSyncServer()
             clientSocket,
             std::ref(room),
             std::ref(metrics),
+            std::ref(correctionCoordinator),
             std::ref(controlCommandMutex)
         );
         clientThread.detach();

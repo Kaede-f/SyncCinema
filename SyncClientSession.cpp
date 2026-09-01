@@ -6,6 +6,8 @@
 
 #include <ws2tcpip.h>
 
+#include "SyncCorrectionExecutor.h"
+
 namespace
 {
     constexpr unsigned short kServerPort = 9000;
@@ -76,6 +78,8 @@ namespace
             return "initial";
         case SyncClientCommandSource::RemoteCommand:
             return "remote";
+        case SyncClientCommandSource::Correction:
+            return "correction";
         case SyncClientCommandSource::LocalCommand:
         default:
             return "local";
@@ -250,16 +254,8 @@ bool SyncClientSession::sendControlMessage(
         return false;
     }
 
-    // 发送方先更新自己的播放器。server 广播时会跳过发送方，
-    // 因此同一条命令在本机只执行一次。
-    if (!applyControlMessage(
-            message,
-            SyncClientCommandSource::LocalCommand,
-            errorMessage))
-    {
-        return false;
-    }
-
+    // 本地操作也必须等待 server 分配 epoch 后回显。这样多个 client
+    // 同时操作时，所有播放器都严格按 server 的同一顺序执行。
     if (!sendProtocolMessage(message, errorMessage))
     {
         handleTransportFailure(errorMessage);
@@ -547,6 +543,7 @@ bool SyncClientSession::applyInitialSnapshot(
         }
 
         applyMessageToState(snapshot, localState_);
+        currentControlEpoch_ = snapshot.controlEpoch;
         localState_.positionMilliseconds = targetPositionMs;
         localState_.positionSeconds =
             static_cast<int>(targetPositionMs / 1000);
@@ -605,6 +602,20 @@ bool SyncClientSession::applyControlMessage(
     {
         std::lock_guard<std::mutex> lock(playerMutex_);
 
+        if (source == SyncClientCommandSource::RemoteCommand)
+        {
+            if (message.controlEpoch <= currentControlEpoch_)
+            {
+                errorMessage = "ignored stale or duplicate CONTROL epoch";
+                return false;
+            }
+            if (message.controlEpoch != currentControlEpoch_ + 1)
+            {
+                errorMessage = "CONTROL epoch gap detected";
+                return false;
+            }
+        }
+
         if (!applyMessageToPlayer(message, player_))
         {
             errorMessage = std::string(sourceLabel(source)) +
@@ -613,6 +624,10 @@ bool SyncClientSession::applyControlMessage(
         }
 
         applyMessageToState(message, localState_);
+        if (source == SyncClientCommandSource::RemoteCommand)
+        {
+            currentControlEpoch_ = message.controlEpoch;
+        }
         long long playerPositionMs =
             player_.getPositionMilliseconds();
         localState_.positionMilliseconds = playerPositionMs;
@@ -646,6 +661,58 @@ bool SyncClientSession::sendProtocolMessage(
     }
 
     return sendAll(socket_, messageToString(message), errorMessage);
+}
+
+bool SyncClientSession::executeCorrectionMessage(
+    const SyncMessage& message,
+    std::string& errorMessage)
+{
+    SyncClientPlaybackSnapshot playbackSnapshot;
+    SyncCorrectionExecution execution;
+
+    {
+        std::lock_guard<std::mutex> lock(playerMutex_);
+        execution = executeSyncCorrection(
+            message,
+            currentControlEpoch_,
+            localState_,
+            player_
+        );
+
+        if (execution.applied)
+        {
+            playbackSnapshot.state = localState_;
+            playbackSnapshot.playerPositionMs =
+                execution.resultMessage.positionMilliseconds;
+            playbackSnapshot.durationMs = player_.getDurationMilliseconds();
+        }
+    }
+
+    std::ostringstream metric;
+    metric << "[metric] type=correction_execution"
+        << " command_id=" << message.commandId
+        << " epoch=" << message.controlEpoch
+        << " state=" << stateToString(message.playbackState)
+        << " forward_ms=" << message.correctionForwardMilliseconds
+        << " target_pos_ms=" << execution.requestedTargetMilliseconds
+        << " observed_pos_ms="
+        << execution.resultMessage.positionMilliseconds
+        << " status="
+        << correctionResultStatusToString(
+            execution.resultMessage.correctionResultStatus
+        )
+        << " reason=" << execution.resultMessage.correctionReason;
+    emitLog(metric.str());
+
+    if (execution.applied)
+    {
+        emitPlaybackChanged(
+            playbackSnapshot,
+            SyncClientCommandSource::Correction
+        );
+    }
+
+    return sendProtocolMessage(execution.resultMessage, errorMessage);
 }
 
 void SyncClientSession::receiverLoop(std::string receiveBuffer)
@@ -684,11 +751,23 @@ void SyncClientSession::receiverLoop(std::string receiveBuffer)
                 continue;
             }
 
+            if (message.type == MessageType::Correction)
+            {
+                std::string errorMessage;
+                if (!executeCorrectionMessage(message, errorMessage))
+                {
+                    handleTransportFailure(errorMessage);
+                    return;
+                }
+                continue;
+            }
+
             if (message.type == MessageType::Pong ||
                 message.type == MessageType::Report ||
                 message.type == MessageType::Join ||
                 message.type == MessageType::JoinRejected ||
-                message.type == MessageType::Snapshot)
+                message.type == MessageType::Snapshot ||
+                message.type == MessageType::CorrectionResult)
             {
                 continue;
             }
@@ -699,7 +778,18 @@ void SyncClientSession::receiverLoop(std::string receiveBuffer)
                     SyncClientCommandSource::RemoteCommand,
                     errorMessage))
             {
+                if (errorMessage == "ignored stale or duplicate CONTROL epoch")
+                {
+                    emitLog(errorMessage);
+                    continue;
+                }
+
                 emitError(errorMessage);
+                if (errorMessage == "CONTROL epoch gap detected")
+                {
+                    handleTransportFailure(errorMessage);
+                    return;
+                }
             }
         }
 
@@ -741,6 +831,7 @@ void SyncClientSession::progressReportLoop()
 
         {
             std::lock_guard<std::mutex> lock(playerMutex_);
+            report.controlEpoch = currentControlEpoch_;
             report.positionMilliseconds =
                 player_.getPositionMilliseconds();
             report.positionSeconds =

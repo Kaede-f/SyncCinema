@@ -18,6 +18,8 @@ bool applyMessageToPlayer(const SyncMessage& message, PlayerController& player)
     case MessageType::Join:
     case MessageType::JoinRejected:
     case MessageType::Snapshot:
+    case MessageType::Correction:
+    case MessageType::CorrectionResult:
         return false;
     case MessageType::Unknown:
         return false;
