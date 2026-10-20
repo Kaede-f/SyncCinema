@@ -83,6 +83,11 @@ namespace
         return std::max(0LL, elapsed);
     }
 
+    long long microsecondsToMilliseconds(long long microseconds)
+    {
+        return microseconds < 0 ? -1 : microseconds / 1000;
+    }
+
     long long projectPositionToServerTime(
         long long reportedPositionMs,
         PlaybackState playbackState,
@@ -198,11 +203,7 @@ void SyncMetricsCollector::recordPongReceived(
     Clock::time_point receivedAt)
 {
     long long rttUs = -1;
-    long long rttMs = -1;
-    long long minRttMs = -1;
-    long long avgRttMs = -1;
-    long long maxRttMs = -1;
-    long long sampleCount = 0;
+    RttStatistics rttStats;
     bool matchedPong = false;
 
     {
@@ -216,19 +217,8 @@ void SyncMetricsCollector::recordPongReceived(
             rttUs = std::chrono::duration_cast<std::chrono::microseconds>(
                 receivedAt - pendingIt->second
             ).count();
-            rttMs = rttUs / 1000;
             stats.pendingPings.erase(pendingIt);
-
-            ++stats.rttSampleCount;
-            stats.latestRttMs = rttMs;
-            stats.totalRttMs += rttMs;
-            stats.minRttMs = stats.rttSampleCount == 1 ? rttMs : std::min(stats.minRttMs, rttMs);
-            stats.maxRttMs = stats.rttSampleCount == 1 ? rttMs : std::max(stats.maxRttMs, rttMs);
-
-            sampleCount = stats.rttSampleCount;
-            minRttMs = stats.minRttMs;
-            maxRttMs = stats.maxRttMs;
-            avgRttMs = stats.totalRttMs / stats.rttSampleCount;
+            rttStats = stats.rttEstimator.addSample(rttUs);
         }
     }
 
@@ -244,7 +234,7 @@ void SyncMetricsCollector::recordPongReceived(
     }
 
     // RTT 使用 server 自己的发送时间和接收时间计算，不依赖 client/server 时钟同步。
-    // 后续估算单向延迟时，先用 min_rtt/2 作为保守估计。
+    // baseline_rtt 取最近窗口 P10；rolling P95 则保留拥塞或进程暂停等异常信号。
     {
         std::lock_guard<std::mutex> logLock(metricLogMutex());
 
@@ -252,11 +242,21 @@ void SyncMetricsCollector::recordPongReceived(
             << " client=" << clientId
             << " seq=" << sequenceNumber
             << " rtt_us=" << rttUs
-            << " rtt_ms=" << rttMs
-            << " min_rtt_ms=" << minRttMs
-            << " avg_rtt_ms=" << avgRttMs
-            << " max_rtt_ms=" << maxRttMs
-            << " samples=" << sampleCount
+            << " rtt_ms=" << microsecondsToMilliseconds(rttStats.latestUs)
+            << " baseline_rtt_ms="
+            << microsecondsToMilliseconds(rttStats.baselineUs)
+            << " rolling_avg_rtt_ms="
+            << microsecondsToMilliseconds(rttStats.rollingAverageUs)
+            << " rolling_median_rtt_ms="
+            << microsecondsToMilliseconds(rttStats.rollingMedianUs)
+            << " rolling_p95_rtt_ms="
+            << microsecondsToMilliseconds(rttStats.rollingP95Us)
+            << " lifetime_min_rtt_ms="
+            << microsecondsToMilliseconds(rttStats.lifetimeMinUs)
+            << " lifetime_max_rtt_ms="
+            << microsecondsToMilliseconds(rttStats.lifetimeMaxUs)
+            << " window_samples=" << rttStats.windowSamples
+            << " samples=" << rttStats.totalSamples
             << "\n";
     }
 }
@@ -331,9 +331,11 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
     long long minDiffMs = 0;
     long long maxDiffMs = 0;
     long long latestRttMs = -1;
-    long long minRttMs = -1;
-    long long avgRttMs = -1;
+    long long baselineRttMs = -1;
+    long long rollingMedianRttMs = -1;
+    long long rollingP95RttMs = -1;
     long long rttSampleCount = 0;
+    std::size_t rttWindowSamples = 0;
     long long controlEpoch = 0;
     bool settling = false;
     std::vector<PairProgressMetric> pairMetrics;
@@ -385,16 +387,19 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             maxDiffMs = stats.maxDiffMs;
         }
 
-        latestRttMs = stats.latestRttMs;
-        minRttMs = stats.minRttMs;
-        rttSampleCount = stats.rttSampleCount;
-        avgRttMs = stats.rttSampleCount > 0
-            ? stats.totalRttMs / stats.rttSampleCount
-            : -1;
+        const RttStatistics rttStats = stats.rttEstimator.snapshot();
+        latestRttMs = microsecondsToMilliseconds(rttStats.latestUs);
+        baselineRttMs = microsecondsToMilliseconds(rttStats.baselineUs);
+        rollingMedianRttMs = microsecondsToMilliseconds(
+            rttStats.rollingMedianUs
+        );
+        rollingP95RttMs = microsecondsToMilliseconds(rttStats.rollingP95Us);
+        rttSampleCount = rttStats.totalSamples;
+        rttWindowSamples = rttStats.windowSamples;
 
-        if (stats.minRttMs >= 0)
+        if (rttStats.baselineUs >= 0)
         {
-            estimatedOneWayDelayMs = stats.minRttMs / 2;
+            estimatedOneWayDelayMs = rttStats.baselineUs / 2000;
         }
 
         stats.hasLatestProgressReport = true;
@@ -446,8 +451,10 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 continue;
             }
 
-            long long otherOneWayDelayMs = otherStats.minRttMs >= 0
-                ? otherStats.minRttMs / 2
+            const RttStatistics otherRttStats =
+                otherStats.rttEstimator.snapshot();
+            long long otherOneWayDelayMs = otherRttStats.baselineUs >= 0
+                ? otherRttStats.baselineUs / 2000
                 : 0;
             long long otherProjectedPositionMs = projectPositionToServerTime(
                 otherStats.latestPositionMs,
@@ -475,8 +482,8 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 pairMetric.reportAgeBMs = otherReportAgeMs;
                 pairMetric.estimatedOneWayDelayAMs = estimatedOneWayDelayMs;
                 pairMetric.estimatedOneWayDelayBMs = otherOneWayDelayMs;
-                pairMetric.hasRttA = stats.minRttMs >= 0;
-                pairMetric.hasRttB = otherStats.minRttMs >= 0;
+                pairMetric.hasRttA = rttStats.available();
+                pairMetric.hasRttB = otherRttStats.available();
             }
             else
             {
@@ -488,8 +495,8 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
                 pairMetric.reportAgeBMs = 0;
                 pairMetric.estimatedOneWayDelayAMs = otherOneWayDelayMs;
                 pairMetric.estimatedOneWayDelayBMs = estimatedOneWayDelayMs;
-                pairMetric.hasRttA = otherStats.minRttMs >= 0;
-                pairMetric.hasRttB = stats.minRttMs >= 0;
+                pairMetric.hasRttA = otherRttStats.available();
+                pairMetric.hasRttB = rttStats.available();
             }
 
             pairMetric.pairDiffMs =
@@ -694,9 +701,11 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
             << " min_diff_ms=" << minDiffMs
             << " max_diff_ms=" << maxDiffMs
             << " latest_rtt_ms=" << latestRttMs
-            << " min_rtt_ms=" << minRttMs
-            << " avg_rtt_ms=" << avgRttMs
+            << " baseline_rtt_ms=" << baselineRttMs
+            << " rolling_median_rtt_ms=" << rollingMedianRttMs
+            << " rolling_p95_rtt_ms=" << rollingP95RttMs
             << " rtt_samples=" << rttSampleCount
+            << " rtt_window_samples=" << rttWindowSamples
             << " report_interval_ms=" << reportIntervalMs
             << " settling=" << (settling ? 1 : 0)
             << " quality=" << (
@@ -811,4 +820,42 @@ void SyncMetricsCollector::removeClient(int clientId)
             ++it;
         }
     }
+}
+
+void SyncMetricsCollector::resetSession()
+{
+    long long previousEpoch = 0;
+    std::size_t previousClientCount = 0;
+    std::size_t previousPairCount = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        previousEpoch = currentControlEpoch_;
+        previousClientCount = statsByClient_.size();
+        previousPairCount = pairStatsByKey_.size();
+
+        statsByClient_.clear();
+        pairStatsByKey_.clear();
+        lastCorrectionByClient_.clear();
+        currentControlEpoch_ = 0;
+        hasControlEpochStart_ = false;
+        controlEpochStartedAt_ = {};
+    }
+
+    std::lock_guard<std::mutex> logLock(metricLogMutex());
+    std::cout << "[metric] type=metrics_session_reset"
+        << " previous_epoch=" << previousEpoch
+        << " cleared_clients=" << previousClientCount
+        << " cleared_pairs=" << previousPairCount
+        << "\n";
+}
+
+SyncMetricsSessionSnapshot SyncMetricsCollector::getSessionSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    SyncMetricsSessionSnapshot snapshot;
+    snapshot.controlEpoch = currentControlEpoch_;
+    snapshot.trackedClients = statsByClient_.size();
+    snapshot.trackedPairs = pairStatsByKey_.size();
+    return snapshot;
 }

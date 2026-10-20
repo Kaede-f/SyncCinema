@@ -370,8 +370,15 @@ namespace
             // client 移除与 server 主动发送校正共用顺序锁，避免通过旧 id
             // 找到一个正被关闭、甚至已被系统复用的 socket。
             std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-            room.removeClient(clientSocket);
-            metrics.removeClient(clientId);
+            const bool sessionEnded = room.removeClient(clientSocket);
+            if (sessionEnded)
+            {
+                metrics.resetSession();
+            }
+            else
+            {
+                metrics.removeClient(clientId);
+            }
             correctionCoordinator.removeClient(clientId);
         }
         closeSocket(clientSocket);
@@ -438,8 +445,15 @@ namespace
                 << joinResult.clientId << "\n";
             {
                 std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-                room.removeClient(clientSocket);
-                metrics.removeClient(joinResult.clientId);
+                const bool sessionEnded = room.removeClient(clientSocket);
+                if (sessionEnded)
+                {
+                    metrics.resetSession();
+                }
+                else
+                {
+                    metrics.removeClient(joinResult.clientId);
+                }
                 correctionCoordinator.removeClient(joinResult.clientId);
             }
             closeSocket(clientSocket);

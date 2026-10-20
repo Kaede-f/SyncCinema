@@ -47,7 +47,8 @@ public:
         SocketHandle clientSocket,
         const std::string& mediaIdentity
     );
-    void removeClient(SocketHandle clientSocket);
+    // 返回 true 表示最后一个 client 已离开，本轮房间会话已经结束。
+    bool removeClient(SocketHandle clientSocket);
 
     // server 为控制命令分配 epoch 后回显给所有 client（包括发起者）。
     // 所有人都按同一条权威消息执行，才能维护完全一致的控制顺序。

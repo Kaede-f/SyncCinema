@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "Protocol.h"
+#include "RttEstimator.h"
 #include "SyncCorrectionPolicy.h"
 
 // 单次进度上报样本。
@@ -20,6 +21,13 @@ struct SyncMetricSample
     long long roomPositionMs = 0;
     PlaybackState clientState = PlaybackState::Stopped;
     PlaybackState roomState = PlaybackState::Stopped;
+};
+
+struct SyncMetricsSessionSnapshot
+{
+    long long controlEpoch = 0;
+    std::size_t trackedClients = 0;
+    std::size_t trackedPairs = 0;
 };
 
 // SyncMetricsCollector 负责日志分析，并从可信窗口中产出校正提案。
@@ -49,6 +57,11 @@ public:
     void recordCorrectionDispatched(const SyncCorrectionProposal& proposal);
     void removeClient(int clientId);
 
+    // 最后一个 client 离开后，Room 会开启全新的媒体会话；metrics 必须同步清空，
+    // 否则下一场会错误继承旧 epoch、RTT 和校正窗口。
+    void resetSession();
+    SyncMetricsSessionSnapshot getSessionSnapshot() const;
+
 private:
     struct ClientStats
     {
@@ -69,11 +82,7 @@ private:
         PlaybackState latestPlaybackState = PlaybackState::Stopped;
         Clock::time_point latestReportReceivedAt{};
 
-        long long rttSampleCount = 0;
-        long long latestRttMs = -1;
-        long long minRttMs = -1;
-        long long maxRttMs = -1;
-        long long totalRttMs = 0;
+        RttEstimator rttEstimator;
         std::unordered_map<int, Clock::time_point> pendingPings;
     };
 
@@ -91,7 +100,7 @@ private:
         Clock::time_point lastDecisionLoggedAt{};
     };
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<int, ClientStats> statsByClient_;
     std::unordered_map<std::uint64_t, PairWindowStats> pairStatsByKey_;
     std::unordered_map<int, Clock::time_point> lastCorrectionByClient_;

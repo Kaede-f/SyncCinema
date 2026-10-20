@@ -6,11 +6,15 @@
 #include <vector>
 
 #include "MockPlayer.h"
+#include "NetSocket.h"
+#include "PlaybackPositionConvergence.h"
 #include "Protocol.h"
+#include "RttEstimator.h"
 #include "Room.h"
 #include "SyncCorrectionPolicy.h"
 #include "SyncCorrectionCoordinator.h"
 #include "SyncCorrectionExecutor.h"
+#include "SyncMetrics.h"
 
 namespace
 {
@@ -71,6 +75,149 @@ namespace
             state.positionMilliseconds == 123456,
             "SNAPSHOT applies millisecond position"
         );
+    }
+
+    void testPlaybackPositionConvergence()
+    {
+        using Tracker = PlaybackPositionConvergenceTracker;
+        const Tracker::Clock::time_point referenceTime{};
+        PlaybackPositionConvergenceConfig config;
+        config.toleranceMilliseconds = 250;
+        config.requiredConsecutiveSamples = 2;
+
+        Tracker playingTracker(
+            55000,
+            PlaybackState::Playing,
+            referenceTime,
+            config
+        );
+
+        PlaybackPositionObservation initial = playingTracker.observe(
+            0,
+            referenceTime
+        );
+        expect(
+            !initial.converged && initial.errorMilliseconds == -55000,
+            "initial sync does not accept an un-applied seek at position zero"
+        );
+
+        PlaybackPositionObservation firstClose = playingTracker.observe(
+            55080,
+            referenceTime + std::chrono::milliseconds(100)
+        );
+        expect(
+            !firstClose.converged &&
+                firstClose.expectedPositionMilliseconds == 55100 &&
+                firstClose.consecutiveSamples == 1,
+            "playing convergence advances the expected position with time"
+        );
+
+        PlaybackPositionObservation secondClose = playingTracker.observe(
+            55190,
+            referenceTime + std::chrono::milliseconds(200)
+        );
+        expect(
+            secondClose.converged &&
+                secondClose.expectedPositionMilliseconds == 55200 &&
+                secondClose.consecutiveSamples == 2,
+            "initial sync requires consecutive close position samples"
+        );
+
+        Tracker pausedTracker(
+            42000,
+            PlaybackState::Paused,
+            referenceTime,
+            config
+        );
+        pausedTracker.observe(
+            42100,
+            referenceTime + std::chrono::seconds(5)
+        );
+        PlaybackPositionObservation paused = pausedTracker.observe(
+            41950,
+            referenceTime + std::chrono::seconds(10)
+        );
+        expect(
+            paused.converged &&
+                paused.expectedPositionMilliseconds == 42000,
+            "paused convergence keeps a fixed expected position"
+        );
+    }
+
+    void testRollingRttEstimator()
+    {
+        RttEstimator estimator(5);
+        estimator.addSample(20000);
+        estimator.addSample(21000);
+        estimator.addSample(19000);
+        estimator.addSample(20000);
+        RttStatistics withOutlier = estimator.addSample(10000000);
+
+        expect(
+            withOutlier.baselineUs == 19000 &&
+                withOutlier.rollingMedianUs == 20000 &&
+                withOutlier.rollingP95Us == 10000000,
+            "RTT window keeps suspension outliers visible without moving the baseline"
+        );
+
+        estimator.addSample(20000);
+        estimator.addSample(22000);
+        estimator.addSample(21000);
+        estimator.addSample(19000);
+        RttStatistics recovered = estimator.addSample(20000);
+        expect(
+            recovered.windowSamples == 5 &&
+                recovered.baselineUs == 19000 &&
+                recovered.rollingP95Us == 22000 &&
+                recovered.lifetimeMaxUs == 10000000,
+            "RTT rolling statistics recover after old outliers leave the window"
+        );
+    }
+
+    void testMetricsSessionReset()
+    {
+        SyncMetricsCollector metrics;
+        SyncMessage play;
+        play.type = MessageType::Play;
+        metrics.beginControlEpoch(7, play);
+        metrics.recordPingSent(42, 1, SyncMetricsCollector::Clock::now());
+
+        SyncMetricsSessionSnapshot beforeReset = metrics.getSessionSnapshot();
+        expect(
+            beforeReset.controlEpoch == 7 && beforeReset.trackedClients == 1,
+            "metrics tracks the active room session"
+        );
+
+        metrics.resetSession();
+        SyncMetricsSessionSnapshot afterReset = metrics.getSessionSnapshot();
+        expect(
+            afterReset.controlEpoch == 0 &&
+                afterReset.trackedClients == 0 &&
+                afterReset.trackedPairs == 0,
+            "metrics reset clears epoch and client state between room sessions"
+        );
+    }
+
+    void testClosedPeerSendDoesNotTerminateProcess()
+    {
+#ifndef _WIN32
+        int sockets[2] = { kInvalidSocket, kInvalidSocket };
+        const int createResult = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
+        expect(createResult == 0, "POSIX socketpair is available for send test");
+        if (createResult != 0)
+        {
+            return;
+        }
+
+        closeSocket(sockets[1]);
+        const char byte = 'x';
+        const int sendResult = sendSocket(sockets[0], &byte, 1);
+        expect(
+            sendResult == kSocketError,
+            "sending to a closed peer returns an error instead of SIGPIPE"
+        );
+        closeSocket(sockets[0]);
+#endif
     }
 
     void testSnapshotProtocolRejectsMalformedInput()
@@ -209,8 +356,14 @@ namespace
             "Room accepts another client with the same media"
         );
 
-        room.removeClient(secondSocket);
-        room.removeClient(firstSocket);
+        expect(
+            !room.removeClient(secondSocket),
+            "removing one of two clients keeps the room session active"
+        );
+        expect(
+            room.removeClient(firstSocket),
+            "removing the final client reports the end of the room session"
+        );
         RoomSnapshot emptyRoom = room.getSnapshot();
         expect(
             emptyRoom.mediaIdentity.empty(),
@@ -822,6 +975,10 @@ namespace
 int main()
 {
     testSnapshotProtocolRoundTrip();
+    testPlaybackPositionConvergence();
+    testRollingRttEstimator();
+    testMetricsSessionReset();
+    testClosedPeerSendDoesNotTerminateProcess();
     testSnapshotProtocolRejectsMalformedInput();
     testMediaJoinProtocol();
     testPlaybackControlClassification();

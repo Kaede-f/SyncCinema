@@ -1,5 +1,7 @@
 #include "NetSocket.h"
 
+#include <cstddef>
+
 #ifdef _WIN32 // 如果是 Windows 平台
 
 bool initializeSockets()
@@ -28,6 +30,11 @@ int getSocketError()
     return WSAGetLastError();
 }
 
+int sendSocket(SocketHandle socket, const char* data, int length)
+{
+    return send(socket, data, length, 0);
+}
+
 #else // 如果是 Linux 平台
 
 bool initializeSockets()
@@ -48,6 +55,15 @@ void closeSocket(SocketHandle socket)
 int getSocketError()
 {
     return errno;
+}
+
+int sendSocket(SocketHandle socket, const char* data, int length)
+{
+#ifdef MSG_NOSIGNAL
+    return send(socket, data, static_cast<std::size_t>(length), MSG_NOSIGNAL);
+#else
+    return send(socket, data, static_cast<std::size_t>(length), 0);
+#endif
 }
 
 #endif

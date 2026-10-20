@@ -170,6 +170,13 @@ def mark_repeat_table_header(row):
     tr_pr.append(tbl_header)
 
 
+def prevent_table_row_split(row):
+    tr_pr = row._tr.get_or_add_trPr()
+    cant_split = OxmlElement("w:cantSplit")
+    cant_split.set(qn("w:val"), "true")
+    tr_pr.append(cant_split)
+
+
 def configure_document(doc):
     section = doc.sections[0]
     section.page_width = Inches(8.5)
@@ -269,10 +276,10 @@ def add_title_block(doc):
     set_run_font(run, size=12.5, color=COLOR_MUTED)
 
     metadata = [
-        ("当前开发分支", "feature/media-load-feedback"),
-        ("版本基线", "10a19af + 本阶段 media-load-feedback"),
-        ("本次阶段", "libVLC 异步媒体状态与 Qt 错误反馈"),
-        ("维护日期", "2026-09-01"),
+        ("当前开发分支", "feature/sync-correction-execution"),
+        ("版本基线", "c89e021 + 云端单机双实例实验"),
+        ("本次阶段", "自动同步校正云端验收与问题识别"),
+        ("维护日期", "2026-09-25"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
     table = doc.add_table(rows=1, cols=2)
@@ -416,6 +423,62 @@ def add_commit_history_table(doc):
                 name=FONT_CODE if index == 0 else FONT_BODY,
                 size=8.7 if index == 0 else 9,
             )
+
+
+def add_cloud_correction_experiment_table(doc):
+    rows = [
+        (
+            "会话与协议",
+            "7 次 JOIN/快照、30 个控制 epoch、7 次正常移除；1 次异媒体拒绝；0 个 stale_epoch",
+            "加入、双向控制、媒体切换、房间重置和媒体一致性检查均按设计工作。",
+        ),
+        (
+            "正常 RTT",
+            "各客户端中位 RTT 约 19-30 ms；正常样本 P95 约 23-38 ms",
+            "公网控制链路稳定，几百毫秒播放偏差的主要来源不是网络往返时延。",
+        ),
+        (
+            "晚加入偏差",
+            "三个晚加入阶段的稳定相对偏差约 421-537 ms；当前硬校正阈值为 750 ms",
+            "快照能恢复大致进度，但 libVLC 异步 seek/缓冲留下可感知的小偏差，且不会触发硬 seek。",
+        ),
+        (
+            "故障注入",
+            "暂停客户端进程后出现约 10.0-20.3 s 持续落后，进度上报间隔最大约 12.6-22.5 s",
+            "测试确实制造了客户端整体停顿；同时说明暂停期间的超大 RTT 不能解释为真实网络变差。",
+        ),
+        (
+            "自动校正",
+            "3 次 CORRECT 均返回 APPLIED；触发偏差中位数为 20328/10497/10000 ms，校正后约 126/108/20 ms；ACK 为 30/29/34 ms",
+            "目标端选择、命令派发、客户端执行和回执匹配完整闭环，且校正后迅速恢复到亚秒级。",
+        ),
+    ]
+
+    table = doc.add_table(rows=1, cols=3)
+    set_table_geometry(table, [1750, 3500, 4110])
+    headers = ("观察项", "关键数据", "数据反映的问题或结论")
+    for index, header in enumerate(headers):
+        cell = table.rows[0].cells[index]
+        set_cell_shading(cell, COLOR_LIGHT_BLUE)
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+        run = paragraph.add_run(header)
+        set_run_font(run, size=9, bold=True, color=COLOR_DARK_BLUE)
+    mark_repeat_table_header(table.rows[0])
+
+    for observation, data, conclusion in rows:
+        row = table.add_row()
+        prevent_table_row_split(row)
+        cells = row.cells
+        for index, text in enumerate((observation, data, conclusion)):
+            paragraph = cells[index].paragraphs[0]
+            paragraph.alignment = (
+                WD_ALIGN_PARAGRAPH.CENTER if index == 0 else WD_ALIGN_PARAGRAPH.LEFT
+            )
+            set_paragraph_spacing(paragraph, after=0, line_spacing=1.15)
+            run = paragraph.add_run(text)
+            set_run_font(run, size=8.8, bold=index == 0)
 
 
 def add_changed_files_table(doc):
@@ -1323,7 +1386,120 @@ def build_document():
         "Windows 完整构建 Qt、CLI、server 与两项测试，CTest 2/2 通过；WSL Linux server 与核心测试通过。"
         "本机双 TCP 端烟雾测试还验证了两端收到相同 CONTROL 1 PLAY，旧 epoch REPORT 被明确拒绝，"
         "持续约 1.2 秒偏差触发一次定向 CORRECT，server 最终匹配到 APPLIED 回执。"
-        "本阶段尚未部署云端，因此结论是‘工程闭环与跨平台回归成立’，不能提前声称真实异地同步效果已经改善。",
+        "随后提交 c89e021 并部署到 Linux 云服务器。当前结论是‘工程闭环、跨平台回归和云端启动成立’，"
+        "但双机异地校正效果仍需用真实数据验收，不能提前声称同步精度已经改善。",
+    )
+
+    doc.add_heading("7.12 公网异常连接触发 Linux SIGPIPE", level=2)
+    add_body(
+        doc,
+        "云端版本进入公网运行后，Qt client 报 connect failed 10061。检查发现 tmux 会话仍在，"
+        "但 9000 端口已无人监听，pane 中只留下多次 client rejected: valid JOIN was not received，"
+        "随后 server 无普通错误日志地回到 shell。立即执行 echo $? 得到 141，即 128 加信号 13，"
+        "确认进程被 SIGPIPE 终止。这个现象没有在 Windows 和本地正常客户端回归中出现，"
+        "说明部署验证覆盖了单元测试无法模拟的公网异常连接。",
+    )
+    add_code_block(
+        doc,
+        [
+            "public scanner connects to TCP 9000",
+            "  -> sends HTTP, TLS, random bytes, or disconnects before JOIN",
+            "  -> server rejects the handshake and sends REJECT",
+            "  -> peer has already closed the socket",
+            "  -> Linux send raises SIGPIPE",
+            "  -> default signal action terminates SyncCinemaServer",
+            "  -> shell exit status = 128 + 13 = 141",
+        ],
+    )
+    add_bullet(doc, "公网端口会持续收到不遵守 SyncCinema 协议的连接；此前日志曾明确出现 visionheight.com/scan，本次代码尚未记录 peer address，因此不声称具体来源。")
+    add_bullet(doc, "Windows send 通常返回 SOCKET_ERROR，而 Linux 默认可能先投递 SIGPIPE；原有 bytesSent == kSocketError 分支因此没有机会执行，这是典型的跨平台行为差异。")
+    add_bullet(doc, "临时止血是在启动 server 的 tmux shell 中执行 trap '' PIPE，使子进程继承忽略设置；send 随后返回 EPIPE，由现有错误路径处理。")
+    add_bullet(doc, "正式修复计划是在 Linux socket 初始化层统一忽略 SIGPIPE，或对每次 send 使用 MSG_NOSIGNAL，并增加‘握手失败后对端立即断开’回归测试。")
+    add_bullet(doc, "该缺陷不只会被扫描器触发；合法客户端在 server 发送快照、心跳或控制消息时突然断网，同样可能命中，因此属于服务端可用性问题。")
+    add_body(
+        doc,
+        "这次排障形成了完整证据链：客户端错误码 10061说明端口拒绝连接，ss 证明监听进程消失，"
+        "tmux capture-pane 证明服务无业务错误直接退出，shell 状态 141 最终定位到 SIGPIPE。"
+        "面试表达时应强调先依据证据缩小范围，再回到 POSIX socket 语义验证根因，而不是把问题笼统归因于云服务器不稳定。",
+    )
+
+    doc.add_heading("7.13 云端单机双实例自动校正实验", level=2)
+    add_body(
+        doc,
+        "2026-09-25 在提交 c89e021 上完成云端 server 与同一台 Windows 电脑两个 Qt client 的完整实验。"
+        "基础测试覆盖晚加入快照、双向 PLAY/PAUSE/SEEK、连续播放、房间清空后更换影片，以及异媒体加入拒绝；"
+        "故障注入则通过暂停一个客户端进程 3-5 秒制造持续落后。该实验能验证公网通信、播放器停顿检测和校正闭环，"
+        "但两端共享同一台电脑，不能替代真实双机在独立解码负载、系统调度和网络路径下的最终验收。",
+    )
+    add_cloud_correction_experiment_table(doc)
+    add_bullet(
+        doc,
+        "晚加入后的轻微延迟与日志一致：稳定相对偏差约 421-537 ms，低于 750 ms 硬 seek 阈值；执行一次新的播放控制后偏差明显缩小，说明权威 CONTROL 能重新对齐两端，而初始快照应用仍存在播放器异步稳定窗口。",
+    )
+    add_bullet(
+        doc,
+        "一次晚加入期间出现 Playing 状态却短暂上报 0 ms，形成约 55 s 离群值，随后自行恢复。现有稳定窗口和方向安全门阻止了误校正，但后续应让新客户端在实际位置稳定前暂不参与校正统计。",
+    )
+    add_bullet(
+        doc,
+        "暂停进程期间 RTT 最大值达到约 10.9 s 和 20.8 s，这是 PONG 线程随进程一起停顿造成的测量结果，不代表公网链路本身恶化；正常 RTT 中位数仍为 19-30 ms。后续统计应优先使用滚动中位数或低分位数，避免累计平均值被故障注入污染。",
+    )
+    add_bullet(
+        doc,
+        "房间清空后 Room 快照已回到 epoch 0，但 metrics 日志曾短暂保留旧 epoch 3，说明业务状态重置正确而统计收集器未同步重置。当前不影响协议校验和校正执行，但会污染分析结论，应补充 metrics 会话重置接口与回归测试。",
+    )
+    add_body(
+        doc,
+        "阶段结论：自动校正已经从‘代码可执行’推进到‘云端故障注入下有量化效果’。三次校正均选中真实落后端，"
+        "命令全部成功回执，校正后典型偏差降至 20-126 ms，证明最小闭环有效。当前主要问题已从‘能否校正’转为"
+        "晚加入中等偏差、播放器位置稳定性、统计会话重置和 Linux SIGPIPE 等可靠性收口；在这些问题修复前，"
+        "不把本次结果表述为真实双机异地同步精度的最终结论。",
+    )
+
+    doc.add_heading("7.14 可靠性修复与提交前云端复验", level=2)
+    add_body(
+        doc,
+        "2026-10-20 针对 7.12 和 7.13 暴露的问题完成一轮可靠性收口，并在提交前将候选 Linux server"
+        " 单独部署到云端。代码没有覆盖旧发布目录，便于异常时快速回退；Windows 完整构建与两项 CTest、"
+        "WSL Linux server 构建与核心测试均通过后，才进入真实播放器复验。",
+    )
+    add_bullet(
+        doc,
+        "晚加入位置确认：libVLC seek 是异步命令，调用成功不代表画面已到达目标。client 新增位置收敛跟踪器，"
+        "Playing 状态按经过时间推进期望位置，要求连续两个样本落在 250 ms 容差内；必要时最多补发两次追赶 seek，"
+        "确认后才启动进度上报，避免 Playing/0 ms 等未应用快照样本进入校正窗口。",
+    )
+    add_bullet(
+        doc,
+        "RTT 稳健估计：每个 client 保存最近 60 个微秒级 RTT，以窗口 P10 作为当前低排队基线，"
+        "同时记录滚动平均值、中位数、P95 和 lifetime min/max。进程暂停产生的秒级 PONG 延迟仍能被 P95 观察，"
+        "但不会长期抬高 one_way 补偿。",
+    )
+    add_bullet(
+        doc,
+        "会话生命周期：Room::removeClient 返回房间是否已经清空；最后一个 client 离开时，server 同步调用"
+        " metrics.resetSession，清除旧 epoch、client RTT、pair 窗口和校正冷却。复验日志出现"
+        " metrics_session_reset previous_epoch=18，证明业务会话与统计会话一起结束。",
+    )
+    add_bullet(
+        doc,
+        "Linux SIGPIPE：server 发送统一走 sendSocket，POSIX 分支使用 MSG_NOSIGNAL。云端向 9000 端口连续制造"
+        " 20 次 connect 后 TCP RST，日志得到 EPIPE 32，但原 PID 与监听端口保持不变；异常 peer 现在只会损失"
+        " 单条连接，不再终止整个进程。",
+    )
+    add_body(
+        doc,
+        "真实单机双实例复验中，第二个 client 在房间约 38082 ms 时加入；最初两条 pair 样本偏差约 1091 ms，"
+        "随后约 1-2 秒内降到 36-287 ms，没有触发错误校正，用户也未观察到可见问题。故障注入形成两次独立停顿："
+        "client 2 的 REPORT 间隔约 24825 ms、窗口中位偏差约 22128 ms，client 1 的 REPORT 间隔约 10457 ms、"
+        "窗口中位偏差约 8053 ms。server 两次都选择真实落后端，APPLIED 回执延迟分别为 28 ms 和 23 ms；"
+        "恢复后 Playing 窗口最终达到 median 约 88 ms、P95 约 90 ms。",
+    )
+    add_body(
+        doc,
+        "本次复验同时验证了新 RTT 解释：两端稳定基线分别约为 22 ms 和 28 ms；暂停期间 lifetime max 达到"
+        "约 8.8 s 和 23.5 s，滚动 P95 显示异常，但 baseline 始终保持稳定。结论是本轮已解决已知可靠性阻塞项，"
+        "最小自动校正闭环具备提交条件；仍需保留‘同机双实例’限定，不能把结果表述为真实异地双机最终精度。",
     )
 
     doc.add_heading("8. 面试表达模板", level=1)
@@ -1384,6 +1560,14 @@ def build_document():
         "LibVlcPlayer 负责订阅和生命周期解绑，QtClientController 再通过 queued invoke 回到主线程。"
         "同时用 generation 隔离旧会话迟到事件，并在播放失败后离开房间，避免无效进度污染同步测量。",
     )
+    add_body(
+        doc,
+        "第八段可以这样说明公网稳定性：版本部署后，公网扫描连接在 JOIN 前断开，server 没有打印 send 错误却整体退出。"
+        "我先用 10061、ss 和 tmux 输出确认监听进程消失，再通过退出码 141 定位为 SIGPIPE。根因是 Windows send"
+        " 返回错误，而 Linux 默认信号会在错误分支执行前终止进程。临时用 shell 忽略 PIPE 恢复服务，正式修复则把"
+        " sendSocket 下沉到跨平台网络层，Linux 使用 MSG_NOSIGNAL。随后用 socketpair 回归和云端 20 次 TCP RST 复验，"
+        "确认第三方异常流量只能损失单条连接，不能终止整个服务。",
+    )
 
     doc.add_heading("9. 后续学习重点", level=1)
     add_numbered(doc, "SyncClientSession：如何把 UI/CLI 与网络、协议、播放器并发解耦。")
@@ -1415,9 +1599,12 @@ def build_document():
     add_numbered(doc, "CONTROL epoch：为什么本地操作也要等待 server 回显，以及 epoch gap 为什么应视为不可继续的协议错误。")
     add_numbered(doc, "目标 client 级冷却：为什么多人房间不能只按 pair 冷却。")
     add_numbered(doc, "MetricLogger：当指标跨多个 cpp 产生时，为什么每个类各自一把日志锁仍然不够。")
+    add_numbered(doc, "Linux SIGPIPE：为什么 send 的返回值检查仍可能来不及执行，以及进程退出码 141 如何形成。")
+    add_numbered(doc, "晚加入稳定窗口：为什么 SNAPSHOT 已经包含当前进度，libVLC 仍可能短暂上报 0 ms 或留下 421-537 ms 偏差。")
+    add_numbered(doc, "故障注入下的 RTT：为什么暂停整个进程会同时阻塞 PONG，累计平均值为何不适合作为实时网络基线。")
+    add_numbered(doc, "metrics 会话生命周期：为什么 Room 清空时业务 epoch 和统计 epoch 必须一起重置。")
 
     doc.add_heading("10. 后续工程路线", level=1)
-    add_numbered(doc, "提交并推送最小自动校正闭环，随后统一部署新版 Linux server，避免客户端与旧协议 server 混用。")
     add_numbered(doc, "用两台真实电脑完成同媒体、相同公网 server 的验收，采集 correction_decision、correction_command、correction_execution 和 correction_result 全链路日志。")
     add_numbered(doc, "制造持续 750 ms 以上落后，验证只校正落后端、ACK 能匹配、5 秒冷却生效，并观察是否出现过冲或反复 seek。")
     add_numbered(doc, "统计校正前后 pair median/P95、命令成功率、拒绝原因和用户可见跳转频率，再决定是否调整阈值。")
@@ -1429,9 +1616,10 @@ def build_document():
     add_callout(
         doc,
         "下一阶段入口",
-        "最小自动校正已经完成代码闭环与 Windows/Linux 回归：普通控制具备权威 epoch，server 能定向派发"
-        "带 command id 的 CORRECT，client 安全执行并返回结构化结果。下一步不再扩功能，而是 review/提交后"
-        "统一部署云端，用两台真实电脑验证校正方向、频率、回执和体感，再根据数据调整阈值。",
+        "最小自动校正已完成可靠性收口和第二轮云端单机双实例验收：Linux SIGPIPE、metrics 会话重置、"
+        "滚动 RTT 基线和晚加入位置确认均已实现并通过回归。两次故障注入分别从约 22.1 秒和 8.1 秒偏差恢复，"
+        "最终 Playing 窗口中位偏差约 88 ms。下一步用两台真实电脑复测相同场景，再根据跨设备数据决定是否为"
+        " 250-750 ms 中等偏差引入温和校正。",
     )
 
     doc.save(OUTPUT_PATH)

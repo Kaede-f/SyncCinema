@@ -15,6 +15,16 @@ namespace
     constexpr auto kInitialSnapshotTimeout = std::chrono::seconds(5);
     constexpr auto kPlayerSeekableTimeout = std::chrono::seconds(15);
     constexpr auto kPlayerReadyPollInterval = std::chrono::milliseconds(25);
+    constexpr auto kInitialPositionConvergenceTimeout =
+        std::chrono::seconds(5);
+    constexpr auto kPositionConvergencePollInterval =
+        std::chrono::milliseconds(50);
+    constexpr auto kCatchUpSeekMinimumInterval =
+        std::chrono::milliseconds(250);
+    constexpr long long kInitialSeekAppliedToleranceMs = 1000;
+    constexpr int kMaximumCatchUpSeekCount = 2;
+    constexpr PlaybackPositionConvergenceConfig
+        kInitialPositionConvergenceConfig{ 250, 2 };
 
     bool tryTakeProtocolLine(std::string& receiveBuffer, std::string& line)
     {
@@ -35,6 +45,9 @@ namespace
         return true;
     }
 
+    /*
+        一次 send(socket, buffer, length, 0) 不保证把 length 个字节全部发送完
+    */
     bool sendAll(
         SOCKET socket,
         const std::string& data,
@@ -46,7 +59,7 @@ namespace
             int remaining = static_cast<int>(data.size() - totalSent);
             int bytesSent = send(
                 socket,
-                data.data() + totalSent,
+                data.data() + totalSent, // data.data() 返回字符串第一个字符的地址
                 remaining,
                 0
             );
@@ -87,6 +100,11 @@ namespace
     }
 }
 
+/*
+    构造函数成员初始化列表
+    也就是直接用初始化列表初始化成员，而不是先默认构造一个空的成员，再赋值
+    尤其 player_ 是引用，引用必须在出生时就绑定对象，不能先创建一个空引用，以后再赋值
+*/
 SyncClientSession::SyncClientSession(
     PlayerController& player,
     SyncClientCallbacks callbacks)
@@ -238,7 +256,7 @@ void SyncClientSession::disconnect()
     }
 }
 
-bool SyncClientSession::sendControlMessage(
+bool SyncClientSession::sendControlMessage( // 发送 控制类消息 的高级接口
     const SyncMessage& message,
     std::string& errorMessage)
 {
@@ -256,7 +274,7 @@ bool SyncClientSession::sendControlMessage(
 
     // 本地操作也必须等待 server 分配 epoch 后回显。这样多个 client
     // 同时操作时，所有播放器都严格按 server 的同一顺序执行。
-    if (!sendProtocolMessage(message, errorMessage))
+    if (!sendProtocolMessage(message, errorMessage)) // 发送 任意协议消息 的底层公共接口
     {
         handleTransportFailure(errorMessage);
         return false;
@@ -493,6 +511,9 @@ bool SyncClientSession::applyInitialSnapshot(
 
     Clock::time_point applyStartedAt = Clock::now();
     SyncClientPlaybackSnapshot playbackSnapshot;
+    PlaybackPositionObservation positionObservation;
+    long long positionConfirmationMs = 0;
+    int catchUpSeekCount = 0;
 
     {
         std::lock_guard<std::mutex> lock(playerMutex_);
@@ -533,6 +554,8 @@ bool SyncClientSession::applyInitialSnapshot(
                 return false;
             }
 
+            Clock::time_point positionReferenceTime = Clock::now();
+
             if (snapshot.playbackState != PlaybackState::Playing &&
                 !player_.pause())
             {
@@ -540,13 +563,49 @@ bool SyncClientSession::applyInitialSnapshot(
                     "initial snapshot failed: pause command failed";
                 return false;
             }
+
+            Clock::time_point positionConfirmationStartedAt = Clock::now();
+            if (!waitUntilPlayerPositionConverges(
+                    targetPositionMs,
+                    snapshot.playbackState,
+                    positionReferenceTime,
+                    positionObservation,
+                    catchUpSeekCount))
+            {
+                errorMessage =
+                    "initial snapshot failed: player position did not "
+                    "converge near target (expected=" +
+                    std::to_string(
+                        positionObservation.expectedPositionMilliseconds) +
+                    " ms, actual=" +
+                    std::to_string(
+                        positionObservation.actualPositionMilliseconds) +
+                    " ms)";
+                return false;
+            }
+            positionConfirmationMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - positionConfirmationStartedAt
+                ).count();
+        }
+        else
+        {
+            positionObservation.actualPositionMilliseconds =
+                player_.getPositionMilliseconds();
+            positionObservation.expectedPositionMilliseconds =
+                targetPositionMs;
+            positionObservation.errorMilliseconds =
+                positionObservation.actualPositionMilliseconds -
+                targetPositionMs;
+            positionObservation.converged = true;
         }
 
         applyMessageToState(snapshot, localState_);
         currentControlEpoch_ = snapshot.controlEpoch;
-        localState_.positionMilliseconds = targetPositionMs;
+        localState_.positionMilliseconds =
+            positionObservation.actualPositionMilliseconds;
         localState_.positionSeconds =
-            static_cast<int>(targetPositionMs / 1000);
+            static_cast<int>(localState_.positionMilliseconds / 1000);
 
         playbackSnapshot.state = localState_;
         playbackSnapshot.playerPositionMs =
@@ -565,7 +624,11 @@ bool SyncClientSession::applyInitialSnapshot(
         << " epoch=" << snapshot.controlEpoch
         << " state=" << stateToString(snapshot.playbackState)
         << " snapshot_pos_ms=" << snapshot.positionMilliseconds
-        << " target_pos_ms=" << playbackSnapshot.state.positionMilliseconds
+        << " target_pos_ms=" << positionObservation.expectedPositionMilliseconds
+        << " actual_pos_ms=" << playbackSnapshot.playerPositionMs
+        << " position_error_ms=" << positionObservation.errorMilliseconds
+        << " position_confirm_ms=" << positionConfirmationMs
+        << " catch_up_seeks=" << catchUpSeekCount
         << " apply_ms=" << applyDurationMs
         << " success=1";
     emitLog(metric.str());
@@ -590,6 +653,91 @@ bool SyncClientSession::waitUntilPlayerSeekable()
     }
 
     return running_ && player_.isSeekable();
+}
+
+bool SyncClientSession::waitUntilPlayerPositionConverges(
+    long long targetPositionMilliseconds,
+    PlaybackState playbackState,
+    Clock::time_point targetReferenceTime,
+    PlaybackPositionObservation& finalObservation,
+    int& catchUpSeekCount)
+{
+    PlaybackPositionConvergenceTracker tracker(
+        targetPositionMilliseconds,
+        playbackState,
+        targetReferenceTime,
+        kInitialPositionConvergenceConfig
+    );
+
+    Clock::time_point deadline =
+        Clock::now() + kInitialPositionConvergenceTimeout;
+    Clock::time_point lastCatchUpSeekAt = targetReferenceTime;
+    catchUpSeekCount = 0;
+
+    while (running_ && Clock::now() < deadline)
+    {
+        Clock::time_point observedAt = Clock::now();
+        finalObservation = tracker.observe(
+            player_.getPositionMilliseconds(),
+            observedAt
+        );
+        if (finalObservation.converged)
+        {
+            return true;
+        }
+
+        if (playbackState == PlaybackState::Playing &&
+            catchUpSeekCount < kMaximumCatchUpSeekCount)
+        {
+            const long long distanceFromInitialTarget =
+                finalObservation.actualPositionMilliseconds >=
+                    targetPositionMilliseconds
+                    ? finalObservation.actualPositionMilliseconds -
+                        targetPositionMilliseconds
+                    : targetPositionMilliseconds -
+                        finalObservation.actualPositionMilliseconds;
+
+            // 第一次 seek 已经把播放器带到目标附近，但播放器可能因为
+            // 缓冲耗时而落后正在前进的房间时钟。此时最多补发两次邻近
+            // seek，追到“当前目标”，而不是等待一个固定偏差自行消失。
+            const bool initialSeekHasApplied =
+                targetPositionMilliseconds <=
+                    kInitialSeekAppliedToleranceMs ||
+                distanceFromInitialTarget <=
+                    kInitialSeekAppliedToleranceMs;
+            const bool stillBehind =
+                finalObservation.errorMilliseconds <
+                    -kInitialPositionConvergenceConfig.toleranceMilliseconds;
+            const bool catchUpIntervalElapsed =
+                observedAt - lastCatchUpSeekAt >=
+                    kCatchUpSeekMinimumInterval;
+
+            if (initialSeekHasApplied &&
+                stillBehind &&
+                catchUpIntervalElapsed)
+            {
+                if (!player_.seekMilliseconds(
+                        finalObservation.expectedPositionMilliseconds))
+                {
+                    return false;
+                }
+
+                ++catchUpSeekCount;
+                lastCatchUpSeekAt = observedAt;
+            }
+        }
+
+        std::this_thread::sleep_for(kPositionConvergencePollInterval);
+    }
+
+    if (running_)
+    {
+        finalObservation = tracker.observe(
+            player_.getPositionMilliseconds(),
+            Clock::now()
+        );
+    }
+    return running_ && finalObservation.converged;
 }
 
 bool SyncClientSession::applyControlMessage(

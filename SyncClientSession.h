@@ -11,6 +11,7 @@
 #include <winsock2.h>
 
 #include "PlayerController.h"
+#include "PlaybackPositionConvergence.h"
 #include "Protocol.h"
 
 enum class SyncClientCommandSource
@@ -101,6 +102,13 @@ private:
         std::string& errorMessage
     );
     bool waitUntilPlayerSeekable();
+    bool waitUntilPlayerPositionConverges(
+        long long targetPositionMilliseconds,
+        PlaybackState playbackState,
+        Clock::time_point targetReferenceTime,
+        PlaybackPositionObservation& finalObservation,
+        int& catchUpSeekCount
+    );
 
     bool applyControlMessage(
         const SyncMessage& message,

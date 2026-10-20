@@ -14,11 +14,10 @@ namespace
 
         while (totalSent < totalSize)
         {
-            int bytesSent = send(
+            int bytesSent = sendSocket(
                 socket,
                 data.c_str() + totalSent,
-                totalSize - totalSent,
-                0
+                totalSize - totalSent
             );
 
             if (bytesSent == kSocketError)
@@ -78,7 +77,7 @@ RoomJoinResult Room::joinClient(
     return result;
 }
 
-void Room::removeClient(SocketHandle clientSocket)
+bool Room::removeClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -101,6 +100,8 @@ void Room::removeClient(SocketHandle clientSocket)
         controlEpoch_ = 0;
         lastStateUpdateTime_ = Clock::now();
     }
+
+    return clients_.empty();
 }
 
 bool Room::broadcastControlMessage(const SyncMessage& message)

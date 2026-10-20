@@ -39,3 +39,7 @@ void cleanupSockets();
 void closeSocket(SocketHandle socket);
 
 int getSocketError();
+
+// 统一发送入口。Linux 使用 MSG_NOSIGNAL，远端提前断开时让 send 返回错误，
+// 而不是用 SIGPIPE 直接终止整个 server 进程。
+int sendSocket(SocketHandle socket, const char* data, int length);
