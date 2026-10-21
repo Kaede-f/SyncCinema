@@ -1,0 +1,161 @@
+groups:
+  - name: synccinema-availability
+    interval: 15s
+    rules:
+      - alert: SyncCinemaServerDown
+        expr: up{job="synccinema"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: SyncCinema metrics endpoint is unreachable
+          description: Prometheus has failed to scrape the sync server for one minute.
+
+      - alert: SyncCinemaJoinSuccessRatioLow
+        expr: |
+          (
+            sum(increase(synccinema_join_results_total{outcome="accepted"}[10m]))
+            /
+            clamp_min(sum(increase(synccinema_join_results_total[10m])), 1)
+          ) < 0.99
+          and
+          sum(increase(synccinema_join_results_total[10m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: JOIN success ratio is below 99 percent
+          description: At least 20 JOIN attempts were observed in ten minutes and fewer than 99 percent succeeded.
+
+      - alert: SyncCinemaControlAcknowledgementMissing
+        expr: increase(synccinema_control_results_total{status="missing"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: A playback control acknowledgement is missing
+          description: A session ended with at least one expected control ACK absent.
+
+  - name: synccinema-user-experience
+    interval: 15s
+    rules:
+      - alert: SyncCinemaFirstFrameP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(synccinema_time_to_first_frame_ms_bucket[10m]))
+          ) > 3000
+          and
+          increase(synccinema_time_to_first_frame_ms_count[10m]) >= 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: First-frame P95 exceeds three seconds
+          description: Startup responsiveness is outside the initial service objective.
+
+      - alert: SyncCinemaPairSkewP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(synccinema_pair_skew_ms_bucket[10m]))
+          ) > 250
+          and
+          increase(synccinema_pair_skew_ms_count[10m]) >= 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Playback skew P95 exceeds 250 milliseconds
+          description: At least 100 valid pair samples were measured and synchronization quality is degraded.
+
+      - alert: SyncCinemaGoodSyncRatioLow
+        expr: |
+          (
+            sum(rate(synccinema_sync_pair_samples_total{quality="good"}[10m]))
+            /
+            clamp_min(sum(rate(synccinema_sync_pair_samples_total[10m])), 0.000001)
+          ) < 0.95
+          and
+          sum(increase(synccinema_sync_pair_samples_total[10m])) >= 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Sync-good ratio is below 95 percent
+          description: More than five percent of valid projected pair samples exceed the 250 millisecond tolerance.
+
+      - alert: SyncCinemaControlLatencyP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(synccinema_control_ack_latency_ms_bucket[10m]))
+          ) > 500
+          and
+          increase(synccinema_control_ack_latency_ms_count[10m]) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Control ACK latency P95 exceeds 500 milliseconds
+          description: Playback controls are taking too long to be acknowledged by clients.
+
+      - alert: SyncCinemaCorrectionFailureRatioHigh
+        expr: |
+          (
+            sum(increase(synccinema_corrections_total{status=~"dispatch_failed|rejected|missing_result"}[10m]))
+            /
+            clamp_min(sum(increase(synccinema_corrections_total{status=~"dispatched|dispatch_failed"}[10m])), 1)
+          ) > 0.01
+          and
+          sum(increase(synccinema_corrections_total{status=~"dispatched|dispatch_failed"}[10m])) >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Correction failure ratio exceeds one percent
+          description: Guarded correction dispatches or acknowledgements are failing too frequently.
+
+      - alert: SyncCinemaCorrectionConvergenceP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(synccinema_correction_convergence_ms_bucket[15m]))
+          ) > 2000
+          and
+          increase(synccinema_correction_convergence_ms_count[15m]) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Correction convergence P95 exceeds two seconds
+          description: Applied corrections are taking too long to restore acceptable synchronization.
+
+  - name: synccinema-host
+    interval: 30s
+    rules:
+      - alert: SyncCinemaHostDiskSpaceLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node",mountpoint="/",fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{job="node",mountpoint="/",fstype!~"tmpfs|overlay"}
+          ) < 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Host root filesystem has less than 15 percent free space
+          description: Telemetry and media storage may fail when disk space is exhausted.
+
+      - alert: SyncCinemaHostFileDescriptorsHigh
+        expr: |
+          node_filefd_allocated{job="node"}
+          /
+          clamp_min(node_filefd_maximum{job="node"}, 1) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Host file descriptor utilization exceeds 80 percent
+          description: New TCP connections may fail if descriptor pressure continues.
