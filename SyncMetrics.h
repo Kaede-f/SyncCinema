@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "Protocol.h"
 #include "RttEstimator.h"
@@ -30,6 +31,24 @@ struct SyncMetricsSessionSnapshot
     std::size_t trackedPairs = 0;
 };
 
+// server 已把两份 REPORT 投影到同一时刻后的 pair 事实。
+// validForExperience 只在非 settling、双方已有 RTT 基线且样本未过期时为 true。
+struct SyncPairObservation
+{
+    int clientAId = 0;
+    int clientBId = 0;
+    long long controlEpoch = 0;
+    PlaybackState playbackState = PlaybackState::Stopped;
+    long long absoluteDifferenceMilliseconds = 0;
+    bool validForExperience = false;
+};
+
+struct SyncMetricsUpdate
+{
+    std::optional<SyncCorrectionProposal> correctionProposal;
+    std::vector<SyncPairObservation> pairObservations;
+};
+
 // SyncMetricsCollector 负责日志分析，并从可信窗口中产出校正提案。
 //
 // 当前同时观察两类偏差：
@@ -51,7 +70,7 @@ public:
     // controlEpoch 由 Room 生成，metrics 只消费它，避免出现两套版本号各自递增。
     void beginControlEpoch(long long controlEpoch, const SyncMessage& controlMessage);
 
-    std::optional<SyncCorrectionProposal> recordProgressReport(
+    SyncMetricsUpdate recordProgressReport(
         const SyncMetricSample& sample
     );
     void recordCorrectionDispatched(const SyncCorrectionProposal& proposal);

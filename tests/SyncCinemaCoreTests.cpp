@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "MockPlayer.h"
+#include "ExperienceMetrics.h"
 #include "NetSocket.h"
 #include "PlaybackPositionConvergence.h"
 #include "Protocol.h"
@@ -691,6 +692,244 @@ namespace
         );
     }
 
+    void testExperienceObservationProtocol()
+    {
+        SyncMessage firstFrame;
+        firstFrame.type = MessageType::FirstFrame;
+        firstFrame.controlEpoch = 3;
+        firstFrame.firstFrameTrigger = FirstFrameTrigger::Startup;
+        firstFrame.firstFrameMilliseconds = 1875;
+
+        const std::string firstFrameWire = messageToString(firstFrame);
+        expect(
+            firstFrameWire == "FIRST_FRAME 3 STARTUP 1875\n",
+            "FIRST_FRAME serializes startup latency"
+        );
+        const SyncMessage parsedFirstFrame = stringToMessage(firstFrameWire);
+        expect(
+            parsedFirstFrame.type == MessageType::FirstFrame &&
+                parsedFirstFrame.controlEpoch == 3 &&
+                parsedFirstFrame.firstFrameTrigger ==
+                    FirstFrameTrigger::Startup &&
+                parsedFirstFrame.firstFrameMilliseconds == 1875,
+            "FIRST_FRAME round-trips epoch, trigger and duration"
+        );
+
+        SyncMessage controlResult;
+        controlResult.type = MessageType::ControlResult;
+        controlResult.controlEpoch = 4;
+        controlResult.relatedControlType = MessageType::Seek;
+        controlResult.controlResultStatus = ControlResultStatus::Applied;
+        controlResult.positionMilliseconds = 120250;
+        controlResult.controlApplyMilliseconds = 12;
+        controlResult.controlResultReason = "OK";
+
+        const std::string controlResultWire = messageToString(controlResult);
+        expect(
+            controlResultWire ==
+                "CONTROL_RESULT 4 SEEK APPLIED 120250 12 OK\n",
+            "CONTROL_RESULT serializes the authoritative control outcome"
+        );
+        const SyncMessage parsedResult = stringToMessage(controlResultWire);
+        expect(
+            parsedResult.type == MessageType::ControlResult &&
+                parsedResult.controlEpoch == 4 &&
+                parsedResult.relatedControlType == MessageType::Seek &&
+                parsedResult.controlResultStatus ==
+                    ControlResultStatus::Applied &&
+                parsedResult.positionMilliseconds == 120250 &&
+                parsedResult.controlApplyMilliseconds == 12 &&
+                parsedResult.controlResultReason == "OK",
+            "CONTROL_RESULT round-trips status, position and apply latency"
+        );
+
+        expect(
+            stringToMessage("FIRST_FRAME 3 UNKNOWN 10").type ==
+                MessageType::Unknown,
+            "FIRST_FRAME rejects unknown triggers"
+        );
+        expect(
+            stringToMessage("CONTROL_RESULT 0 PLAY APPLIED 0 1 OK").type ==
+                MessageType::Unknown,
+            "CONTROL_RESULT rejects a non-positive control epoch"
+        );
+        expect(
+            stringToMessage("CONTROL_RESULT 4 PLAY APPLIED 0 1 FAILED").type ==
+                MessageType::Unknown,
+            "CONTROL_RESULT requires OK for an applied result"
+        );
+        expect(
+            stringToMessage("CONTROL_RESULT 4 PLAY REJECTED 0 1 OK").type ==
+                MessageType::Unknown,
+            "CONTROL_RESULT requires a stable reason for rejection"
+        );
+    }
+
+    void testExperienceMetricsSessionSummary()
+    {
+        using Collector = ExperienceMetricsCollector;
+        const Collector::Clock::time_point startedAt{};
+        Collector collector;
+        collector.beginSession("session-test");
+        collector.recordClientJoined(1, true);
+        collector.recordClientJoined(2, true);
+        collector.recordClientJoined(3, false);
+
+        SyncMessage firstFrame;
+        firstFrame.type = MessageType::FirstFrame;
+        firstFrame.controlEpoch = 0;
+        firstFrame.firstFrameTrigger = FirstFrameTrigger::Startup;
+        firstFrame.firstFrameMilliseconds = 1200;
+        expect(
+            collector.recordFirstFrame(1, firstFrame).status ==
+                FirstFrameRecordStatus::Recorded,
+            "first frame is recorded once per joined client"
+        );
+        expect(
+            collector.recordFirstFrame(1, firstFrame).status ==
+                FirstFrameRecordStatus::Duplicate,
+            "duplicate first-frame observations are ignored"
+        );
+        firstFrame.firstFrameMilliseconds = 2100;
+        expect(
+            collector.recordFirstFrame(2, firstFrame).status ==
+                FirstFrameRecordStatus::Recorded,
+            "second client contributes its first-frame sample"
+        );
+
+        expect(
+            collector.recordControlDispatched(
+                1,
+                MessageType::Play,
+                { 1, 2 },
+                startedAt
+            ),
+            "control dispatch starts ACK correlation"
+        );
+        SyncMessage result;
+        result.type = MessageType::ControlResult;
+        result.controlEpoch = 1;
+        result.relatedControlType = MessageType::Play;
+        result.controlResultStatus = ControlResultStatus::Applied;
+        result.positionMilliseconds = 1000;
+        result.controlApplyMilliseconds = 18;
+        result.controlResultReason = "OK";
+        expect(
+            collector.recordControlResult(
+                1,
+                result,
+                startedAt + std::chrono::milliseconds(120)
+            ).matchStatus == ControlAckMatchStatus::Matched,
+            "matching control result records end-to-end ACK latency"
+        );
+        expect(
+            collector.recordControlResult(
+                1,
+                result,
+                startedAt + std::chrono::milliseconds(125)
+            ).matchStatus == ControlAckMatchStatus::Duplicate,
+            "duplicate control results do not inflate success counts"
+        );
+        result.controlResultStatus = ControlResultStatus::Rejected;
+        result.controlApplyMilliseconds = 25;
+        result.controlResultReason = "PLAYER_COMMAND_FAILED";
+        expect(
+            collector.recordControlResult(
+                2,
+                result,
+                startedAt + std::chrono::milliseconds(300)
+            ).matchStatus == ControlAckMatchStatus::Matched,
+            "rejected control results are correlated and counted"
+        );
+
+        collector.recordCorrectionDispatched(9, 1, 2, 1, startedAt);
+        collector.recordCorrectionResult(9, true, true);
+
+        ExperiencePairSample pairSample;
+        pairSample.clientAId = 1;
+        pairSample.clientBId = 2;
+        pairSample.controlEpoch = 1;
+        pairSample.playbackState = PlaybackState::Playing;
+        pairSample.valid = true;
+        pairSample.absoluteDifferenceMilliseconds = 400;
+        expect(
+            collector.recordPairSample(
+                pairSample,
+                startedAt + std::chrono::milliseconds(200)
+            ).empty(),
+            "large skew does not prematurely mark correction converged"
+        );
+        pairSample.absoluteDifferenceMilliseconds = 120;
+        expect(
+            collector.recordPairSample(
+                pairSample,
+                startedAt + std::chrono::milliseconds(500)
+            ).empty(),
+            "correction waits for consecutive good samples"
+        );
+        pairSample.absoluteDifferenceMilliseconds = 80;
+        const std::vector<CorrectionConvergenceRecord> converged =
+            collector.recordPairSample(
+                pairSample,
+                startedAt + std::chrono::milliseconds(800)
+            );
+        expect(
+            converged.size() == 1 &&
+                converged.front().commandId == 9 &&
+                converged.front().convergenceMilliseconds == 800,
+            "correction converges after two consecutive samples within 250 ms"
+        );
+
+        expect(
+            collector.recordControlDispatched(
+                2,
+                MessageType::Pause,
+                { 1 },
+                startedAt + std::chrono::seconds(1)
+            ),
+            "unanswered control is retained as a missing ACK"
+        );
+
+        const ExperienceSessionSummary summary = collector.endSession(
+            startedAt + std::chrono::seconds(2)
+        );
+        expect(
+            summary.sessionId == "session-test" &&
+                summary.joinedClients == 3 &&
+                summary.firstFrameExpected == 2 &&
+                summary.firstFrameReports == 2 &&
+                summary.firstFrameMissing == 0 &&
+                summary.firstFrameP95BucketMilliseconds == 3000,
+            "session summary reports join and first-frame coverage"
+        );
+        expect(
+            summary.controlExpectedAcks == 3 &&
+                summary.controlMatchedAcks == 2 &&
+                summary.controlAppliedAcks == 1 &&
+                summary.controlRejectedAcks == 1 &&
+                summary.controlMissingAcks == 1 &&
+                summary.controlAckP95BucketMilliseconds == 500,
+            "session summary reports applied, rejected and missing control ACKs"
+        );
+        expect(
+            summary.validPairSamples == 3 &&
+                summary.goodPairSamples == 2 &&
+                summary.syncGoodRatio > 0.66 &&
+                summary.syncGoodRatio < 0.67 &&
+                summary.pairSkewP95BucketMilliseconds == 500 &&
+                summary.maximumPairSkewMilliseconds == 400,
+            "session summary reports sync quality without storing every sample"
+        );
+        expect(
+            summary.correctionsDispatched == 1 &&
+                summary.correctionsApplied == 1 &&
+                summary.correctionsConverged == 1 &&
+                summary.correctionsNotConverged == 0 &&
+                summary.correctionConvergenceP95BucketMilliseconds == 1000,
+            "session summary measures correction outcome and convergence time"
+        );
+    }
+
     void testPlayerEventAbstraction()
     {
         ConsoleMockPlayer player;
@@ -1168,6 +1407,8 @@ int main()
     testPlaybackControlClassification();
     testProgressReportCarriesControlEpoch();
     testAuthoritativeControlAndCorrectionProtocol();
+    testExperienceObservationProtocol();
+    testExperienceMetricsSessionSummary();
     testPlayerEventAbstraction();
     testRoomSnapshotAndEpoch();
     testRoomMediaSessionLifecycle();

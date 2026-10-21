@@ -6,8 +6,10 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <utility>
 
+#include "ExperienceMetrics.h"
 #include "Protocol.h"
 #include "MetricLogger.h"
 #include "NetSocket.h"
@@ -53,6 +55,68 @@ namespace
             "duration_ms",
             removal.sessionDurationMilliseconds
         );
+        telemetry.emit(event);
+    }
+
+    void emitSessionSummary(
+        TelemetryLogger& telemetry,
+        const ExperienceSessionSummary& summary)
+    {
+        TelemetryEvent event;
+        event.name = "session_summary";
+        event.sessionId = summary.sessionId;
+        event
+            .addInteger("joined_clients", summary.joinedClients)
+            .addInteger("first_frame_expected", summary.firstFrameExpected)
+            .addInteger("first_frame_reports", summary.firstFrameReports)
+            .addInteger("first_frame_missing", summary.firstFrameMissing)
+            .addInteger(
+                "first_frame_p95_bucket_ms",
+                summary.firstFrameP95BucketMilliseconds
+            )
+            .addInteger("control_expected_acks", summary.controlExpectedAcks)
+            .addInteger("control_matched_acks", summary.controlMatchedAcks)
+            .addInteger("control_applied_acks", summary.controlAppliedAcks)
+            .addInteger("control_rejected_acks", summary.controlRejectedAcks)
+            .addInteger("control_missing_acks", summary.controlMissingAcks)
+            .addInteger(
+                "control_ack_p95_bucket_ms",
+                summary.controlAckP95BucketMilliseconds
+            )
+            .addInteger(
+                "client_apply_p95_bucket_ms",
+                summary.clientApplyP95BucketMilliseconds
+            )
+            .addInteger("valid_pair_samples", summary.validPairSamples)
+            .addInteger("good_pair_samples", summary.goodPairSamples)
+            .addDouble("sync_good_ratio", summary.syncGoodRatio)
+            .addInteger(
+                "pair_skew_p95_bucket_ms",
+                summary.pairSkewP95BucketMilliseconds
+            )
+            .addInteger(
+                "max_pair_skew_ms",
+                summary.maximumPairSkewMilliseconds
+            )
+            .addInteger(
+                "corrections_dispatched",
+                summary.correctionsDispatched
+            )
+            .addInteger("corrections_applied", summary.correctionsApplied)
+            .addInteger("corrections_rejected", summary.correctionsRejected)
+            .addInteger(
+                "corrections_missing_results",
+                summary.correctionsMissingResults
+            )
+            .addInteger("corrections_converged", summary.correctionsConverged)
+            .addInteger(
+                "corrections_not_converged",
+                summary.correctionsNotConverged
+            )
+            .addInteger(
+                "correction_convergence_p95_bucket_ms",
+                summary.correctionConvergenceP95BucketMilliseconds
+            );
         telemetry.emit(event);
     }
 
@@ -162,10 +226,13 @@ namespace
 
     void processLine(
         int clientId,
+        const std::string& sessionId,
         Room& room,
         SyncMetricsCollector& metrics,
+        ExperienceMetricsCollector& experienceMetrics,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
+        TelemetryLogger& telemetry,
         const std::string& line)
     {
         if (line.empty())
@@ -190,6 +257,76 @@ namespace
         {
             // 当前协议中 PING 只由 server 主动发出，client 只需要回 PONG。
             // 如果这里收到 PING，说明对端发来了当前 server 不支持的方向，直接忽略。
+            return;
+        }
+
+        if (message.type == MessageType::FirstFrame)
+        {
+            FirstFrameRecord record = experienceMetrics.recordFirstFrame(
+                clientId,
+                message
+            );
+
+            TelemetryEvent event;
+            event.name = "media_first_frame";
+            event.sessionId = sessionId;
+            event.clientId = clientId;
+            event.controlEpoch = message.controlEpoch;
+            event
+                .addString(
+                    "status",
+                    firstFrameRecordStatusToString(record.status)
+                )
+                .addString(
+                    "trigger",
+                    firstFrameTriggerToString(record.trigger)
+                )
+                .addInteger("duration_ms", record.durationMilliseconds);
+            telemetry.emit(event);
+            return;
+        }
+
+        if (message.type == MessageType::ControlResult)
+        {
+            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
+            ControlAckRecord record = experienceMetrics.recordControlResult(
+                clientId,
+                message,
+                Clock::now()
+            );
+
+            TelemetryEvent event;
+            event.name = "control_applied";
+            event.sessionId = sessionId;
+            event.clientId = clientId;
+            event.controlEpoch = message.controlEpoch;
+            event
+                .addString(
+                    "match",
+                    controlAckMatchStatusToString(record.matchStatus)
+                )
+                .addString(
+                    "command",
+                    messageTypeToString(record.controlType)
+                )
+                .addString(
+                    "status",
+                    controlResultStatusToString(record.resultStatus)
+                )
+                .addInteger(
+                    "ack_latency_ms",
+                    record.acknowledgementLatencyMilliseconds
+                )
+                .addInteger(
+                    "client_apply_ms",
+                    record.clientApplyMilliseconds
+                )
+                .addInteger(
+                    "actual_position_ms",
+                    record.actualPositionMilliseconds
+                )
+                .addString("reason", record.reason);
+            telemetry.emit(event);
             return;
         }
 
@@ -238,8 +375,53 @@ namespace
             sample.clientState = message.playbackState;
             sample.roomState = roomSnapshot.state.state;
 
-            std::optional<SyncCorrectionProposal> proposal =
+            SyncMetricsUpdate metricsUpdate =
                 metrics.recordProgressReport(sample);
+
+            for (const SyncPairObservation& observation :
+                metricsUpdate.pairObservations)
+            {
+                ExperiencePairSample experienceSample;
+                experienceSample.clientAId = observation.clientAId;
+                experienceSample.clientBId = observation.clientBId;
+                experienceSample.controlEpoch = observation.controlEpoch;
+                experienceSample.playbackState = observation.playbackState;
+                experienceSample.absoluteDifferenceMilliseconds =
+                    observation.absoluteDifferenceMilliseconds;
+                experienceSample.valid = observation.validForExperience;
+
+                std::vector<CorrectionConvergenceRecord> converged =
+                    experienceMetrics.recordPairSample(
+                        experienceSample,
+                        Clock::now()
+                    );
+                for (const CorrectionConvergenceRecord& record : converged)
+                {
+                    TelemetryEvent event;
+                    event.name = "correction_converged";
+                    event.sessionId = sessionId;
+                    event.controlEpoch = record.controlEpoch;
+                    event
+                        .addInteger("command_id", record.commandId)
+                        .addInteger("target_client", record.targetClientId)
+                        .addInteger(
+                            "reference_client",
+                            record.referenceClientId
+                        )
+                        .addInteger(
+                            "convergence_ms",
+                            record.convergenceMilliseconds
+                        )
+                        .addInteger(
+                            "final_abs_diff_ms",
+                            record.finalAbsoluteDifferenceMilliseconds
+                        );
+                    telemetry.emit(event);
+                }
+            }
+
+            std::optional<SyncCorrectionProposal>& proposal =
+                metricsUpdate.correctionProposal;
             if (!proposal.has_value())
             {
                 return;
@@ -281,6 +463,13 @@ namespace
             if (sent)
             {
                 metrics.recordCorrectionDispatched(*proposal);
+                experienceMetrics.recordCorrectionDispatched(
+                    command->commandId,
+                    command->controlEpoch,
+                    proposal->targetClientId,
+                    proposal->referenceClientId,
+                    Clock::now()
+                );
             }
             else
             {
@@ -311,6 +500,42 @@ namespace
                 clientId,
                 message
             );
+            const bool matched = result.matchStatus ==
+                CorrectionResultMatchStatus::Matched;
+            const bool applied = result.resultStatus ==
+                CorrectionResultStatus::Applied;
+            experienceMetrics.recordCorrectionResult(
+                result.commandId,
+                matched,
+                applied
+            );
+
+            TelemetryEvent event;
+            event.name = "correction_completed";
+            event.sessionId = sessionId;
+            event.clientId = clientId;
+            event.controlEpoch = result.controlEpoch;
+            event
+                .addString(
+                    "match",
+                    correctionResultMatchStatusToString(result.matchStatus)
+                )
+                .addInteger("command_id", result.commandId)
+                .addString(
+                    "status",
+                    correctionResultStatusToString(result.resultStatus)
+                )
+                .addInteger(
+                    "ack_latency_ms",
+                    result.acknowledgementLatencyMs
+                )
+                .addInteger(
+                    "actual_position_ms",
+                    result.actualPositionMilliseconds
+                )
+                .addInteger("forward_ms", result.forwardMilliseconds)
+                .addString("reason", result.reason);
+            telemetry.emit(event);
             {
                 std::lock_guard<std::mutex> logLock(metricLogMutex());
                 std::cout << "[metric] type=correction_result"
@@ -345,10 +570,41 @@ namespace
         // 多个 client 可能同时发控制命令。这把锁保证 Room 应用顺序、广播顺序和
         // metrics epoch 顺序完全一致，后续同步算法才有稳定的“先后”语义。
         std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-        room.broadcastControlMessage(message);
+        std::vector<ClientConnection> targets = room.getClientSnapshot();
+        const Clock::time_point broadcastStartedAt = Clock::now();
+        const bool broadcastSucceeded = room.broadcastControlMessage(message);
         RoomSnapshot snapshot = room.getSnapshot();
         metrics.beginControlEpoch(snapshot.controlEpoch, message);
         correctionCoordinator.retainControlEpoch(snapshot.controlEpoch);
+
+        std::vector<int> targetClientIds;
+        targetClientIds.reserve(targets.size());
+        for (const ClientConnection& target : targets)
+        {
+            targetClientIds.push_back(target.id);
+        }
+        const bool ackTrackingStarted =
+            experienceMetrics.recordControlDispatched(
+                snapshot.controlEpoch,
+                message.type,
+                targetClientIds,
+                broadcastStartedAt
+            );
+
+        TelemetryEvent event;
+        event.name = "control_dispatched";
+        event.sessionId = sessionId;
+        event.clientId = clientId;
+        event.controlEpoch = snapshot.controlEpoch;
+        event
+            .addString("command", messageTypeToString(message.type))
+            .addInteger(
+                "target_clients",
+                static_cast<long long>(targetClientIds.size())
+            )
+            .addBoolean("broadcast_success", broadcastSucceeded)
+            .addBoolean("ack_tracking_started", ackTrackingStarted);
+        telemetry.emit(event);
     }
 
     void handleClient(
@@ -357,6 +613,7 @@ namespace
         std::string sessionId,
         Room& room,
         SyncMetricsCollector& metrics,
+        ExperienceMetricsCollector& experienceMetrics,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         TelemetryLogger& telemetry,
@@ -374,10 +631,13 @@ namespace
             {
                 processLine(
                     clientId,
+                    sessionId,
                     room,
                     metrics,
+                    experienceMetrics,
                     correctionCoordinator,
                     controlCommandMutex,
+                    telemetry,
                     line
                 );
             }
@@ -406,6 +666,7 @@ namespace
         }
 
         RoomRemovalResult removal;
+        std::optional<ExperienceSessionSummary> sessionSummary;
         {
             // client 移除与 server 主动发送校正共用顺序锁，避免通过旧 id
             // 找到一个正被关闭、甚至已被系统复用的 socket。
@@ -413,10 +674,12 @@ namespace
             removal = room.removeClient(clientSocket);
             if (removal.sessionEnded)
             {
+                sessionSummary = experienceMetrics.endSession(Clock::now());
                 metrics.resetSession();
             }
             else
             {
+                experienceMetrics.removeClient(clientId);
                 metrics.removeClient(clientId);
             }
             correctionCoordinator.removeClient(clientId);
@@ -439,6 +702,10 @@ namespace
                 static_cast<long long>(removal.remainingClients)
             );
         telemetry.emit(disconnected);
+        if (sessionSummary.has_value())
+        {
+            emitSessionSummary(telemetry, *sessionSummary);
+        }
         emitSessionEnded(telemetry, removal);
 
         std::cout << "client removed. online clients: "
@@ -449,6 +716,7 @@ namespace
         SocketHandle clientSocket,
         Room& room,
         SyncMetricsCollector& metrics,
+        ExperienceMetricsCollector& experienceMetrics,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         TelemetryLogger& telemetry)
@@ -491,6 +759,11 @@ namespace
                 joinMessage.mediaIdentity
             );
 
+            if (joinResult.sessionStarted)
+            {
+                experienceMetrics.beginSession(joinResult.sessionId);
+            }
+
             if (joinResult.accepted)
             {
                 initialSnapshot = room.getSnapshot();
@@ -498,6 +771,13 @@ namespace
                     clientSocket,
                     makeSnapshotMessage(initialSnapshot)
                 );
+                if (snapshotSent)
+                {
+                    experienceMetrics.recordClientJoined(
+                        joinResult.clientId,
+                        initialSnapshot.state.state == PlaybackState::Playing
+                    );
+                }
             }
         }
 
@@ -543,15 +823,20 @@ namespace
             std::cout << "initial snapshot send failed for client #"
                 << joinResult.clientId << "\n";
             RoomRemovalResult removal;
+            std::optional<ExperienceSessionSummary> sessionSummary;
             {
                 std::lock_guard<std::mutex> controlLock(controlCommandMutex);
                 removal = room.removeClient(clientSocket);
                 if (removal.sessionEnded)
                 {
+                    sessionSummary = experienceMetrics.endSession(
+                        Clock::now()
+                    );
                     metrics.resetSession();
                 }
                 else
                 {
+                    experienceMetrics.removeClient(joinResult.clientId);
                     metrics.removeClient(joinResult.clientId);
                 }
                 correctionCoordinator.removeClient(joinResult.clientId);
@@ -570,6 +855,10 @@ namespace
                     elapsedMilliseconds(joinStartedAt)
                 );
             telemetry.emit(rejected);
+            if (sessionSummary.has_value())
+            {
+                emitSessionSummary(telemetry, *sessionSummary);
+            }
             emitSessionEnded(telemetry, removal);
             return;
         }
@@ -606,6 +895,7 @@ namespace
             joinResult.sessionId,
             room,
             metrics,
+            experienceMetrics,
             correctionCoordinator,
             controlCommandMutex,
             telemetry,
@@ -701,6 +991,7 @@ void runSyncServer()
 
     Room room;
     SyncMetricsCollector metrics;
+    ExperienceMetricsCollector experienceMetrics;
     SyncCorrectionCoordinator correctionCoordinator;
     const std::string telemetryPath = TelemetryLogger::pathFromEnvironment();
     TelemetryLogger telemetry(&std::cout, telemetryPath);
@@ -748,6 +1039,7 @@ void runSyncServer()
             clientSocket,
             std::ref(room),
             std::ref(metrics),
+            std::ref(experienceMetrics),
             std::ref(correctionCoordinator),
             std::ref(controlCommandMutex),
             std::ref(telemetry)

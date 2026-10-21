@@ -17,6 +17,20 @@ enum class CorrectionResultStatus
     Rejected
 };
 
+enum class ControlResultStatus
+{
+    None,
+    Applied,
+    Rejected
+};
+
+enum class FirstFrameTrigger
+{
+    None,
+    Startup,
+    Play
+};
+
 // Playback status shared by the room and clients.
 struct SyncState
 {
@@ -43,6 +57,8 @@ enum class MessageType
     Join,
     JoinRejected,
     Snapshot,
+    FirstFrame,
+    ControlResult,
     Correction,
     CorrectionResult,
     Unknown
@@ -63,6 +79,12 @@ struct SyncMessage
     long long controlEpoch = 0; // SNAPSHOT/CONTROL/REPORT/CORRECT：房间权威控制版本。
     std::string mediaIdentity; // JOIN/SNAPSHOT 使用：标识本次房间播放的媒体来源。
     std::string rejectionReason; // REJECT 使用：返回握手失败的稳定错误码。
+    MessageType relatedControlType = MessageType::Unknown;
+    ControlResultStatus controlResultStatus = ControlResultStatus::None;
+    long long controlApplyMilliseconds = 0;
+    std::string controlResultReason;
+    FirstFrameTrigger firstFrameTrigger = FirstFrameTrigger::None;
+    long long firstFrameMilliseconds = 0;
     long long commandId = 0; // CORRECT/CORRECT_RESULT：校正请求与回执配对。
     long long correctionForwardMilliseconds = 0; // CORRECT：落后端应向前追赶的距离。
     CorrectionResultStatus correctionResultStatus =
@@ -73,6 +95,8 @@ struct SyncMessage
 std::string stateToString(PlaybackState state);
 std::string messageTypeToString(MessageType type);
 std::string correctionResultStatusToString(CorrectionResultStatus status);
+std::string controlResultStatusToString(ControlResultStatus status);
+std::string firstFrameTriggerToString(FirstFrameTrigger trigger);
 
 // 只有 PLAY / PAUSE / SEEK 会改变房间的权威播放状态。
 // 把这个判断集中在协议层，避免 server、Room 和 metrics 各自维护一份不同规则。

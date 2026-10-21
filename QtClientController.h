@@ -65,7 +65,7 @@ private:
 
     mutable std::mutex resourcesMutex_;
     std::unique_ptr<LibVlcPlayer> player_;
-    std::unique_ptr<SyncClientSession> session_;
+    std::shared_ptr<SyncClientSession> session_;
 
     std::thread startupThread_;
     std::atomic_bool startupRunning_{ false };

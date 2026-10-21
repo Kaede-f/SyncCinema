@@ -20,6 +20,8 @@ bool applyMessageToPlayer(const SyncMessage& message, PlayerController& player)
     case MessageType::Snapshot:
     case MessageType::Correction:
     case MessageType::CorrectionResult:
+    case MessageType::FirstFrame:
+    case MessageType::ControlResult:
         return false;
     case MessageType::Unknown:
         return false;

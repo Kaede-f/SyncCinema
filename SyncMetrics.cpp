@@ -314,7 +314,7 @@ void SyncMetricsCollector::beginControlEpoch(
     }
 }
 
-std::optional<SyncCorrectionProposal>
+SyncMetricsUpdate
 SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
 {
     Clock::time_point now = Clock::now();
@@ -786,7 +786,26 @@ SyncMetricsCollector::recordProgressReport(const SyncMetricSample& sample)
         }
     }
 
-    return selectedProposal;
+    SyncMetricsUpdate update;
+    update.correctionProposal = selectedProposal;
+    update.pairObservations.reserve(pairMetrics.size());
+    for (const PairProgressMetric& pairMetric : pairMetrics)
+    {
+        SyncPairObservation observation;
+        observation.clientAId = pairMetric.clientAId;
+        observation.clientBId = pairMetric.clientBId;
+        observation.controlEpoch = pairMetric.controlEpoch;
+        observation.playbackState = pairMetric.playbackState;
+        observation.absoluteDifferenceMilliseconds =
+            pairMetric.pairAbsDiffMs;
+        observation.validForExperience =
+            !pairMetric.settling &&
+            pairMetric.playbackState != PlaybackState::Stopped &&
+            pairMetric.hasRttA &&
+            pairMetric.hasRttB;
+        update.pairObservations.push_back(observation);
+    }
+    return update;
 }
 
 void SyncMetricsCollector::recordCorrectionDispatched(

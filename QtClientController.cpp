@@ -1,5 +1,6 @@
 #include "QtClientController.h"
 
+#include <chrono>
 #include <utility>
 
 #include <QMetaObject>
@@ -52,48 +53,8 @@ void QtClientController::connectToRoom(
             lifecycleGeneration
         ]()
         {
+            const auto startupStartedAt = std::chrono::steady_clock::now();
             auto player = std::make_unique<LibVlcPlayer>();
-            player->setEventCallback(
-                [this, lifecycleGeneration](const PlayerEvent& event)
-                {
-                    postPlayerEvent(event, lifecycleGeneration);
-                }
-            );
-            if (cancelStartup_)
-            {
-                startupRunning_ = false;
-                return;
-            }
-
-            if (!player->setVideoOutputWindow(nativeWindow))
-            {
-                postError("无法取得视频区域的原生窗口句柄。");
-                startupRunning_ = false;
-                QMetaObject::invokeMethod(
-                    this,
-                    [this]()
-                    {
-                        emit busyChanged(false, QString());
-                    },
-                    Qt::QueuedConnection
-                );
-                return;
-            }
-
-            if (!player->openMedia(media))
-            {
-                postError("无法打开媒体，请检查路径或 URL。");
-                startupRunning_ = false;
-                QMetaObject::invokeMethod(
-                    this,
-                    [this]()
-                    {
-                        emit busyChanged(false, QString());
-                    },
-                    Qt::QueuedConnection
-                );
-                return;
-            }
 
             SyncClientCallbacks callbacks;
             callbacks.onLog = [this](const std::string& message)
@@ -136,10 +97,59 @@ void QtClientController::connectToRoom(
                 );
             };
 
-            auto session = std::make_unique<SyncClientSession>(
+            auto session = std::make_shared<SyncClientSession>(
                 *player,
                 std::move(callbacks)
             );
+            session->beginStartupObservation(startupStartedAt);
+            std::weak_ptr<SyncClientSession> weakSession = session;
+            player->setEventCallback(
+                [this, lifecycleGeneration, weakSession](
+                    const PlayerEvent& event)
+                {
+                    if (std::shared_ptr<SyncClientSession> activeSession =
+                        weakSession.lock())
+                    {
+                        activeSession->observePlayerEvent(event);
+                    }
+                    postPlayerEvent(event, lifecycleGeneration);
+                }
+            );
+            if (cancelStartup_)
+            {
+                startupRunning_ = false;
+                return;
+            }
+
+            if (!player->setVideoOutputWindow(nativeWindow))
+            {
+                postError("无法取得视频区域的原生窗口句柄。");
+                startupRunning_ = false;
+                QMetaObject::invokeMethod(
+                    this,
+                    [this]()
+                    {
+                        emit busyChanged(false, QString());
+                    },
+                    Qt::QueuedConnection
+                );
+                return;
+            }
+
+            if (!player->openMedia(media))
+            {
+                postError("无法打开媒体，请检查路径或 URL。");
+                startupRunning_ = false;
+                QMetaObject::invokeMethod(
+                    this,
+                    [this]()
+                    {
+                        emit busyChanged(false, QString());
+                    },
+                    Qt::QueuedConnection
+                );
+                return;
+            }
 
             QMetaObject::invokeMethod(
                 this,
@@ -389,7 +399,7 @@ void QtClientController::joinStartupThread()
 
 void QtClientController::releaseResources()
 {
-    std::unique_ptr<SyncClientSession> session;
+    std::shared_ptr<SyncClientSession> session;
     std::unique_ptr<LibVlcPlayer> player;
     {
         std::lock_guard<std::mutex> lock(resourcesMutex_);

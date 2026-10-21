@@ -93,6 +93,40 @@ namespace
         }
         return false;
     }
+
+    bool stringToControlResultStatus(
+        const std::string& text,
+        ControlResultStatus& status)
+    {
+        if (text == "APPLIED")
+        {
+            status = ControlResultStatus::Applied;
+            return true;
+        }
+        if (text == "REJECTED")
+        {
+            status = ControlResultStatus::Rejected;
+            return true;
+        }
+        return false;
+    }
+
+    bool stringToFirstFrameTrigger(
+        const std::string& text,
+        FirstFrameTrigger& trigger)
+    {
+        if (text == "STARTUP")
+        {
+            trigger = FirstFrameTrigger::Startup;
+            return true;
+        }
+        if (text == "PLAY")
+        {
+            trigger = FirstFrameTrigger::Play;
+            return true;
+        }
+        return false;
+    }
 }
 
 std::string stateToString(PlaybackState state)
@@ -132,12 +166,44 @@ std::string messageTypeToString(MessageType type)
         return "REJECT";
     case MessageType::Snapshot:
         return "SNAPSHOT";
+    case MessageType::FirstFrame:
+        return "FIRST_FRAME";
+    case MessageType::ControlResult:
+        return "CONTROL_RESULT";
     case MessageType::Correction:
         return "CORRECT";
     case MessageType::CorrectionResult:
         return "CORRECT_RESULT";
     default:
         return "UNKNOWN";
+    }
+}
+
+std::string controlResultStatusToString(ControlResultStatus status)
+{
+    switch (status)
+    {
+    case ControlResultStatus::Applied:
+        return "APPLIED";
+    case ControlResultStatus::Rejected:
+        return "REJECTED";
+    case ControlResultStatus::None:
+    default:
+        return "NONE";
+    }
+}
+
+std::string firstFrameTriggerToString(FirstFrameTrigger trigger)
+{
+    switch (trigger)
+    {
+    case FirstFrameTrigger::Startup:
+        return "STARTUP";
+    case FirstFrameTrigger::Play:
+        return "PLAY";
+    case FirstFrameTrigger::None:
+    default:
+        return "NONE";
     }
 }
 
@@ -229,6 +295,17 @@ std::string messageToString(const SyncMessage& message)
             " " + stateToString(message.playbackState) +
             " " + std::to_string(message.positionMilliseconds) +
             " " + message.mediaIdentity + "\n";
+    case MessageType::FirstFrame:
+        return "FIRST_FRAME " + std::to_string(message.controlEpoch) +
+            " " + firstFrameTriggerToString(message.firstFrameTrigger) +
+            " " + std::to_string(message.firstFrameMilliseconds) + "\n";
+    case MessageType::ControlResult:
+        return "CONTROL_RESULT " + std::to_string(message.controlEpoch) +
+            " " + messageTypeToString(message.relatedControlType) +
+            " " + controlResultStatusToString(message.controlResultStatus) +
+            " " + std::to_string(message.positionMilliseconds) +
+            " " + std::to_string(message.controlApplyMilliseconds) +
+            " " + message.controlResultReason + "\n";
     case MessageType::Correction:
         return "CORRECT " + std::to_string(message.commandId) +
             " " + std::to_string(message.controlEpoch) +
@@ -448,6 +525,92 @@ SyncMessage stringToMessage(const std::string& tcpString)
         return message;
     }
 
+    if (command == "FIRST_FRAME")
+    {
+        long long controlEpoch = 0;
+        long long firstFrameMilliseconds = 0;
+        std::string triggerText;
+        std::string extra;
+        FirstFrameTrigger trigger = FirstFrameTrigger::None;
+
+        if (!(iss >> controlEpoch) || controlEpoch < 0 ||
+            !(iss >> triggerText) ||
+            !stringToFirstFrameTrigger(triggerText, trigger) ||
+            !(iss >> firstFrameMilliseconds) ||
+            firstFrameMilliseconds < 0 ||
+            (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = MessageType::FirstFrame;
+        message.controlEpoch = controlEpoch;
+        message.firstFrameTrigger = trigger;
+        message.firstFrameMilliseconds = firstFrameMilliseconds;
+        return message;
+    }
+
+    if (command == "CONTROL_RESULT")
+    {
+        long long controlEpoch = 0;
+        long long positionMilliseconds = 0;
+        long long applyMilliseconds = 0;
+        std::string controlTypeText;
+        std::string statusText;
+        std::string reason;
+        std::string extra;
+        MessageType controlType = MessageType::Unknown;
+        ControlResultStatus status = ControlResultStatus::None;
+
+        if (!(iss >> controlEpoch) || controlEpoch <= 0 ||
+            !(iss >> controlTypeText))
+        {
+            return message;
+        }
+
+        if (controlTypeText == "PLAY")
+        {
+            controlType = MessageType::Play;
+        }
+        else if (controlTypeText == "PAUSE")
+        {
+            controlType = MessageType::Pause;
+        }
+        else if (controlTypeText == "SEEK")
+        {
+            controlType = MessageType::Seek;
+        }
+        else
+        {
+            return message;
+        }
+
+        if (!(iss >> statusText) ||
+            !stringToControlResultStatus(statusText, status) ||
+            !(iss >> positionMilliseconds) ||
+            !isValidPositionMilliseconds(positionMilliseconds) ||
+            !(iss >> applyMilliseconds) || applyMilliseconds < 0 ||
+            !(iss >> reason) || !isValidRejectionReason(reason) ||
+            (status == ControlResultStatus::Applied && reason != "OK") ||
+            (status == ControlResultStatus::Rejected && reason == "OK") ||
+            (iss >> extra))
+        {
+            return message;
+        }
+
+        message.type = MessageType::ControlResult;
+        message.controlEpoch = controlEpoch;
+        message.relatedControlType = controlType;
+        message.controlResultStatus = status;
+        message.positionMilliseconds = positionMilliseconds;
+        message.positionSeconds = static_cast<int>(
+            positionMilliseconds / 1000
+        );
+        message.controlApplyMilliseconds = applyMilliseconds;
+        message.controlResultReason = reason;
+        return message;
+    }
+
     if (command == "CORRECT")
     {
         long long commandId = 0;
@@ -541,6 +704,8 @@ void applyMessageToState(const SyncMessage& message, SyncState& state)
         state.positionMilliseconds = message.positionMilliseconds;
         state.positionSeconds = static_cast<int>(message.positionMilliseconds / 1000);
         break;
+    case MessageType::FirstFrame:
+    case MessageType::ControlResult:
     case MessageType::Correction:
     case MessageType::CorrectionResult:
     case MessageType::Unknown:

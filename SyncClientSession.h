@@ -83,6 +83,14 @@ public:
     bool isConnected() const;
     SyncClientPlaybackSnapshot getPlaybackSnapshot() const;
 
+    // Qt 在开始创建播放器前启动计时，并把真实 libVLC 事件转交给会话层。
+    // 第一次 Playing 会形成 FIRST_FRAME；Stopped 房间则从首条 PLAY 重新计时。
+    void beginStartupObservation(
+        std::chrono::steady_clock::time_point startedAt =
+            std::chrono::steady_clock::now()
+    );
+    void observePlayerEvent(const PlayerEvent& event);
+
     bool setVolume(int volume);
     int getVolume() const;
 
@@ -113,6 +121,7 @@ private:
     bool applyControlMessage(
         const SyncMessage& message,
         SyncClientCommandSource source,
+        SyncMessage& controlResult,
         std::string& errorMessage
     );
     bool executeCorrectionMessage(
@@ -123,6 +132,12 @@ private:
         const SyncMessage& message,
         std::string& errorMessage
     );
+    void prepareFirstFrameForSnapshot(const SyncMessage& snapshot);
+    void prepareFirstFrameForPlay(
+        long long controlEpoch,
+        Clock::time_point startedAt
+    );
+    bool sendFirstFrameObservationIfReady(std::string& errorMessage);
 
     void receiverLoop(std::string receiveBuffer);
     void progressReportLoop();
@@ -143,6 +158,7 @@ private:
     mutable std::mutex lifecycleMutex_;
     mutable std::mutex playerMutex_;
     std::mutex sendMutex_;
+    std::mutex experienceMutex_;
     std::mutex stopMutex_;
     std::condition_variable stopCondition_;
 
@@ -154,6 +170,15 @@ private:
     SyncState localState_;
     long long currentControlEpoch_ = 0;
     std::string mediaIdentity_;
+
+    bool firstFrameObservationStarted_ = false;
+    bool firstFrameObserved_ = false;
+    bool firstFrameSending_ = false;
+    bool firstFrameReported_ = false;
+    Clock::time_point firstFrameStartedAt_{};
+    long long firstFrameEpoch_ = 0;
+    long long firstFrameDurationMs_ = 0;
+    FirstFrameTrigger firstFrameTrigger_ = FirstFrameTrigger::None;
     std::thread receiverThread_;
     std::thread progressReportThread_;
 };

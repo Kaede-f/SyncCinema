@@ -203,6 +203,13 @@ bool SyncClientSession::connectToRoom(
     }
 
     connected_ = true;
+    if (!sendFirstFrameObservationIfReady(errorMessage))
+    {
+        running_ = false;
+        connected_ = false;
+        closeSocketAndCleanup();
+        return false;
+    }
     receiverThread_ = std::thread(
         &SyncClientSession::receiverLoop,
         this,
@@ -301,6 +308,51 @@ SyncClientPlaybackSnapshot SyncClientSession::getPlaybackSnapshot() const
     snapshot.state.positionSeconds =
         static_cast<int>(snapshot.playerPositionMs / 1000);
     return snapshot;
+}
+
+void SyncClientSession::beginStartupObservation(
+    std::chrono::steady_clock::time_point startedAt)
+{
+    std::lock_guard<std::mutex> lock(experienceMutex_);
+    firstFrameObservationStarted_ = true;
+    firstFrameObserved_ = false;
+    firstFrameSending_ = false;
+    firstFrameReported_ = false;
+    firstFrameStartedAt_ = startedAt;
+    firstFrameEpoch_ = 0;
+    firstFrameDurationMs_ = 0;
+    firstFrameTrigger_ = FirstFrameTrigger::Startup;
+}
+
+void SyncClientSession::observePlayerEvent(const PlayerEvent& event)
+{
+    if (event.type != PlayerEventType::Playing)
+    {
+        return;
+    }
+
+    const Clock::time_point observedAt = Clock::now();
+    {
+        std::lock_guard<std::mutex> lock(experienceMutex_);
+        if (!firstFrameObservationStarted_ || firstFrameObserved_ ||
+            firstFrameStartedAt_ == Clock::time_point{})
+        {
+            return;
+        }
+
+        firstFrameObserved_ = true;
+        firstFrameDurationMs_ =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                observedAt - firstFrameStartedAt_
+            ).count();
+        firstFrameDurationMs_ = (std::max)(0LL, firstFrameDurationMs_);
+    }
+
+    std::string errorMessage;
+    if (!sendFirstFrameObservationIfReady(errorMessage))
+    {
+        handleTransportFailure(errorMessage);
+    }
 }
 
 bool SyncClientSession::setVolume(int volume)
@@ -508,6 +560,8 @@ bool SyncClientSession::applyInitialSnapshot(
             "initial snapshot media identity does not match the opened media";
         return false;
     }
+
+    prepareFirstFrameForSnapshot(snapshot);
 
     Clock::time_point applyStartedAt = Clock::now();
     SyncClientPlaybackSnapshot playbackSnapshot;
@@ -743,38 +797,103 @@ bool SyncClientSession::waitUntilPlayerPositionConverges(
 bool SyncClientSession::applyControlMessage(
     const SyncMessage& message,
     SyncClientCommandSource source,
+    SyncMessage& controlResult,
     std::string& errorMessage)
 {
+    const Clock::time_point applyStartedAt = Clock::now();
     SyncClientPlaybackSnapshot snapshot;
+    bool duplicateAlreadyApplied = false;
+
+    auto fillControlResult = [
+        &controlResult,
+        &message,
+        applyStartedAt
+    ](
+        ControlResultStatus status,
+        const std::string& reason,
+        long long actualPositionMilliseconds)
+    {
+        controlResult.type = MessageType::ControlResult;
+        controlResult.controlEpoch = message.controlEpoch;
+        controlResult.relatedControlType = message.type;
+        controlResult.controlResultStatus = status;
+        controlResult.positionMilliseconds = (std::max)(
+            0LL,
+            actualPositionMilliseconds
+        );
+        controlResult.positionSeconds = static_cast<int>(
+            controlResult.positionMilliseconds / 1000
+        );
+        controlResult.controlApplyMilliseconds = (std::max)(
+            0LL,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - applyStartedAt
+            ).count()
+        );
+        controlResult.controlResultReason = reason;
+    };
 
     {
         std::lock_guard<std::mutex> lock(playerMutex_);
 
         if (source == SyncClientCommandSource::RemoteCommand)
         {
-            if (message.controlEpoch <= currentControlEpoch_)
+            if (message.controlEpoch == currentControlEpoch_)
+            {
+                duplicateAlreadyApplied = true;
+                fillControlResult(
+                    ControlResultStatus::Applied,
+                    "OK",
+                    player_.getPositionMilliseconds()
+                );
+            }
+            else if (message.controlEpoch < currentControlEpoch_)
             {
                 errorMessage = "ignored stale or duplicate CONTROL epoch";
+                fillControlResult(
+                    ControlResultStatus::Rejected,
+                    "STALE_EPOCH",
+                    player_.getPositionMilliseconds()
+                );
                 return false;
             }
-            if (message.controlEpoch != currentControlEpoch_ + 1)
+            else if (message.controlEpoch != currentControlEpoch_ + 1)
             {
                 errorMessage = "CONTROL epoch gap detected";
+                fillControlResult(
+                    ControlResultStatus::Rejected,
+                    "EPOCH_GAP",
+                    player_.getPositionMilliseconds()
+                );
                 return false;
             }
         }
 
-        if (!applyMessageToPlayer(message, player_))
+        if (!duplicateAlreadyApplied && message.type == MessageType::Play)
+        {
+            prepareFirstFrameForPlay(message.controlEpoch, applyStartedAt);
+        }
+
+        if (!duplicateAlreadyApplied &&
+            !applyMessageToPlayer(message, player_))
         {
             errorMessage = std::string(sourceLabel(source)) +
                 " player command failed";
+            fillControlResult(
+                ControlResultStatus::Rejected,
+                "PLAYER_COMMAND_FAILED",
+                player_.getPositionMilliseconds()
+            );
             return false;
         }
 
-        applyMessageToState(message, localState_);
-        if (source == SyncClientCommandSource::RemoteCommand)
+        if (!duplicateAlreadyApplied)
         {
-            currentControlEpoch_ = message.controlEpoch;
+            applyMessageToState(message, localState_);
+            if (source == SyncClientCommandSource::RemoteCommand)
+            {
+                currentControlEpoch_ = message.controlEpoch;
+            }
         }
         long long playerPositionMs =
             player_.getPositionMilliseconds();
@@ -785,14 +904,31 @@ bool SyncClientSession::applyControlMessage(
         snapshot.state = localState_;
         snapshot.playerPositionMs = playerPositionMs;
         snapshot.durationMs = player_.getDurationMilliseconds();
+
+        if (source == SyncClientCommandSource::RemoteCommand &&
+            controlResult.type == MessageType::Unknown)
+        {
+            fillControlResult(
+                ControlResultStatus::Applied,
+                "OK",
+                playerPositionMs
+            );
+        }
     }
 
-    emitLog(
-        std::string(sourceLabel(source)) +
-        " applied: " +
-        syncStateToString(snapshot.state)
-    );
-    emitPlaybackChanged(snapshot, source);
+    if (duplicateAlreadyApplied)
+    {
+        emitLog("duplicate CONTROL already applied; ACK repeated");
+    }
+    else
+    {
+        emitLog(
+            std::string(sourceLabel(source)) +
+            " applied: " +
+            syncStateToString(snapshot.state)
+        );
+        emitPlaybackChanged(snapshot, source);
+    }
     return true;
 }
 
@@ -809,6 +945,85 @@ bool SyncClientSession::sendProtocolMessage(
     }
 
     return sendAll(socket_, messageToString(message), errorMessage);
+}
+
+void SyncClientSession::prepareFirstFrameForSnapshot(
+    const SyncMessage& snapshot)
+{
+    std::lock_guard<std::mutex> lock(experienceMutex_);
+    if (!firstFrameObservationStarted_ || firstFrameObserved_)
+    {
+        return;
+    }
+
+    firstFrameEpoch_ = snapshot.controlEpoch;
+    const bool snapshotWillPrepareFrame =
+        snapshot.playbackState != PlaybackState::Stopped ||
+        snapshot.positionMilliseconds > 0;
+    if (snapshotWillPrepareFrame)
+    {
+        firstFrameTrigger_ = FirstFrameTrigger::Startup;
+        if (firstFrameStartedAt_ == Clock::time_point{})
+        {
+            firstFrameStartedAt_ = Clock::now();
+        }
+        return;
+    }
+
+    // 空房间停在 0 ms 时并没有请求播放。把计时起点延后到第一条 PLAY，
+    // 否则用户在房间里等待多久都会被错误算进首帧耗时。
+    firstFrameTrigger_ = FirstFrameTrigger::Play;
+    firstFrameStartedAt_ = {};
+}
+
+void SyncClientSession::prepareFirstFrameForPlay(
+    long long controlEpoch,
+    Clock::time_point startedAt)
+{
+    std::lock_guard<std::mutex> lock(experienceMutex_);
+    if (!firstFrameObservationStarted_ || firstFrameObserved_ ||
+        firstFrameTrigger_ != FirstFrameTrigger::Play)
+    {
+        return;
+    }
+
+    firstFrameEpoch_ = controlEpoch;
+    firstFrameStartedAt_ = startedAt;
+}
+
+bool SyncClientSession::sendFirstFrameObservationIfReady(
+    std::string& errorMessage)
+{
+    if (!connected_)
+    {
+        return true;
+    }
+
+    SyncMessage message;
+    {
+        std::lock_guard<std::mutex> lock(experienceMutex_);
+        if (!firstFrameObserved_ || firstFrameReported_ || firstFrameSending_)
+        {
+            return true;
+        }
+
+        firstFrameSending_ = true;
+        message.type = MessageType::FirstFrame;
+        message.controlEpoch = firstFrameEpoch_;
+        message.firstFrameTrigger = firstFrameTrigger_;
+        message.firstFrameMilliseconds = firstFrameDurationMs_;
+    }
+
+    const bool sent = sendProtocolMessage(message, errorMessage);
+    {
+        std::lock_guard<std::mutex> lock(experienceMutex_);
+        firstFrameSending_ = false;
+        if (sent)
+        {
+            firstFrameReported_ = true;
+        }
+    }
+    return sent;
 }
 
 bool SyncClientSession::executeCorrectionMessage(
@@ -915,16 +1130,33 @@ void SyncClientSession::receiverLoop(std::string receiveBuffer)
                 message.type == MessageType::Join ||
                 message.type == MessageType::JoinRejected ||
                 message.type == MessageType::Snapshot ||
+                message.type == MessageType::FirstFrame ||
+                message.type == MessageType::ControlResult ||
                 message.type == MessageType::CorrectionResult)
             {
                 continue;
             }
 
             std::string errorMessage;
-            if (!applyControlMessage(
-                    message,
-                    SyncClientCommandSource::RemoteCommand,
-                    errorMessage))
+            SyncMessage controlResult;
+            const bool applied = applyControlMessage(
+                message,
+                SyncClientCommandSource::RemoteCommand,
+                controlResult,
+                errorMessage
+            );
+
+            if (controlResult.type == MessageType::ControlResult)
+            {
+                std::string sendError;
+                if (!sendProtocolMessage(controlResult, sendError))
+                {
+                    handleTransportFailure(sendError);
+                    return;
+                }
+            }
+
+            if (!applied)
             {
                 if (errorMessage == "ignored stale or duplicate CONTROL epoch")
                 {
