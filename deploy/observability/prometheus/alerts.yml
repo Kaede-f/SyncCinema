@@ -100,10 +100,10 @@ groups:
           summary: Control ACK latency P95 exceeds 500 milliseconds
           description: Playback controls are taking too long to be acknowledged by clients.
 
-      - alert: SyncCinemaCorrectionFailureRatioHigh
+      - alert: SyncCinemaCorrectionDispatchFailureRatioHigh
         expr: |
           (
-            sum(increase(synccinema_corrections_total{status=~"dispatch_failed|rejected|missing_result"}[10m]))
+            sum(increase(synccinema_corrections_total{status="dispatch_failed"}[10m]))
             /
             clamp_min(sum(increase(synccinema_corrections_total{status=~"dispatched|dispatch_failed"}[10m])), 1)
           ) > 0.01
@@ -113,8 +113,24 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: Correction failure ratio exceeds one percent
-          description: Guarded correction dispatches or acknowledgements are failing too frequently.
+          summary: Correction dispatch failure ratio exceeds one percent
+          description: The server is failing to send guarded correction commands too frequently.
+
+      - alert: SyncCinemaCorrectionResultFailureRatioHigh
+        expr: |
+          (
+            sum(increase(synccinema_corrections_total{status=~"rejected|unmatched|missing_result"}[10m]))
+            /
+            clamp_min(sum(increase(synccinema_corrections_total{status=~"applied|rejected|unmatched|missing_result"}[10m])), 1)
+          ) > 0.01
+          and
+          sum(increase(synccinema_corrections_total{status=~"applied|rejected|unmatched|missing_result"}[10m])) >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Correction result failure ratio exceeds one percent
+          description: Too many correction commands are rejected, unmatched, or missing a result.
 
       - alert: SyncCinemaCorrectionConvergenceP95High
         expr: |

@@ -51,6 +51,9 @@ Testing/
 __pycache__/
 *.py[cod]
 
+# Local observability credentials
+/deploy/observability/.env
+
 # OS/editor noise
 Thumbs.db
 Desktop.ini

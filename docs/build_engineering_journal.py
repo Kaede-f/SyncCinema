@@ -277,8 +277,8 @@ def add_title_block(doc):
 
     metadata = [
         ("当前开发分支", "feature/observability"),
-        ("版本基线", "b960333 + 同步校正可靠性收口"),
-        ("本次阶段", "可观测性指标契约与结构化会话事件"),
+        ("版本基线", "291c09c + 可观测性展示告警"),
+        ("本次阶段", "产品可观测性闭环与可复现实验"),
         ("维护日期", "2026-10-21"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
@@ -343,6 +343,14 @@ def add_numbered(doc, text):
     return paragraph
 
 
+def add_compact_numbered(doc, text):
+    paragraph = doc.add_paragraph(style="List Number")
+    set_paragraph_spacing(paragraph, before=0, after=2, line_spacing=1.05)
+    run = paragraph.add_run(text)
+    set_run_font(run, size=9.2)
+    return paragraph
+
+
 def add_callout(doc, label, text):
     paragraph = doc.add_paragraph()
     set_paragraph_spacing(paragraph, before=6, after=8, line_spacing=1.25)
@@ -394,6 +402,15 @@ def add_commit_history_table(doc):
         ("4944cf8", "control epochs and robust skew windows", "隔离控制周期并以中位数/P95 过滤单点抖动"),
         ("92300ce", "late-joining room snapshots", "新 client 加入时按毫秒对齐当前房间状态与控制版本"),
         ("2f4f27a", "read-only sync correction advice", "以安全门和可解释原因生成校正建议，但不改变播放行为"),
+        ("81ec949", "Qt desktop client", "共享会话层支撑可直接使用的 Windows 播放器界面"),
+        ("10a19af", "media session identity", "隔离不同媒体的 Room 状态并拒绝错误会话加入"),
+        ("12dff62", "media playback feedback", "把 libVLC 异步打开、缓冲和失败反馈到 UI"),
+        ("c89e021", "guarded correction execution", "server 到目标 client 的校正命令、ACK 与安全执行闭环"),
+        ("b960333", "sync recovery hardening", "修复 SIGPIPE、晚加入恢复和统计会话残留"),
+        ("18ed947", "structured session telemetry", "版本化 JSONL、session_id 和生命周期事件"),
+        ("1632195", "playback experience outcomes", "首帧、控制 ACK、同步质量、校正收敛和会话汇总"),
+        ("613381c", "bounded Prometheus metrics", "低基数在线指标与回环地址健康检查端点"),
+        ("291c09c", "dashboards and alerts", "自动配置 Grafana 总览与带样本门槛的告警规则"),
     ]
 
     table = doc.add_table(rows=1, cols=3)
@@ -1547,6 +1564,125 @@ def build_document():
         "已经落地；下一阶段才会计算会话级汇总和八项核心体验指标。",
     )
 
+    doc.add_heading("7.16 可观测性第二阶段：核心体验结果", level=2)
+    add_body(
+        doc,
+        "提交 1632195 把指标契约落实为可计算事实。client 在 libVLC 真正进入 Playing 后发送 FIRST_FRAME，"
+        "并为每个权威 PLAY、PAUSE、SEEK 返回 CONTROL_RESULT；server 只使用自己的 steady_clock 计算从广播到"
+        "匹配 ACK 的耗时，避免比较不同设备的系统时间。ExperienceMetricsCollector 独立维护待确认命令、首帧、"
+        "有效 pair 样本和待收敛校正，不承担 socket 与日志职责。",
+    )
+    add_bullet(
+        doc,
+        "首帧：按 JOIN、PLAY 和 SEEK 的触发原因记录从用户相关动作到 libVLC Playing 事件的耗时，并识别重复、"
+        "未知 client 和无效消息。",
+    )
+    add_bullet(
+        doc,
+        "控制 ACK：server 记录目标 client 集合；client 报告 APPLIED 或 REJECTED、播放器 API 执行耗时和实际位置；"
+        "会话结束时仍未返回的目标计为 missing。",
+    )
+    add_bullet(
+        doc,
+        "同步和校正：只统计通过 epoch、状态、样本新鲜度、RTT 与 settling 检查的 pair 样本；校正必须收到匹配"
+        " APPLIED，随后连续两次进入 250 ms 容差才算 converged。",
+    )
+    add_bullet(
+        doc,
+        "会话汇总：最后一个 client 离开时输出 session_summary，包含首帧 P95 桶、控制 ACK P95 桶、sync good ratio、"
+        "pair skew P95、校正成功与收敛统计。汇总使用固定桶，内存不会随播放时长增长。",
+    )
+    add_body(
+        doc,
+        "验证覆盖重复首帧、错误 epoch、重复 ACK、缺失 ACK、校正成功/失败/超时和连续良好样本。该阶段解决了"
+        "‘日志很多但无法回答一次会话体验是否成功’的问题，也明确了桶上界是近似分位数，不应伪装成原始精确值。",
+    )
+
+    doc.add_heading("7.17 可观测性第三阶段：低基数在线指标", level=2)
+    add_body(
+        doc,
+        "提交 613381c 新增 PrometheusMetrics 和 MetricsHttpServer。server 默认只在 127.0.0.1:9100 暴露"
+        " /healthz 与 /metrics，端口可由 SYNCCINEMA_METRICS_PORT 覆盖；监控端点失败会被明确记录，但不会阻止"
+        "9000 业务端口启动。",
+    )
+    add_bullet(
+        doc,
+        "指标类型：当前连接数和活跃会话使用 gauge，JOIN/控制/校正生命周期使用 counter，首帧、ACK、pair skew"
+        "和校正收敛使用 histogram。",
+    )
+    add_bullet(
+        doc,
+        "基数控制：label 仅允许 outcome、reason、status、quality 和 command 等有限枚举；session_id、client_id、"
+        "media_id、URL 与错误全文只留在 JSONL，不能制造无限时间序列。",
+    )
+    add_bullet(
+        doc,
+        "并发与容量：固定数组保存枚举计数，直方图使用有限桶；渲染时持有内部 mutex 得到一致快照，采集内存"
+        "与会话时长和用户数量中的高基数字段无关。",
+    )
+    add_body(
+        doc,
+        "测试不仅断言文本中存在指标，还真实启动回环 HTTP server，请求 healthz 和 metrics，验证状态码、"
+        "Content-Length、Content-Type 与响应体。Windows 三目标构建、Linux server/CoreTests 和 CTest 均通过。",
+    )
+
+    doc.add_heading("7.18 可观测性第四阶段：看板与告警", level=2)
+    add_body(
+        doc,
+        "提交 291c09c 提供可直接部署的 Prometheus、Grafana、Alertmanager 和 node_exporter Compose 配置。"
+        "所有 Web 管理端口只绑定服务器回环地址，开发机通过 SSH 隧道访问；镜像固定版本，Grafana 密码通过"
+        "未提交的 .env 注入。这样避免把监控后台和默认口令暴露到公网。",
+    )
+    add_bullet(
+        doc,
+        "Grafana 自动加载 14 个面板：服务状态、连接与会话、JOIN 成功率、首帧 P95、同步良好率、pair skew、"
+        "控制 ACK、校正生命周期与收敛，以及主机 CPU、内存和磁盘。",
+    )
+    add_bullet(
+        doc,
+        "Prometheus 配置 12 条规则。体验告警同时要求阈值超标、最小样本量和持续时间；没有足够数据时不把"
+        "偶发点误报为产品故障。主机告警覆盖进程不可采集、磁盘和文件描述符压力。",
+    )
+    add_bullet(
+        doc,
+        "Alertmanager 第一版只保存和展示告警，不把个人邮箱、Webhook 或密钥写进仓库。真实通知渠道属于部署"
+        "私有配置，是已知上线项而不是代码中伪造的能力。",
+    )
+    add_body(
+        doc,
+        "验证证据包括 Docker Compose 展开成功、Grafana dashboard JSON 解析成功、promtool 检查主配置和 12 条"
+        "规则成功、amtool 检查路由成功，并用 promtool 逐条解析 17 个动态 PromQL。",
+    )
+
+    doc.add_heading("7.19 可观测性第五阶段：可复现实验与验收报告", level=2)
+    add_body(
+        doc,
+        "最后一阶段把‘手工暂停进程后肉眼看起来追上了’升级为可复现、可比较的实验。tcp_fault_proxy.py 在"
+        "本地 9000 端口代理到云 server，可按固定随机种子注入双向延迟、抖动、短时阻塞和计划断连。它不随机"
+        "删除 TCP 字节，因为那会破坏应用协议，不等价于网络层丢包；真实丢包只允许在隔离环境用 tc netem。",
+    )
+    add_bullet(
+        doc,
+        "代理输出结构化 JSONL，记录参数、连接、方向字节数、错误和关闭原因。30 ms 单向延迟的回环集成测试"
+        "测得至少 50 ms 往返，同时验证载荷未损坏。",
+    )
+    add_bullet(
+        doc,
+        "prometheus_experiment_report.py 在指定窗口查询 17 个 PromQL，自动计算可用率、JOIN 成功率、首帧 P95、"
+        "同步良好率、pair skew P95、控制 ACK P95、校正派发失败率、结果失败率和收敛 P95。",
+    )
+    add_bullet(
+        doc,
+        "报告同时输出 Markdown 和 JSON，并把结论分成 PASS、FAIL、INSUFFICIENT_DATA 和 NO_DATA。样本不足不算"
+        "通过，采集缺失也不算通过；--fail-on-objective 可供后续 CI 或验收门禁使用。",
+    )
+    add_body(
+        doc,
+        "八个 Python 测试覆盖达标、阈值违规、样本不足、无数据、采集端快速失败、Markdown 汇总、代理真实转发和空闲连接定时断开。至此形成"
+        "事件定位、在线聚合、看板展示、持续告警、故障注入、报告验收的第一版闭环。仍未完成的产品指标包括"
+        "每观影小时硬校正次数、客户端无崩溃会话率和 Nginx HTTP 指标，文档中保留这些边界。",
+    )
+
     doc.add_heading("8. 面试表达模板", level=1)
     add_body(
         doc,
@@ -1615,11 +1751,17 @@ def build_document():
     )
     add_body(
         doc,
-        "第九段可以这样说明产品指标：我把观测分成用户体验、同步正确性和系统健康三层。用户体验看 JOIN 成功率、"
-        "首帧和无崩溃会话；同步正确性看有效 pair skew 的 P50/P95/P99、同步良好时间占比、校正成功率和收敛时间；"
-        "技术侧按 latency、traffic、errors、saturation 四个黄金信号组织。实现时先定义分子分母、settling 排除条件"
-        "和 SLO，再用 session_id 关联 JSONL 事件，避免只有零散日志却无法形成趋势。跨设备耗时不直接比较墙上时间，"
-        "而由 server steady_clock 测量命令到 ACK 的闭环。",
+        "第九段可以这样说明产品指标：我把观测分成用户体验、同步正确性和系统健康三层。用户体验看 JOIN 成功率"
+        "和首帧；同步正确性看有效 pair skew P95、同步良好时间占比、控制 ACK、校正成功率和收敛时间；技术侧按"
+        " RED 与 USE 组织。实现时先定义分子分母、settling 排除条件和 SLO，再用 session_id 关联 JSONL 事件。"
+        "跨设备耗时不比较墙上时间，而由 server steady_clock 测量命令到 ACK 的闭环。",
+    )
+    add_body(
+        doc,
+        "第十段可以这样说明数据闭环：这些指标不是停在日志里。server 用固定桶和低基数 label 暴露 Prometheus，"
+        "Grafana 自动展示连接、首帧、同步、控制、校正和主机资源；告警同时设置阈值、持续时间与最小样本量。"
+        "为了让结论可重复，我又做了 TCP 故障代理注入延迟、抖动、阻塞和断连，并让报告器自动输出 PASS、FAIL、"
+        "样本不足或无数据。这样一次优化必须经过故障复现、指标变化、恢复效果和验收报告，而不是只凭肉眼觉得变快。",
     )
 
     doc.add_heading("9. 后续学习重点", level=1)
@@ -1661,14 +1803,22 @@ def build_document():
     add_numbered(doc, "指标口径：如何定义成功率分子分母、有效样本、settling 排除条件与 P50/P95/P99。")
     add_numbered(doc, "低基数维度：为什么错误全文、session_id 和 media_id 可以用于日志检索，却不能直接做 Prometheus label。")
     add_numbered(doc, "RED 与 USE：如何分别衡量服务请求和 CPU、内存、文件描述符、网络等资源饱和度。")
+    add_numbered(doc, "ExperienceMetricsCollector：如何跟踪首帧、待确认控制、有效 pair 样本和校正收敛生命周期。")
+    add_numbered(doc, "PrometheusMetrics：为什么 counter、gauge、histogram 各有不同语义，以及固定桶如何限制内存。")
+    add_numbered(doc, "MetricsHttpServer：为什么监控端口只绑定 loopback，失败又不能拖垮 9000 业务监听。")
+    add_numbered(doc, "Grafana 与 PromQL：如何从 counter 构造窗口成功率，从 histogram bucket 计算 P95。")
+    add_numbered(doc, "告警抗噪：为什么阈值之外还必须同时要求最小样本量和持续时间。")
+    add_numbered(doc, "故障实验：TCP 应用层延迟代理能验证什么，为什么不能用丢字节冒充 IP 丢包。")
+    add_numbered(doc, "验收报告：为什么 PASS、FAIL、INSUFFICIENT_DATA、NO_DATA 必须是四种不同结论。")
 
     doc.add_heading("10. 后续工程路线", level=1)
-    add_numbered(doc, "实现首帧、初始同步、控制应用 ACK、校正收敛和会话汇总事件，形成八项核心体验指标。")
-    add_numbered(doc, "为 JSONL 增加日志轮转与保留策略，并从事件生成离线会话报告，先验证成功率和分位数口径。")
-    add_numbered(doc, "接入 Prometheus counter/gauge/histogram 与 /metrics endpoint，严格限制 label 基数。")
-    add_numbered(doc, "建立用户体验、同步质量、系统资源三张 Grafana 看板，并为持续超标而非单点异常配置告警。")
-    add_numbered(doc, "用两台真实电脑和延迟、抖动、丢包、进程暂停、断网、server 重启实验验证 SLO。")
-    add_numbered(doc, "补齐服务托管、健康检查、优雅停机、自动重连、CI 和发布包；随后增加聊天与弹幕。")
+    add_compact_numbered(doc, "把本分支部署到云服务器，用两台真实电脑完成 baseline、延迟抖动、短时阻塞、断连和 server 重启实验，并保存自动报告。")
+    add_compact_numbered(doc, "根据真实报告调整首帧、同步和校正 SLO；只有样本量充足时才修改阈值，避免为通过测试而降低标准。")
+    add_compact_numbered(doc, "增加有效 Playing 时长累计，补齐 hard_corrections_per_watch_hour。")
+    add_compact_numbered(doc, "增加客户端崩溃上报或监督进程，补齐 crash_free_session_ratio，并明确区分崩溃、主动退出和断网。")
+    add_compact_numbered(doc, "接入 Nginx 请求延迟、4xx/5xx、Range 请求和出口带宽；配置私有 Alertmanager 通知渠道。")
+    add_compact_numbered(doc, "为 JSONL 增加 logrotate 与保留策略，为 Prometheus/Grafana 数据卷制定备份和容量上限。")
+    add_compact_numbered(doc, "补齐 systemd 服务托管、优雅停机、自动重连、CI 和 Windows 发布包；随后再增加聊天与弹幕。")
 
     doc.save(OUTPUT_PATH)
     print(f"Created {OUTPUT_PATH}")
