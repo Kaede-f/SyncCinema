@@ -1,3 +1,4 @@
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -11,9 +12,11 @@
 
 #include "MockPlayer.h"
 #include "ExperienceMetrics.h"
+#include "MetricsHttpServer.h"
 #include "NetSocket.h"
 #include "PlaybackPositionConvergence.h"
 #include "Protocol.h"
+#include "PrometheusMetrics.h"
 #include "RttEstimator.h"
 #include "Room.h"
 #include "SyncCorrectionPolicy.h"
@@ -930,6 +933,138 @@ namespace
         );
     }
 
+    void testPrometheusMetricsEndpoint()
+    {
+        PrometheusMetrics metrics;
+        metrics.setServerUp(true);
+        metrics.recordSessionStarted();
+        metrics.setConnectedClients(2);
+        metrics.recordJoinResult(JoinMetricReason::Ok, 42);
+
+        FirstFrameRecord firstFrame;
+        firstFrame.status = FirstFrameRecordStatus::Recorded;
+        firstFrame.durationMilliseconds = 1800;
+        metrics.recordFirstFrame(firstFrame);
+
+        metrics.recordControlDispatched(MessageType::Play, 2, true);
+        ControlAckRecord controlResult;
+        controlResult.matchStatus = ControlAckMatchStatus::Matched;
+        controlResult.resultStatus = ControlResultStatus::Applied;
+        controlResult.acknowledgementLatencyMilliseconds = 120;
+        controlResult.clientApplyMilliseconds = 8;
+        metrics.recordControlResult(controlResult);
+
+        ExperiencePairSample pair;
+        pair.clientAId = 1;
+        pair.clientBId = 2;
+        pair.valid = true;
+        pair.absoluteDifferenceMilliseconds = 100;
+        metrics.recordPairSample(pair);
+        pair.absoluteDifferenceMilliseconds = 400;
+        metrics.recordPairSample(pair);
+
+        metrics.recordCorrectionDispatched(true);
+        metrics.recordCorrectionResult(true, true);
+        CorrectionConvergenceRecord convergence;
+        convergence.convergenceMilliseconds = 700;
+        metrics.recordCorrectionConverged(convergence);
+
+        ExperienceSessionSummary summary;
+        summary.firstFrameMissing = 1;
+        summary.controlMissingAcks = 1;
+        metrics.recordSessionSummary(summary);
+
+        const std::string rendered = metrics.render();
+        expect(
+            rendered.find("synccinema_server_up 1\n") != std::string::npos &&
+                rendered.find(
+                    "synccinema_join_results_total{outcome=\"accepted\",reason=\"OK\"} 1\n"
+                ) != std::string::npos,
+            "Prometheus snapshot exposes server and bounded JOIN metrics"
+        );
+        expect(
+            rendered.find(
+                "synccinema_time_to_first_frame_ms_bucket{le=\"1000\"} 0\n"
+            ) != std::string::npos &&
+                rendered.find(
+                    "synccinema_time_to_first_frame_ms_bucket{le=\"2000\"} 1\n"
+                ) != std::string::npos,
+            "Prometheus histogram buckets are cumulative"
+        );
+        expect(
+            rendered.find(
+                "synccinema_sync_pair_samples_total{quality=\"good\"} 1\n"
+            ) != std::string::npos &&
+                rendered.find(
+                    "synccinema_sync_pair_samples_total{quality=\"bad\"} 1\n"
+                ) != std::string::npos,
+            "Prometheus snapshot separates good and bad sync samples"
+        );
+        expect(
+            rendered.find("session_id") == std::string::npos &&
+                rendered.find("media_id") == std::string::npos,
+            "Prometheus output excludes high-cardinality identifiers"
+        );
+
+        expect(initializeSockets(), "metrics endpoint initializes sockets");
+        MetricsHttpServer endpoint(metrics);
+        std::string startError;
+        const bool started = endpoint.start(0, startError);
+        expect(started, "metrics endpoint starts on an ephemeral loopback port");
+        if (started)
+        {
+            SocketHandle client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(endpoint.port());
+            const bool connected = client != kInvalidSocket &&
+                connect(
+                    client,
+                    reinterpret_cast<sockaddr*>(&address),
+                    sizeof(address)
+                ) != kSocketError;
+            expect(connected, "metrics endpoint accepts a loopback connection");
+            if (connected)
+            {
+                const std::string request =
+                    "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+                const int sent = sendSocket(
+                    client,
+                    request.data(),
+                    static_cast<int>(request.size())
+                );
+                std::string response;
+                std::array<char, 2048> buffer{};
+                int received = 0;
+                while ((received = recv(
+                            client,
+                            buffer.data(),
+                            static_cast<int>(buffer.size()),
+                            0)) > 0)
+                {
+                    response.append(
+                        buffer.data(),
+                        static_cast<std::size_t>(received)
+                    );
+                }
+                expect(
+                    sent == static_cast<int>(request.size()) &&
+                        response.starts_with("HTTP/1.1 200 OK\r\n") &&
+                        response.find("synccinema_server_up 1\n") !=
+                            std::string::npos,
+                    "GET /metrics returns Prometheus text over real TCP"
+                );
+            }
+            if (client != kInvalidSocket)
+            {
+                closeSocket(client);
+            }
+        }
+        endpoint.stop();
+        cleanupSockets();
+    }
+
     void testPlayerEventAbstraction()
     {
         ConsoleMockPlayer player;
@@ -1409,6 +1544,7 @@ int main()
     testAuthoritativeControlAndCorrectionProtocol();
     testExperienceObservationProtocol();
     testExperienceMetricsSessionSummary();
+    testPrometheusMetricsEndpoint();
     testPlayerEventAbstraction();
     testRoomSnapshotAndEpoch();
     testRoomMediaSessionLifecycle();

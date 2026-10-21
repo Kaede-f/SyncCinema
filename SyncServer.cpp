@@ -5,14 +5,18 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <utility>
 
 #include "ExperienceMetrics.h"
+#include "MetricsHttpServer.h"
 #include "Protocol.h"
 #include "MetricLogger.h"
 #include "NetSocket.h"
+#include "PrometheusMetrics.h"
 #include "Room.h"
 #include "SyncCorrectionCoordinator.h"
 #include "SyncMetrics.h"
@@ -21,11 +25,53 @@
 namespace
 {
     constexpr unsigned short kServerPort = 9000;
+    constexpr unsigned short kDefaultMetricsPort = 9100;
     constexpr auto kHeartbeatInterval = std::chrono::milliseconds(1000);
     constexpr auto kJoinTimeout = std::chrono::seconds(5);
     constexpr std::size_t kMaxHandshakeBytes = 4096;
 
     using Clock = std::chrono::steady_clock;
+
+    unsigned short metricsPortFromEnvironment(std::string& warning)
+    {
+#ifdef _WIN32
+        char* environmentValue = nullptr;
+        std::size_t environmentLength = 0;
+        if (_dupenv_s(
+                &environmentValue,
+                &environmentLength,
+                "SYNCCINEMA_METRICS_PORT") != 0)
+        {
+            environmentValue = nullptr;
+        }
+        const std::string value = environmentValue == nullptr
+            ? std::string{}
+            : std::string(environmentValue);
+        std::free(environmentValue);
+#else
+        const char* environmentValue = std::getenv(
+            "SYNCCINEMA_METRICS_PORT"
+        );
+        const std::string value = environmentValue == nullptr
+            ? std::string{}
+            : std::string(environmentValue);
+#endif
+        if (value.empty())
+        {
+            return kDefaultMetricsPort;
+        }
+
+        errno = 0;
+        char* end = nullptr;
+        const long parsed = std::strtol(value.c_str(), &end, 10);
+        if (errno != 0 || end == value.c_str() || *end != '\0' ||
+            parsed < 1 || parsed > 65535)
+        {
+            warning = "invalid SYNCCINEMA_METRICS_PORT; using 9100";
+            return kDefaultMetricsPort;
+        }
+        return static_cast<unsigned short>(parsed);
+    }
 
     long long elapsedMilliseconds(
         Clock::time_point startedAt,
@@ -230,6 +276,7 @@ namespace
         Room& room,
         SyncMetricsCollector& metrics,
         ExperienceMetricsCollector& experienceMetrics,
+        PrometheusMetrics& prometheus,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         TelemetryLogger& telemetry,
@@ -266,6 +313,7 @@ namespace
                 clientId,
                 message
             );
+            prometheus.recordFirstFrame(record);
 
             TelemetryEvent event;
             event.name = "media_first_frame";
@@ -294,6 +342,7 @@ namespace
                 message,
                 Clock::now()
             );
+            prometheus.recordControlResult(record);
 
             TelemetryEvent event;
             event.name = "control_applied";
@@ -389,6 +438,7 @@ namespace
                 experienceSample.absoluteDifferenceMilliseconds =
                     observation.absoluteDifferenceMilliseconds;
                 experienceSample.valid = observation.validForExperience;
+                prometheus.recordPairSample(experienceSample);
 
                 std::vector<CorrectionConvergenceRecord> converged =
                     experienceMetrics.recordPairSample(
@@ -397,6 +447,7 @@ namespace
                     );
                 for (const CorrectionConvergenceRecord& record : converged)
                 {
+                    prometheus.recordCorrectionConverged(record);
                     TelemetryEvent event;
                     event.name = "correction_converged";
                     event.sessionId = sessionId;
@@ -475,6 +526,7 @@ namespace
             {
                 correctionCoordinator.markDispatchFailed(command->commandId);
             }
+            prometheus.recordCorrectionDispatched(sent);
 
             {
                 std::lock_guard<std::mutex> logLock(metricLogMutex());
@@ -509,6 +561,7 @@ namespace
                 matched,
                 applied
             );
+            prometheus.recordCorrectionResult(matched, applied);
 
             TelemetryEvent event;
             event.name = "correction_completed";
@@ -590,6 +643,11 @@ namespace
                 targetClientIds,
                 broadcastStartedAt
             );
+        prometheus.recordControlDispatched(
+            message.type,
+            targetClientIds.size(),
+            broadcastSucceeded
+        );
 
         TelemetryEvent event;
         event.name = "control_dispatched";
@@ -614,6 +672,7 @@ namespace
         Room& room,
         SyncMetricsCollector& metrics,
         ExperienceMetricsCollector& experienceMetrics,
+        PrometheusMetrics& prometheus,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         TelemetryLogger& telemetry,
@@ -635,6 +694,7 @@ namespace
                     room,
                     metrics,
                     experienceMetrics,
+                    prometheus,
                     correctionCoordinator,
                     controlCommandMutex,
                     telemetry,
@@ -685,6 +745,12 @@ namespace
             correctionCoordinator.removeClient(clientId);
         }
         closeSocket(clientSocket);
+        prometheus.setConnectedClients(removal.remainingClients);
+        if (sessionSummary.has_value())
+        {
+            prometheus.recordSessionSummary(*sessionSummary);
+            prometheus.recordSessionEnded();
+        }
 
         TelemetryEvent disconnected;
         disconnected.name = "client_disconnected";
@@ -717,6 +783,7 @@ namespace
         Room& room,
         SyncMetricsCollector& metrics,
         ExperienceMetricsCollector& experienceMetrics,
+        PrometheusMetrics& prometheus,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
         TelemetryLogger& telemetry)
@@ -733,6 +800,8 @@ namespace
             closeSocket(clientSocket);
             std::cout << "client rejected: valid JOIN was not received\n";
 
+            const long long joinDurationMs =
+                elapsedMilliseconds(joinStartedAt);
             TelemetryEvent rejected;
             rejected.name = "join_result";
             rejected
@@ -740,9 +809,13 @@ namespace
                 .addString("reason", "JOIN_REQUIRED")
                 .addInteger(
                     "duration_ms",
-                    elapsedMilliseconds(joinStartedAt)
+                    joinDurationMs
                 );
             telemetry.emit(rejected);
+            prometheus.recordJoinResult(
+                JoinMetricReason::JoinRequired,
+                joinDurationMs
+            );
             return;
         }
 
@@ -762,6 +835,7 @@ namespace
             if (joinResult.sessionStarted)
             {
                 experienceMetrics.beginSession(joinResult.sessionId);
+                prometheus.recordSessionStarted();
             }
 
             if (joinResult.accepted)
@@ -799,6 +873,8 @@ namespace
             closeSocket(clientSocket);
             std::cout << "client rejected: room media does not match\n";
 
+            const long long joinDurationMs =
+                elapsedMilliseconds(joinStartedAt);
             TelemetryEvent rejected;
             rejected.name = "join_result";
             rejected.sessionId = joinResult.sessionId;
@@ -812,9 +888,13 @@ namespace
                 )
                 .addInteger(
                     "duration_ms",
-                    elapsedMilliseconds(joinStartedAt)
+                    joinDurationMs
                 );
             telemetry.emit(rejected);
+            prometheus.recordJoinResult(
+                JoinMetricReason::MediaMismatch,
+                joinDurationMs
+            );
             return;
         }
 
@@ -842,7 +922,10 @@ namespace
                 correctionCoordinator.removeClient(joinResult.clientId);
             }
             closeSocket(clientSocket);
+            prometheus.setConnectedClients(removal.remainingClients);
 
+            const long long joinDurationMs =
+                elapsedMilliseconds(joinStartedAt);
             TelemetryEvent rejected;
             rejected.name = "join_result";
             rejected.sessionId = joinResult.sessionId;
@@ -852,17 +935,24 @@ namespace
                 .addString("reason", "SNAPSHOT_SEND_FAILED")
                 .addInteger(
                     "duration_ms",
-                    elapsedMilliseconds(joinStartedAt)
+                    joinDurationMs
                 );
             telemetry.emit(rejected);
+            prometheus.recordJoinResult(
+                JoinMetricReason::SnapshotSendFailed,
+                joinDurationMs
+            );
             if (sessionSummary.has_value())
             {
+                prometheus.recordSessionSummary(*sessionSummary);
+                prometheus.recordSessionEnded();
                 emitSessionSummary(telemetry, *sessionSummary);
             }
             emitSessionEnded(telemetry, removal);
             return;
         }
 
+        const long long joinDurationMs = elapsedMilliseconds(joinStartedAt);
         TelemetryEvent joined;
         joined.name = "join_result";
         joined.sessionId = joinResult.sessionId;
@@ -874,13 +964,15 @@ namespace
             .addString("media_id", joinResult.activeMediaIdentity)
             .addInteger(
                 "duration_ms",
-                elapsedMilliseconds(joinStartedAt)
+                joinDurationMs
             )
             .addInteger(
                 "online_clients",
                 static_cast<long long>(room.getClientCount())
             );
         telemetry.emit(joined);
+        prometheus.recordJoinResult(JoinMetricReason::Ok, joinDurationMs);
+        prometheus.setConnectedClients(room.getClientCount());
 
         std::cout << "client #" << joinResult.clientId
             << " joined media=" << joinResult.activeMediaIdentity
@@ -896,6 +988,7 @@ namespace
             room,
             metrics,
             experienceMetrics,
+            prometheus,
             correctionCoordinator,
             controlCommandMutex,
             telemetry,
@@ -992,15 +1085,40 @@ void runSyncServer()
     Room room;
     SyncMetricsCollector metrics;
     ExperienceMetricsCollector experienceMetrics;
+    PrometheusMetrics prometheus;
+    MetricsHttpServer metricsHttpServer(prometheus);
     SyncCorrectionCoordinator correctionCoordinator;
     const std::string telemetryPath = TelemetryLogger::pathFromEnvironment();
     TelemetryLogger telemetry(&std::cout, telemetryPath);
     std::mutex controlCommandMutex;
     std::atomic_bool serverRunning{ true };
 
+    std::string metricsPortWarning;
+    const unsigned short requestedMetricsPort =
+        metricsPortFromEnvironment(metricsPortWarning);
+    if (!metricsPortWarning.empty())
+    {
+        std::cerr << metricsPortWarning << "\n";
+    }
+    std::string metricsError;
+    const bool metricsEndpointEnabled = metricsHttpServer.start(
+        requestedMetricsPort,
+        metricsError
+    );
+    prometheus.setServerUp(true);
+
     std::cout << "SyncServer listening on port " << kServerPort << "...\n";
     std::cout << "Server role: accept clients and broadcast playback commands.\n";
     std::cout << "Press Ctrl+C to stop the server.\n";
+    if (metricsEndpointEnabled)
+    {
+        std::cout << "Metrics endpoint: http://127.0.0.1:"
+            << metricsHttpServer.port() << "/metrics\n";
+    }
+    else
+    {
+        std::cerr << "metrics endpoint disabled: " << metricsError << "\n";
+    }
     if (!telemetry.initializationError().empty())
     {
         std::cerr << "telemetry file disabled: "
@@ -1011,7 +1129,12 @@ void runSyncServer()
     started.name = "server_started";
     started
         .addInteger("listen_port", kServerPort)
-        .addBoolean("jsonl_file_enabled", telemetry.fileEnabled());
+        .addBoolean("jsonl_file_enabled", telemetry.fileEnabled())
+        .addBoolean("metrics_endpoint_enabled", metricsEndpointEnabled)
+        .addInteger(
+            "metrics_port",
+            metricsEndpointEnabled ? metricsHttpServer.port() : 0
+        );
     telemetry.emit(started);
 
     std::thread heartbeatThread(
@@ -1040,6 +1163,7 @@ void runSyncServer()
             std::ref(room),
             std::ref(metrics),
             std::ref(experienceMetrics),
+            std::ref(prometheus),
             std::ref(correctionCoordinator),
             std::ref(controlCommandMutex),
             std::ref(telemetry)
@@ -1053,7 +1177,9 @@ void runSyncServer()
         heartbeatThread.join();
     }
 
+    prometheus.setServerUp(false);
     closeSocket(listenSocket);
+    metricsHttpServer.stop();
     cleanupSockets();
 }
 
