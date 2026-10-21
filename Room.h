@@ -22,13 +22,25 @@ struct RoomSnapshot
     SyncState state;
     long long controlEpoch = 0;
     std::string mediaIdentity;
+    std::string sessionId;
 };
 
 struct RoomJoinResult
 {
     bool accepted = false;
+    bool sessionStarted = false;
     int clientId = 0;
     std::string activeMediaIdentity;
+    std::string sessionId;
+};
+
+struct RoomRemovalResult
+{
+    bool clientRemoved = false;
+    bool sessionEnded = false;
+    std::string sessionId;
+    std::size_t remainingClients = 0;
+    long long sessionDurationMilliseconds = 0;
 };
 
 // Room 表示一个同步观影房间。
@@ -47,8 +59,9 @@ public:
         SocketHandle clientSocket,
         const std::string& mediaIdentity
     );
-    // 返回 true 表示最后一个 client 已离开，本轮房间会话已经结束。
-    bool removeClient(SocketHandle clientSocket);
+    // 返回移除结果和对应 session_id。调用方可以准确区分“未知 socket”与
+    // “最后一位观众离开”，避免重复产生 session_ended 事件。
+    RoomRemovalResult removeClient(SocketHandle clientSocket);
 
     // server 为控制命令分配 epoch 后回显给所有 client（包括发起者）。
     // 所有人都按同一条权威消息执行，才能维护完全一致的控制顺序。
@@ -75,6 +88,8 @@ private:
     std::vector<ClientConnection> clients_;
     SyncState state_;
     std::string mediaIdentity_;
+    std::string sessionId_;
+    Clock::time_point sessionStartedAt_{};
     Clock::time_point lastStateUpdateTime_ = Clock::now();
     long long controlEpoch_ = 0;
     int nextClientId_ = 1;

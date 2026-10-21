@@ -276,10 +276,10 @@ def add_title_block(doc):
     set_run_font(run, size=12.5, color=COLOR_MUTED)
 
     metadata = [
-        ("当前开发分支", "feature/sync-correction-execution"),
-        ("版本基线", "c89e021 + 云端单机双实例实验"),
-        ("本次阶段", "自动同步校正云端验收与问题识别"),
-        ("维护日期", "2026-09-25"),
+        ("当前开发分支", "feature/observability"),
+        ("版本基线", "b960333 + 同步校正可靠性收口"),
+        ("本次阶段", "可观测性指标契约与结构化会话事件"),
+        ("维护日期", "2026-10-21"),
         ("安全约束", "服务器口令、私钥和其他凭据不得进入源码、日志、文档或 Git 历史"),
     ]
     table = doc.add_table(rows=1, cols=2)
@@ -1502,6 +1502,51 @@ def build_document():
         "最小自动校正闭环具备提交条件；仍需保留‘同机双实例’限定，不能把结果表述为真实异地双机最终精度。",
     )
 
+    doc.add_heading("7.15 可观测性第一阶段：指标契约与会话事件", level=2)
+    add_body(
+        doc,
+        "2026-10-21 开始把项目从‘能够通过日志人工验证’推进到‘能够用统一数据口径长期衡量’。"
+        "此前已经有 RTT、pair skew、校正命令和回执等详细 [metric] 行，但缺少稳定 session_id、结构化事件 schema、"
+        "成功率分母和正式 SLO 定义，因此还不能可靠回答连接成功率、同步良好时间占比或故障趋势。"
+        "本阶段没有先接 Grafana，而是先固定数据契约，避免把含义不稳定的数字过早做成看板。",
+    )
+    add_bullet(
+        doc,
+        "指标字典：新增 docs/Observability.md，按用户体验和技术黄金信号定义 JOIN 成功率、首帧、初始同步、"
+        "pair skew、同步良好率、控制应用延迟、校正成功率和校正收敛时间；每项明确分子、分母、排除条件、"
+        "分位数和第一版目标，禁止只报平均值。",
+    )
+    add_bullet(
+        doc,
+        "结构化事件：TelemetryEvent 使用 typed attributes，TelemetryLogger 输出 schema_version=1 的单行 JSON。"
+        "多线程写入由统一 mutex 串行化；设置 SYNCCINEMA_TELEMETRY_PATH 后追加写入纯 JSONL，并逐条 flush，"
+        "日志目录无法创建时降级为控制台而不阻止 server 启动。",
+    )
+    add_bullet(
+        doc,
+        "会话关联：空房间接受首个媒体时生成 UUID v4 session_id；后续同媒体 client 复用该 ID，最后一个 client"
+        " 离开时返回 session duration 并清空。RoomRemovalResult 同时区分未知 socket、普通离开和真正会话结束，"
+        "避免重复产生 session_ended。",
+    )
+    add_bullet(
+        doc,
+        "生命周期事件：server_started、session_started、join_result、client_disconnected 和 session_ended"
+        " 已接入 server。媒体只记录稳定 media_id，不记录原始 URL 或本地路径；reason 使用有限错误码，避免隐私泄露"
+        "和 Prometheus 高基数标签。",
+    )
+    add_bullet(
+        doc,
+        "时间语义：UTC timestamp 只用于检索，duration_ms 仍在同一进程内使用 steady_clock 计算。跨设备控制延迟"
+        "后续由 server 从接收 CONTROL 到收到各 client APPLIED ACK 计算，不能直接相减两台电脑的系统时间。",
+    )
+    add_body(
+        doc,
+        "自动化测试覆盖 JSON 转义与类型保持、100 个 UUID 的格式和唯一性、四线程并发事件不穿行、JSONL 文件追加，"
+        "以及 Room 在同一会话复用 ID、清空后生成新 ID。Windows Qt/server/核心测试与 WSL Linux server/核心测试均"
+        "完成构建，CTest 全部通过。当前只完成可靠采集基础，尚未声称 Prometheus 指标、Grafana 看板、首帧和控制 ACK"
+        "已经落地；下一阶段才会计算会话级汇总和八项核心体验指标。",
+    )
+
     doc.add_heading("8. 面试表达模板", level=1)
     add_body(
         doc,
@@ -1568,6 +1613,14 @@ def build_document():
         " sendSocket 下沉到跨平台网络层，Linux 使用 MSG_NOSIGNAL。随后用 socketpair 回归和云端 20 次 TCP RST 复验，"
         "确认第三方异常流量只能损失单条连接，不能终止整个服务。",
     )
+    add_body(
+        doc,
+        "第九段可以这样说明产品指标：我把观测分成用户体验、同步正确性和系统健康三层。用户体验看 JOIN 成功率、"
+        "首帧和无崩溃会话；同步正确性看有效 pair skew 的 P50/P95/P99、同步良好时间占比、校正成功率和收敛时间；"
+        "技术侧按 latency、traffic、errors、saturation 四个黄金信号组织。实现时先定义分子分母、settling 排除条件"
+        "和 SLO，再用 session_id 关联 JSONL 事件，避免只有零散日志却无法形成趋势。跨设备耗时不直接比较墙上时间，"
+        "而由 server steady_clock 测量命令到 ACK 的闭环。",
+    )
 
     doc.add_heading("9. 后续学习重点", level=1)
     add_numbered(doc, "SyncClientSession：如何把 UI/CLI 与网络、协议、播放器并发解耦。")
@@ -1603,24 +1656,19 @@ def build_document():
     add_numbered(doc, "晚加入稳定窗口：为什么 SNAPSHOT 已经包含当前进度，libVLC 仍可能短暂上报 0 ms 或留下 421-537 ms 偏差。")
     add_numbered(doc, "故障注入下的 RTT：为什么暂停整个进程会同时阻塞 PONG，累计平均值为何不适合作为实时网络基线。")
     add_numbered(doc, "metrics 会话生命周期：为什么 Room 清空时业务 epoch 和统计 epoch 必须一起重置。")
+    add_numbered(doc, "TelemetryEvent 与 schema_version：为什么先稳定事件契约，再选择 Prometheus、Loki 或数据库。")
+    add_numbered(doc, "session_id 生命周期：为什么 client_id 不能跨会话关联，媒体原始 URL 也不应进入遥测。")
+    add_numbered(doc, "指标口径：如何定义成功率分子分母、有效样本、settling 排除条件与 P50/P95/P99。")
+    add_numbered(doc, "低基数维度：为什么错误全文、session_id 和 media_id 可以用于日志检索，却不能直接做 Prometheus label。")
+    add_numbered(doc, "RED 与 USE：如何分别衡量服务请求和 CPU、内存、文件描述符、网络等资源饱和度。")
 
     doc.add_heading("10. 后续工程路线", level=1)
-    add_numbered(doc, "用两台真实电脑完成同媒体、相同公网 server 的验收，采集 correction_decision、correction_command、correction_execution 和 correction_result 全链路日志。")
-    add_numbered(doc, "制造持续 750 ms 以上落后，验证只校正落后端、ACK 能匹配、5 秒冷却生效，并观察是否出现过冲或反复 seek。")
-    add_numbered(doc, "统计校正前后 pair median/P95、命令成功率、拒绝原因和用户可见跳转频率，再决定是否调整阈值。")
-    add_numbered(doc, "公网硬 seek 闭环稳定后，再研究 250-750 ms 小偏差的温和校正；暂不贸然引入倍速控制。")
-    add_numbered(doc, "进一步同步 server/client 时钟并支持未来执行时间，让两端在约定时刻执行控制，降低广播到达差。")
-    add_numbered(doc, "在 Qt 客户端上继续增加房间信息、聊天与弹幕，但不让 UI 直接处理协议字符串。")
-    add_numbered(doc, "补齐 systemd 服务、配置文件、日志轮转、自动构建测试和发布包。")
-
-    add_callout(
-        doc,
-        "下一阶段入口",
-        "最小自动校正已完成可靠性收口和第二轮云端单机双实例验收：Linux SIGPIPE、metrics 会话重置、"
-        "滚动 RTT 基线和晚加入位置确认均已实现并通过回归。两次故障注入分别从约 22.1 秒和 8.1 秒偏差恢复，"
-        "最终 Playing 窗口中位偏差约 88 ms。下一步用两台真实电脑复测相同场景，再根据跨设备数据决定是否为"
-        " 250-750 ms 中等偏差引入温和校正。",
-    )
+    add_numbered(doc, "实现首帧、初始同步、控制应用 ACK、校正收敛和会话汇总事件，形成八项核心体验指标。")
+    add_numbered(doc, "为 JSONL 增加日志轮转与保留策略，并从事件生成离线会话报告，先验证成功率和分位数口径。")
+    add_numbered(doc, "接入 Prometheus counter/gauge/histogram 与 /metrics endpoint，严格限制 label 基数。")
+    add_numbered(doc, "建立用户体验、同步质量、系统资源三张 Grafana 看板，并为持续超标而非单点异常配置告警。")
+    add_numbered(doc, "用两台真实电脑和延迟、抖动、丢包、进程暂停、断网、server 重启实验验证 SLO。")
+    add_numbered(doc, "补齐服务托管、健康检查、优雅停机、自动重连、CI 和发布包；随后增加聊天与弹幕。")
 
     doc.save(OUTPUT_PATH)
     print(f"Created {OUTPUT_PATH}")

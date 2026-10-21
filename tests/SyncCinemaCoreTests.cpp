@@ -1,8 +1,12 @@
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "MockPlayer.h"
@@ -15,6 +19,7 @@
 #include "SyncCorrectionCoordinator.h"
 #include "SyncCorrectionExecutor.h"
 #include "SyncMetrics.h"
+#include "Telemetry.h"
 
 namespace
 {
@@ -141,6 +146,157 @@ namespace
             paused.converged &&
                 paused.expectedPositionMilliseconds == 42000,
             "paused convergence keeps a fixed expected position"
+        );
+    }
+
+    void testStructuredTelemetrySerialization()
+    {
+        TelemetryEvent event;
+        event.name = "join_result";
+        event.sessionId = "123e4567-e89b-42d3-a456-426614174000";
+        event.clientId = 7;
+        event.controlEpoch = 3;
+        event
+            .addBoolean("success", false)
+            .addString("reason", "bad \"media\"\nline")
+            .addInteger("duration_ms", 42)
+            .addDouble("ratio", 0.5);
+
+        const auto timestamp = std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(123)
+        );
+        const std::string json = serializeTelemetryEvent(event, timestamp);
+
+        expect(
+            json.find("\"schema_version\":1") != std::string::npos &&
+                json.find("\"timestamp\":\"1970-01-01T00:00:00.123Z\"") !=
+                    std::string::npos,
+            "telemetry JSON carries a versioned UTC timestamp"
+        );
+        expect(
+            json.find("\"event\":\"join_result\"") != std::string::npos &&
+                json.find("\"client_id\":7") != std::string::npos &&
+                json.find("\"control_epoch\":3") != std::string::npos,
+            "telemetry JSON carries stable correlation dimensions"
+        );
+        expect(
+            json.find("bad \\\"media\\\"\\nline") != std::string::npos &&
+                json.find('\n') == std::string::npos,
+            "telemetry JSON escapes untrusted strings without breaking JSONL"
+        );
+        expect(
+            json.find("\"success\":false") != std::string::npos &&
+                json.find("\"duration_ms\":42") != std::string::npos &&
+                json.find("\"ratio\":0.5") != std::string::npos,
+            "telemetry JSON preserves field value types"
+        );
+    }
+
+    void testTelemetryLoggerKeepsConcurrentEventsOnSeparateLines()
+    {
+        std::ostringstream output;
+        TelemetryLogger logger(&output);
+        constexpr int threadCount = 4;
+        constexpr int eventsPerThread = 25;
+        std::vector<std::thread> threads;
+
+        for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex)
+        {
+            threads.emplace_back([threadIndex, &logger]
+            {
+                for (int eventIndex = 0;
+                    eventIndex < eventsPerThread;
+                    ++eventIndex)
+                {
+                    TelemetryEvent event;
+                    event.name = "concurrent_test";
+                    event
+                        .addInteger("thread", threadIndex)
+                        .addInteger("sequence", eventIndex);
+                    logger.emit(event);
+                }
+            });
+        }
+        for (std::thread& thread : threads)
+        {
+            thread.join();
+        }
+
+        int lineCount = 0;
+        std::string line;
+        std::istringstream lines(output.str());
+        bool everyLineIsComplete = true;
+        while (std::getline(lines, line))
+        {
+            ++lineCount;
+            everyLineIsComplete = everyLineIsComplete &&
+                line.starts_with("[telemetry] {") &&
+                line.ends_with('}');
+        }
+
+        expect(
+            lineCount == threadCount * eventsPerThread &&
+                everyLineIsComplete,
+            "telemetry logger serializes concurrent events as complete lines"
+        );
+    }
+
+    void testTelemetryLoggerWritesJsonlFile()
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() /
+            ("synccinema-telemetry-" + generateTelemetrySessionId() +
+                ".jsonl");
+
+        bool fileEnabled = false;
+        bool emitted = false;
+        {
+            TelemetryLogger logger(nullptr, path.string());
+            fileEnabled = logger.fileEnabled();
+
+            TelemetryEvent event;
+            event.name = "file_test";
+            event.addBoolean("success", true);
+            emitted = logger.emit(event);
+        }
+
+        std::ifstream input(path);
+        std::string line;
+        const bool readLine = static_cast<bool>(std::getline(input, line));
+        input.close();
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+
+        expect(
+            fileEnabled && emitted && readLine &&
+                line.find("\"event\":\"file_test\"") != std::string::npos &&
+                line.find("\"success\":true") != std::string::npos,
+            "telemetry logger appends one valid JSON object per file line"
+        );
+    }
+
+    void testTelemetrySessionIdsAreUuidV4()
+    {
+        std::unordered_set<std::string> identifiers;
+        bool allHaveUuidShape = true;
+        for (int index = 0; index < 100; ++index)
+        {
+            const std::string identifier = generateTelemetrySessionId();
+            allHaveUuidShape = allHaveUuidShape &&
+                identifier.size() == 36 &&
+                identifier[8] == '-' &&
+                identifier[13] == '-' &&
+                identifier[14] == '4' &&
+                identifier[18] == '-' &&
+                (identifier[19] == '8' || identifier[19] == '9' ||
+                    identifier[19] == 'a' || identifier[19] == 'b') &&
+                identifier[23] == '-';
+            identifiers.insert(identifier);
+        }
+
+        expect(
+            allHaveUuidShape && identifiers.size() == 100,
+            "telemetry session ids are unique UUID v4 values"
         );
     }
 
@@ -316,8 +472,13 @@ namespace
         RoomJoinResult firstJoin = room.joinClient(firstSocket, firstMedia);
         expect(firstJoin.accepted, "first client establishes the room media");
         expect(
-            room.getSnapshot().mediaIdentity == firstMedia,
-            "Room snapshot carries the active media identity"
+            firstJoin.sessionStarted && !firstJoin.sessionId.empty(),
+            "first client creates an observable room session"
+        );
+        expect(
+            room.getSnapshot().mediaIdentity == firstMedia &&
+                room.getSnapshot().sessionId == firstJoin.sessionId,
+            "Room snapshot carries media and session identities"
         );
 
         SyncMessage seek;
@@ -339,7 +500,8 @@ namespace
             secondMedia
         );
         expect(
-            !mismatchedJoin.accepted,
+            !mismatchedJoin.accepted &&
+                mismatchedJoin.sessionId == firstJoin.sessionId,
             "Room rejects a different media while viewers remain"
         );
         expect(
@@ -352,22 +514,35 @@ namespace
             firstMedia
         );
         expect(
-            matchingJoin.accepted,
+            matchingJoin.accepted &&
+                !matchingJoin.sessionStarted &&
+                matchingJoin.sessionId == firstJoin.sessionId,
             "Room accepts another client with the same media"
         );
 
+        RoomRemovalResult firstRemoval = room.removeClient(secondSocket);
         expect(
-            !room.removeClient(secondSocket),
+            firstRemoval.clientRemoved &&
+                !firstRemoval.sessionEnded &&
+                firstRemoval.remainingClients == 1,
             "removing one of two clients keeps the room session active"
         );
+        RoomRemovalResult finalRemoval = room.removeClient(firstSocket);
         expect(
-            room.removeClient(firstSocket),
+            finalRemoval.clientRemoved &&
+                finalRemoval.sessionEnded &&
+                finalRemoval.sessionId == firstJoin.sessionId &&
+                finalRemoval.remainingClients == 0,
             "removing the final client reports the end of the room session"
         );
         RoomSnapshot emptyRoom = room.getSnapshot();
         expect(
             emptyRoom.mediaIdentity.empty(),
             "last client leaving ends the media session"
+        );
+        expect(
+            emptyRoom.sessionId.empty(),
+            "ended room no longer exposes the previous session id"
         );
         expect(
             emptyRoom.state.state == PlaybackState::Stopped &&
@@ -378,7 +553,12 @@ namespace
 
         RoomJoinResult nextJoin = room.joinClient(firstSocket, secondMedia);
         RoomSnapshot nextSnapshot = room.getSnapshot();
-        expect(nextJoin.accepted, "next media can establish a fresh session");
+        expect(
+            nextJoin.accepted &&
+                nextJoin.sessionStarted &&
+                nextJoin.sessionId != firstJoin.sessionId,
+            "next media establishes a distinct observable session"
+        );
         expect(
             nextSnapshot.mediaIdentity == secondMedia &&
                 nextSnapshot.state.state == PlaybackState::Stopped &&
@@ -975,6 +1155,10 @@ namespace
 int main()
 {
     testSnapshotProtocolRoundTrip();
+    testStructuredTelemetrySerialization();
+    testTelemetryLoggerKeepsConcurrentEventsOnSeparateLines();
+    testTelemetryLoggerWritesJsonlFile();
+    testTelemetrySessionIdsAreUuidV4();
     testPlaybackPositionConvergence();
     testRollingRttEstimator();
     testMetricsSessionReset();

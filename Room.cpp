@@ -5,6 +5,8 @@
 #include <iostream>
 #include <string>
 
+#include "Telemetry.h"
+
 namespace
 {
     bool sendAll(SocketHandle socket, const std::string& data)
@@ -58,12 +60,16 @@ RoomJoinResult Room::joinClient(
         // 媒体会话，状态必须从 Stopped/0 开始，不能继承上一部电影。
         state_ = SyncState{};
         mediaIdentity_ = mediaIdentity;
+        sessionId_ = generateTelemetrySessionId();
         controlEpoch_ = 0;
-        lastStateUpdateTime_ = Clock::now();
+        sessionStartedAt_ = Clock::now();
+        lastStateUpdateTime_ = sessionStartedAt_;
+        result.sessionStarted = true;
     }
     else if (mediaIdentity_ != mediaIdentity)
     {
         result.activeMediaIdentity = mediaIdentity_;
+        result.sessionId = sessionId_;
         return result;
     }
 
@@ -74,12 +80,18 @@ RoomJoinResult Room::joinClient(
     result.accepted = true;
     result.clientId = clientId;
     result.activeMediaIdentity = mediaIdentity_;
+    result.sessionId = sessionId_;
     return result;
 }
 
-bool Room::removeClient(SocketHandle clientSocket)
+RoomRemovalResult Room::removeClient(SocketHandle clientSocket)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    RoomRemovalResult result;
+    result.sessionId = sessionId_;
+
+    const std::size_t previousSize = clients_.size();
 
     auto newEnd = std::remove_if(
         clients_.begin(),
@@ -90,18 +102,28 @@ bool Room::removeClient(SocketHandle clientSocket)
         }
     );
     clients_.erase(newEnd, clients_.end());
+    result.clientRemoved = clients_.size() != previousSize;
+    result.remainingClients = clients_.size();
 
-    if (clients_.empty())
+    if (result.clientRemoved && clients_.empty())
     {
         // 单房间 MVP 把“最后一个 client 离开”定义为会话结束。
         // 下一个首位加入者会重新选择媒体并从 0 开始。
         state_ = SyncState{};
         mediaIdentity_.clear();
+        sessionId_.clear();
         controlEpoch_ = 0;
-        lastStateUpdateTime_ = Clock::now();
+        const Clock::time_point endedAt = Clock::now();
+        result.sessionDurationMilliseconds =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                endedAt - sessionStartedAt_
+            ).count();
+        sessionStartedAt_ = {};
+        lastStateUpdateTime_ = endedAt;
+        result.sessionEnded = true;
     }
 
-    return clients_.empty();
+    return result;
 }
 
 bool Room::broadcastControlMessage(const SyncMessage& message)
@@ -194,6 +216,7 @@ RoomSnapshot Room::getSnapshot() const
     snapshot.state = getEstimatedStateLocked(Clock::now());
     snapshot.controlEpoch = controlEpoch_;
     snapshot.mediaIdentity = mediaIdentity_;
+    snapshot.sessionId = sessionId_;
     return snapshot;
 }
 

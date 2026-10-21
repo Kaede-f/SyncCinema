@@ -14,6 +14,7 @@
 #include "Room.h"
 #include "SyncCorrectionCoordinator.h"
 #include "SyncMetrics.h"
+#include "Telemetry.h"
 
 namespace
 {
@@ -23,6 +24,37 @@ namespace
     constexpr std::size_t kMaxHandshakeBytes = 4096;
 
     using Clock = std::chrono::steady_clock;
+
+    long long elapsedMilliseconds(
+        Clock::time_point startedAt,
+        Clock::time_point endedAt = Clock::now())
+    {
+        const long long elapsed = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                endedAt - startedAt
+            ).count()
+        );
+        return elapsed < 0 ? 0 : elapsed;
+    }
+
+    void emitSessionEnded(
+        TelemetryLogger& telemetry,
+        const RoomRemovalResult& removal)
+    {
+        if (!removal.sessionEnded)
+        {
+            return;
+        }
+
+        TelemetryEvent event;
+        event.name = "session_ended";
+        event.sessionId = removal.sessionId;
+        event.addInteger(
+            "duration_ms",
+            removal.sessionDurationMilliseconds
+        );
+        telemetry.emit(event);
+    }
 
     SyncMessage makeSnapshotMessage(const RoomSnapshot& snapshot)
     {
@@ -322,13 +354,18 @@ namespace
     void handleClient(
         SocketHandle clientSocket,
         int clientId,
+        std::string sessionId,
         Room& room,
         SyncMetricsCollector& metrics,
         SyncCorrectionCoordinator& correctionCoordinator,
         std::mutex& controlCommandMutex,
+        TelemetryLogger& telemetry,
         std::string receiveBuffer)
     {
         char buffer[512]{};
+        const Clock::time_point connectedAt = Clock::now();
+        std::string disconnectReason = "peer_closed";
+        int disconnectError = 0;
 
         while (true)
         {
@@ -361,17 +398,20 @@ namespace
             }
             else
             {
-                std::cout << "recv failed: " << getSocketError() << "\n";
+                disconnectError = getSocketError();
+                disconnectReason = "recv_error";
+                std::cout << "recv failed: " << disconnectError << "\n";
                 break;
             }
         }
 
+        RoomRemovalResult removal;
         {
             // client 移除与 server 主动发送校正共用顺序锁，避免通过旧 id
             // 找到一个正被关闭、甚至已被系统复用的 socket。
             std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-            const bool sessionEnded = room.removeClient(clientSocket);
-            if (sessionEnded)
+            removal = room.removeClient(clientSocket);
+            if (removal.sessionEnded)
             {
                 metrics.resetSession();
             }
@@ -382,7 +422,27 @@ namespace
             correctionCoordinator.removeClient(clientId);
         }
         closeSocket(clientSocket);
-        std::cout << "client removed. online clients: " << room.getClientCount() << "\n";
+
+        TelemetryEvent disconnected;
+        disconnected.name = "client_disconnected";
+        disconnected.sessionId = std::move(sessionId);
+        disconnected.clientId = clientId;
+        disconnected
+            .addString("reason", disconnectReason)
+            .addInteger("socket_error", disconnectError)
+            .addInteger(
+                "connection_duration_ms",
+                elapsedMilliseconds(connectedAt)
+            )
+            .addInteger(
+                "remaining_clients",
+                static_cast<long long>(removal.remainingClients)
+            );
+        telemetry.emit(disconnected);
+        emitSessionEnded(telemetry, removal);
+
+        std::cout << "client removed. online clients: "
+            << removal.remainingClients << "\n";
     }
 
     void handleClientConnection(
@@ -390,8 +450,10 @@ namespace
         Room& room,
         SyncMetricsCollector& metrics,
         SyncCorrectionCoordinator& correctionCoordinator,
-        std::mutex& controlCommandMutex)
+        std::mutex& controlCommandMutex,
+        TelemetryLogger& telemetry)
     {
+        const Clock::time_point joinStartedAt = Clock::now();
         std::string receiveBuffer;
         SyncMessage joinMessage;
         if (!receiveJoinMessage(clientSocket, receiveBuffer, joinMessage))
@@ -402,6 +464,17 @@ namespace
             room.sendMessageToClient(clientSocket, rejection);
             closeSocket(clientSocket);
             std::cout << "client rejected: valid JOIN was not received\n";
+
+            TelemetryEvent rejected;
+            rejected.name = "join_result";
+            rejected
+                .addBoolean("success", false)
+                .addString("reason", "JOIN_REQUIRED")
+                .addInteger(
+                    "duration_ms",
+                    elapsedMilliseconds(joinStartedAt)
+                );
+            telemetry.emit(rejected);
             return;
         }
 
@@ -428,6 +501,15 @@ namespace
             }
         }
 
+        if (joinResult.sessionStarted)
+        {
+            TelemetryEvent started;
+            started.name = "session_started";
+            started.sessionId = joinResult.sessionId;
+            started.addString("media_id", joinResult.activeMediaIdentity);
+            telemetry.emit(started);
+        }
+
         if (!joinResult.accepted)
         {
             SyncMessage rejection;
@@ -436,6 +518,23 @@ namespace
             room.sendMessageToClient(clientSocket, rejection);
             closeSocket(clientSocket);
             std::cout << "client rejected: room media does not match\n";
+
+            TelemetryEvent rejected;
+            rejected.name = "join_result";
+            rejected.sessionId = joinResult.sessionId;
+            rejected
+                .addBoolean("success", false)
+                .addString("reason", "MEDIA_MISMATCH")
+                .addString("requested_media_id", joinMessage.mediaIdentity)
+                .addString(
+                    "active_media_id",
+                    joinResult.activeMediaIdentity
+                )
+                .addInteger(
+                    "duration_ms",
+                    elapsedMilliseconds(joinStartedAt)
+                );
+            telemetry.emit(rejected);
             return;
         }
 
@@ -443,10 +542,11 @@ namespace
         {
             std::cout << "initial snapshot send failed for client #"
                 << joinResult.clientId << "\n";
+            RoomRemovalResult removal;
             {
                 std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-                const bool sessionEnded = room.removeClient(clientSocket);
-                if (sessionEnded)
+                removal = room.removeClient(clientSocket);
+                if (removal.sessionEnded)
                 {
                     metrics.resetSession();
                 }
@@ -457,8 +557,41 @@ namespace
                 correctionCoordinator.removeClient(joinResult.clientId);
             }
             closeSocket(clientSocket);
+
+            TelemetryEvent rejected;
+            rejected.name = "join_result";
+            rejected.sessionId = joinResult.sessionId;
+            rejected.clientId = joinResult.clientId;
+            rejected
+                .addBoolean("success", false)
+                .addString("reason", "SNAPSHOT_SEND_FAILED")
+                .addInteger(
+                    "duration_ms",
+                    elapsedMilliseconds(joinStartedAt)
+                );
+            telemetry.emit(rejected);
+            emitSessionEnded(telemetry, removal);
             return;
         }
+
+        TelemetryEvent joined;
+        joined.name = "join_result";
+        joined.sessionId = joinResult.sessionId;
+        joined.clientId = joinResult.clientId;
+        joined.controlEpoch = initialSnapshot.controlEpoch;
+        joined
+            .addBoolean("success", true)
+            .addString("reason", "OK")
+            .addString("media_id", joinResult.activeMediaIdentity)
+            .addInteger(
+                "duration_ms",
+                elapsedMilliseconds(joinStartedAt)
+            )
+            .addInteger(
+                "online_clients",
+                static_cast<long long>(room.getClientCount())
+            );
+        telemetry.emit(joined);
 
         std::cout << "client #" << joinResult.clientId
             << " joined media=" << joinResult.activeMediaIdentity
@@ -470,10 +603,12 @@ namespace
         handleClient(
             clientSocket,
             joinResult.clientId,
+            joinResult.sessionId,
             room,
             metrics,
             correctionCoordinator,
             controlCommandMutex,
+            telemetry,
             std::move(receiveBuffer)
         );
     }
@@ -567,12 +702,26 @@ void runSyncServer()
     Room room;
     SyncMetricsCollector metrics;
     SyncCorrectionCoordinator correctionCoordinator;
+    const std::string telemetryPath = TelemetryLogger::pathFromEnvironment();
+    TelemetryLogger telemetry(&std::cout, telemetryPath);
     std::mutex controlCommandMutex;
     std::atomic_bool serverRunning{ true };
 
     std::cout << "SyncServer listening on port " << kServerPort << "...\n";
     std::cout << "Server role: accept clients and broadcast playback commands.\n";
     std::cout << "Press Ctrl+C to stop the server.\n";
+    if (!telemetry.initializationError().empty())
+    {
+        std::cerr << "telemetry file disabled: "
+            << telemetry.initializationError() << "\n";
+    }
+
+    TelemetryEvent started;
+    started.name = "server_started";
+    started
+        .addInteger("listen_port", kServerPort)
+        .addBoolean("jsonl_file_enabled", telemetry.fileEnabled());
+    telemetry.emit(started);
 
     std::thread heartbeatThread(
         heartbeatLoop,
@@ -600,7 +749,8 @@ void runSyncServer()
             std::ref(room),
             std::ref(metrics),
             std::ref(correctionCoordinator),
-            std::ref(controlCommandMutex)
+            std::ref(controlCommandMutex),
+            std::ref(telemetry)
         );
         clientThread.detach();
     }
