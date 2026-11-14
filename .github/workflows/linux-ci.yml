@@ -1,0 +1,27 @@
+name: Linux CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DUSE_LIBVLC=OFF -DBUILD_QT_CLIENT=OFF
+          cmake --build build --parallel 2 --target SyncCinemaServer SyncCinemaCoreTests
+
+      - name: Run C++ and TCP integration tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Run observability tests
+        run: python3 -m unittest discover -s tools/observability/tests -v
