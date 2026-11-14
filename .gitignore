@@ -46,6 +46,13 @@ Testing/
 *.log
 *.tmp
 *.cache
+*.zip
+~$*.docx
+__pycache__/
+*.py[cod]
+
+# Local observability credentials
+/deploy/observability/.env
 
 # OS/editor noise
 Thumbs.db

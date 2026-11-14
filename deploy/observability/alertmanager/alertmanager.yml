@@ -1,0 +1,16 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: local-console
+  group_by:
+    - alertname
+    - severity
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+# 第一版先在 Alertmanager UI 中完成告警聚合、确认和静默。
+# 上线通知渠道时，在这里增加 webhook/email receiver，不需要修改业务代码。
+receivers:
+  - name: local-console

@@ -12,10 +12,20 @@ bool applyMessageToPlayer(const SyncMessage& message, PlayerController& player)
         return player.pause();
     case MessageType::Seek:
         return player.seek(message.positionSeconds);
+    case MessageType::Report:
+    case MessageType::Ping:
+    case MessageType::Pong:
+    case MessageType::Join:
+    case MessageType::JoinRejected:
+    case MessageType::Snapshot:
+    case MessageType::Correction:
+    case MessageType::CorrectionResult:
+    case MessageType::FirstFrame:
+    case MessageType::ControlResult:
+        return false;
     case MessageType::Unknown:
         return false;
     }
 
     return false;
 }
-

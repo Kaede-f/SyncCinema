@@ -9,14 +9,26 @@
 class ConsoleMockPlayer : public PlayerController
 {
 public:
+    void setEventCallback(PlayerEventCallback callback) override;
     bool openMedia(const std::string& path) override;
     bool play() override;
     bool pause() override;
     bool seek(int seconds) override;
+    bool seekMilliseconds(long long milliseconds) override;
+    bool isSeekable() const override;
+    long long getPositionMilliseconds() const override;
     int getPositionSeconds() const override;
+    bool setVideoOutputWindow(void* nativeWindow) override;
+    long long getDurationMilliseconds() const override;
+    bool setVolume(int volume) override;
+    int getVolume() const override;
 
 private:
+    void emitEvent(PlayerEventType type);
+
+    PlayerEventCallback eventCallback_;
     std::string mediaPath_;
     int positionSeconds_ = 0;
+    long long positionMilliseconds_ = 0;
+    int volume_ = 100;
 };
-

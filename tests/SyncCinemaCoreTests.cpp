@@ -1,0 +1,1596 @@
+#include <array>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+#include "MockPlayer.h"
+#include "ExperienceMetrics.h"
+#include "MetricsHttpServer.h"
+#include "NetSocket.h"
+#include "PlaybackPositionConvergence.h"
+#include "Protocol.h"
+#include "PrometheusMetrics.h"
+#include "RttEstimator.h"
+#include "Room.h"
+#include "SyncCorrectionPolicy.h"
+#include "SyncCorrectionCoordinator.h"
+#include "SyncCorrectionExecutor.h"
+#include "SyncMetrics.h"
+#include "Telemetry.h"
+
+namespace
+{
+    int failureCount = 0;
+
+    void expect(bool condition, const std::string& description)
+    {
+        if (condition)
+        {
+            std::cout << "[PASS] " << description << "\n";
+            return;
+        }
+
+        ++failureCount;
+        std::cout << "[FAIL] " << description << "\n";
+    }
+
+    void testSnapshotProtocolRoundTrip()
+    {
+        const std::string mediaIdentity = makeMediaIdentity(
+            "http://example.test/videos/movie.mp4"
+        );
+        SyncMessage outgoing;
+        outgoing.type = MessageType::Snapshot;
+        outgoing.controlEpoch = 7;
+        outgoing.playbackState = PlaybackState::Playing;
+        outgoing.positionMilliseconds = 123456;
+        outgoing.positionSeconds = 123;
+        outgoing.mediaIdentity = mediaIdentity;
+
+        std::string wireText = messageToString(outgoing);
+        expect(
+            wireText == "SNAPSHOT 7 Playing 123456 " + mediaIdentity + "\n",
+            "SNAPSHOT serializes to one newline-delimited protocol line"
+        );
+
+        SyncMessage parsed = stringToMessage(wireText);
+        expect(parsed.type == MessageType::Snapshot, "SNAPSHOT type parses");
+        expect(parsed.controlEpoch == 7, "SNAPSHOT epoch parses");
+        expect(
+            parsed.playbackState == PlaybackState::Playing,
+            "SNAPSHOT playback state parses"
+        );
+        expect(
+            parsed.positionMilliseconds == 123456,
+            "SNAPSHOT millisecond position parses"
+        );
+        expect(parsed.positionSeconds == 123, "SNAPSHOT derives second position");
+        expect(
+            parsed.mediaIdentity == mediaIdentity,
+            "SNAPSHOT media identity parses"
+        );
+
+        SyncState state;
+        applyMessageToState(parsed, state);
+        expect(state.state == PlaybackState::Playing, "SNAPSHOT applies state");
+        expect(
+            state.positionMilliseconds == 123456,
+            "SNAPSHOT applies millisecond position"
+        );
+    }
+
+    void testPlaybackPositionConvergence()
+    {
+        using Tracker = PlaybackPositionConvergenceTracker;
+        const Tracker::Clock::time_point referenceTime{};
+        PlaybackPositionConvergenceConfig config;
+        config.toleranceMilliseconds = 250;
+        config.requiredConsecutiveSamples = 2;
+
+        Tracker playingTracker(
+            55000,
+            PlaybackState::Playing,
+            referenceTime,
+            config
+        );
+
+        PlaybackPositionObservation initial = playingTracker.observe(
+            0,
+            referenceTime
+        );
+        expect(
+            !initial.converged && initial.errorMilliseconds == -55000,
+            "initial sync does not accept an un-applied seek at position zero"
+        );
+
+        PlaybackPositionObservation firstClose = playingTracker.observe(
+            55080,
+            referenceTime + std::chrono::milliseconds(100)
+        );
+        expect(
+            !firstClose.converged &&
+                firstClose.expectedPositionMilliseconds == 55100 &&
+                firstClose.consecutiveSamples == 1,
+            "playing convergence advances the expected position with time"
+        );
+
+        PlaybackPositionObservation secondClose = playingTracker.observe(
+            55190,
+            referenceTime + std::chrono::milliseconds(200)
+        );
+        expect(
+            secondClose.converged &&
+                secondClose.expectedPositionMilliseconds == 55200 &&
+                secondClose.consecutiveSamples == 2,
+            "initial sync requires consecutive close position samples"
+        );
+
+        Tracker pausedTracker(
+            42000,
+            PlaybackState::Paused,
+            referenceTime,
+            config
+        );
+        pausedTracker.observe(
+            42100,
+            referenceTime + std::chrono::seconds(5)
+        );
+        PlaybackPositionObservation paused = pausedTracker.observe(
+            41950,
+            referenceTime + std::chrono::seconds(10)
+        );
+        expect(
+            paused.converged &&
+                paused.expectedPositionMilliseconds == 42000,
+            "paused convergence keeps a fixed expected position"
+        );
+    }
+
+    void testStructuredTelemetrySerialization()
+    {
+        TelemetryEvent event;
+        event.name = "join_result";
+        event.sessionId = "123e4567-e89b-42d3-a456-426614174000";
+        event.clientId = 7;
+        event.controlEpoch = 3;
+        event
+            .addBoolean("success", false)
+            .addString("reason", "bad \"media\"\nline")
+            .addInteger("duration_ms", 42)
+            .addDouble("ratio", 0.5);
+
+        const auto timestamp = std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(123)
+        );
+        const std::string json = serializeTelemetryEvent(event, timestamp);
+
+        expect(
+            json.find("\"schema_version\":1") != std::string::npos &&
+                json.find("\"timestamp\":\"1970-01-01T00:00:00.123Z\"") !=
+                    std::string::npos,
+            "telemetry JSON carries a versioned UTC timestamp"
+        );
+        expect(
+            json.find("\"event\":\"join_result\"") != std::string::npos &&
+                json.find("\"client_id\":7") != std::string::npos &&
+                json.find("\"control_epoch\":3") != std::string::npos,
+            "telemetry JSON carries stable correlation dimensions"
+        );
+        expect(
+            json.find("bad \\\"media\\\"\\nline") != std::string::npos &&
+                json.find('\n') == std::string::npos,
+            "telemetry JSON escapes untrusted strings without breaking JSONL"
+        );
+        expect(
+            json.find("\"success\":false") != std::string::npos &&
+                json.find("\"duration_ms\":42") != std::string::npos &&
+                json.find("\"ratio\":0.5") != std::string::npos,
+            "telemetry JSON preserves field value types"
+        );
+    }
+
+    void testTelemetryLoggerKeepsConcurrentEventsOnSeparateLines()
+    {
+        std::ostringstream output;
+        TelemetryLogger logger(&output);
+        constexpr int threadCount = 4;
+        constexpr int eventsPerThread = 25;
+        std::vector<std::thread> threads;
+
+        for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex)
+        {
+            threads.emplace_back([threadIndex, &logger]
+            {
+                for (int eventIndex = 0;
+                    eventIndex < eventsPerThread;
+                    ++eventIndex)
+                {
+                    TelemetryEvent event;
+                    event.name = "concurrent_test";
+                    event
+                        .addInteger("thread", threadIndex)
+                        .addInteger("sequence", eventIndex);
+                    logger.emit(event);
+                }
+            });
+        }
+        for (std::thread& thread : threads)
+        {
+            thread.join();
+        }
+
+        int lineCount = 0;
+        std::string line;
+        std::istringstream lines(output.str());
+        bool everyLineIsComplete = true;
+        while (std::getline(lines, line))
+        {
+            ++lineCount;
+            everyLineIsComplete = everyLineIsComplete &&
+                line.starts_with("[telemetry] {") &&
+                line.ends_with('}');
+        }
+
+        expect(
+            lineCount == threadCount * eventsPerThread &&
+                everyLineIsComplete,
+            "telemetry logger serializes concurrent events as complete lines"
+        );
+    }
+
+    void testTelemetryLoggerWritesJsonlFile()
+    {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() /
+            ("synccinema-telemetry-" + generateTelemetrySessionId() +
+                ".jsonl");
+
+        bool fileEnabled = false;
+        bool emitted = false;
+        {
+            TelemetryLogger logger(nullptr, path.string());
+            fileEnabled = logger.fileEnabled();
+
+            TelemetryEvent event;
+            event.name = "file_test";
+            event.addBoolean("success", true);
+            emitted = logger.emit(event);
+        }
+
+        std::ifstream input(path);
+        std::string line;
+        const bool readLine = static_cast<bool>(std::getline(input, line));
+        input.close();
+        std::error_code removeError;
+        std::filesystem::remove(path, removeError);
+
+        expect(
+            fileEnabled && emitted && readLine &&
+                line.find("\"event\":\"file_test\"") != std::string::npos &&
+                line.find("\"success\":true") != std::string::npos,
+            "telemetry logger appends one valid JSON object per file line"
+        );
+    }
+
+    void testTelemetrySessionIdsAreUuidV4()
+    {
+        std::unordered_set<std::string> identifiers;
+        bool allHaveUuidShape = true;
+        for (int index = 0; index < 100; ++index)
+        {
+            const std::string identifier = generateTelemetrySessionId();
+            allHaveUuidShape = allHaveUuidShape &&
+                identifier.size() == 36 &&
+                identifier[8] == '-' &&
+                identifier[13] == '-' &&
+                identifier[14] == '4' &&
+                identifier[18] == '-' &&
+                (identifier[19] == '8' || identifier[19] == '9' ||
+                    identifier[19] == 'a' || identifier[19] == 'b') &&
+                identifier[23] == '-';
+            identifiers.insert(identifier);
+        }
+
+        expect(
+            allHaveUuidShape && identifiers.size() == 100,
+            "telemetry session ids are unique UUID v4 values"
+        );
+    }
+
+    void testRollingRttEstimator()
+    {
+        RttEstimator estimator(5);
+        estimator.addSample(20000);
+        estimator.addSample(21000);
+        estimator.addSample(19000);
+        estimator.addSample(20000);
+        RttStatistics withOutlier = estimator.addSample(10000000);
+
+        expect(
+            withOutlier.baselineUs == 19000 &&
+                withOutlier.rollingMedianUs == 20000 &&
+                withOutlier.rollingP95Us == 10000000,
+            "RTT window keeps suspension outliers visible without moving the baseline"
+        );
+
+        estimator.addSample(20000);
+        estimator.addSample(22000);
+        estimator.addSample(21000);
+        estimator.addSample(19000);
+        RttStatistics recovered = estimator.addSample(20000);
+        expect(
+            recovered.windowSamples == 5 &&
+                recovered.baselineUs == 19000 &&
+                recovered.rollingP95Us == 22000 &&
+                recovered.lifetimeMaxUs == 10000000,
+            "RTT rolling statistics recover after old outliers leave the window"
+        );
+    }
+
+    void testMetricsSessionReset()
+    {
+        SyncMetricsCollector metrics;
+        SyncMessage play;
+        play.type = MessageType::Play;
+        metrics.beginControlEpoch(7, play);
+        metrics.recordPingSent(42, 1, SyncMetricsCollector::Clock::now());
+
+        SyncMetricsSessionSnapshot beforeReset = metrics.getSessionSnapshot();
+        expect(
+            beforeReset.controlEpoch == 7 && beforeReset.trackedClients == 1,
+            "metrics tracks the active room session"
+        );
+
+        metrics.resetSession();
+        SyncMetricsSessionSnapshot afterReset = metrics.getSessionSnapshot();
+        expect(
+            afterReset.controlEpoch == 0 &&
+                afterReset.trackedClients == 0 &&
+                afterReset.trackedPairs == 0,
+            "metrics reset clears epoch and client state between room sessions"
+        );
+    }
+
+    void testClosedPeerSendDoesNotTerminateProcess()
+    {
+#ifndef _WIN32
+        int sockets[2] = { kInvalidSocket, kInvalidSocket };
+        const int createResult = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
+        expect(createResult == 0, "POSIX socketpair is available for send test");
+        if (createResult != 0)
+        {
+            return;
+        }
+
+        closeSocket(sockets[1]);
+        const char byte = 'x';
+        const int sendResult = sendSocket(sockets[0], &byte, 1);
+        expect(
+            sendResult == kSocketError,
+            "sending to a closed peer returns an error instead of SIGPIPE"
+        );
+        closeSocket(sockets[0]);
+#endif
+    }
+
+    void testSnapshotProtocolRejectsMalformedInput()
+    {
+        expect(
+            stringToMessage("SNAPSHOT -1 Playing 1000").type == MessageType::Unknown,
+            "SNAPSHOT rejects a negative epoch"
+        );
+        expect(
+            stringToMessage("SNAPSHOT 1 Buffering 1000").type == MessageType::Unknown,
+            "SNAPSHOT rejects an unknown playback state"
+        );
+        expect(
+            stringToMessage("SNAPSHOT 1 Paused -1").type == MessageType::Unknown,
+            "SNAPSHOT rejects a negative position"
+        );
+        expect(
+            stringToMessage("SNAPSHOT 1 Paused 1000 extra").type == MessageType::Unknown,
+            "SNAPSHOT rejects trailing fields"
+        );
+        expect(
+            stringToMessage("SNAPSHOT 1 Paused").type == MessageType::Unknown,
+            "SNAPSHOT rejects missing fields"
+        );
+
+        const long long tooLargePositionMs =
+            (static_cast<long long>((std::numeric_limits<int>::max)()) + 1) * 1000;
+        expect(
+            stringToMessage(
+                "SNAPSHOT 1 Paused " + std::to_string(tooLargePositionMs)
+                + " 0123456789abcdef"
+            ).type == MessageType::Unknown,
+            "SNAPSHOT rejects a position that cannot fit SyncState seconds"
+        );
+    }
+
+    void testMediaJoinProtocol()
+    {
+        const std::string windowsPath = "D:\\videos\\movie.mp4";
+        const std::string slashPath = "D:/videos/movie.mp4";
+        const std::string mediaIdentity = makeMediaIdentity(windowsPath);
+
+        expect(
+            mediaIdentity == makeMediaIdentity(slashPath),
+            "media identity normalizes path separators"
+        );
+        expect(
+            mediaIdentity != makeMediaIdentity("D:/videos/other.mp4"),
+            "different media sources produce different identities"
+        );
+
+        SyncMessage join;
+        join.type = MessageType::Join;
+        join.mediaIdentity = mediaIdentity;
+        std::string joinWire = messageToString(join);
+        expect(
+            joinWire == "JOIN " + mediaIdentity + "\n",
+            "JOIN serializes to one protocol line"
+        );
+
+        SyncMessage parsedJoin = stringToMessage(joinWire);
+        expect(parsedJoin.type == MessageType::Join, "JOIN type parses");
+        expect(
+            parsedJoin.mediaIdentity == mediaIdentity,
+            "JOIN media identity parses"
+        );
+        expect(
+            stringToMessage("JOIN not-a-valid-id").type == MessageType::Unknown,
+            "JOIN rejects malformed media identities"
+        );
+
+        SyncMessage rejection;
+        rejection.type = MessageType::JoinRejected;
+        rejection.rejectionReason = "MEDIA_MISMATCH";
+        SyncMessage parsedRejection = stringToMessage(
+            messageToString(rejection)
+        );
+        expect(
+            parsedRejection.type == MessageType::JoinRejected,
+            "REJECT type parses"
+        );
+        expect(
+            parsedRejection.rejectionReason == "MEDIA_MISMATCH",
+            "REJECT reason parses"
+        );
+    }
+
+    void testRoomMediaSessionLifecycle()
+    {
+        Room room;
+        const ConnectionId firstConnection = 101;
+        const ConnectionId secondConnection = 102;
+        const std::string firstMedia = makeMediaIdentity("movie-a.mp4");
+        const std::string secondMedia = makeMediaIdentity("movie-b.mp4");
+
+        RoomJoinResult firstJoin = room.joinClient(firstConnection, firstMedia);
+        expect(firstJoin.accepted, "first client establishes the room media");
+        expect(
+            firstJoin.sessionStarted && !firstJoin.sessionId.empty(),
+            "first client creates an observable room session"
+        );
+        expect(
+            room.getSnapshot().mediaIdentity == firstMedia &&
+                room.getSnapshot().sessionId == firstJoin.sessionId,
+            "Room snapshot carries media and session identities"
+        );
+
+        SyncMessage seek;
+        seek.type = MessageType::Seek;
+        seek.positionSeconds = 95;
+        seek.positionMilliseconds = 95000;
+        room.applyControlMessage(seek);
+        RoomSnapshot afterSeek = room.getSnapshot();
+        expect(
+            afterSeek.controlEpoch == 1 &&
+                afterSeek.state.positionMilliseconds == 95000,
+            "active media session applies playback controls"
+        );
+
+        RoomJoinResult mismatchedJoin = room.joinClient(
+            secondConnection,
+            secondMedia
+        );
+        expect(
+            !mismatchedJoin.accepted &&
+                mismatchedJoin.sessionId == firstJoin.sessionId,
+            "Room rejects a different media while viewers remain"
+        );
+        expect(
+            room.getClientCount() == 1,
+            "rejected media does not enter the broadcast list"
+        );
+
+        RoomJoinResult matchingJoin = room.joinClient(
+            secondConnection,
+            firstMedia
+        );
+        expect(
+            matchingJoin.accepted &&
+                !matchingJoin.sessionStarted &&
+                matchingJoin.sessionId == firstJoin.sessionId,
+            "Room accepts another client with the same media"
+        );
+
+        RoomRemovalResult firstRemoval = room.removeClient(secondConnection);
+        expect(
+            firstRemoval.clientRemoved &&
+                !firstRemoval.sessionEnded &&
+                firstRemoval.remainingClients == 1,
+            "removing one of two clients keeps the room session active"
+        );
+        RoomRemovalResult finalRemoval = room.removeClient(firstConnection);
+        expect(
+            finalRemoval.clientRemoved &&
+                finalRemoval.sessionEnded &&
+                finalRemoval.sessionId == firstJoin.sessionId &&
+                finalRemoval.remainingClients == 0,
+            "removing the final client reports the end of the room session"
+        );
+        RoomSnapshot emptyRoom = room.getSnapshot();
+        expect(
+            emptyRoom.mediaIdentity.empty(),
+            "last client leaving ends the media session"
+        );
+        expect(
+            emptyRoom.sessionId.empty(),
+            "ended room no longer exposes the previous session id"
+        );
+        expect(
+            emptyRoom.state.state == PlaybackState::Stopped &&
+                emptyRoom.state.positionMilliseconds == 0 &&
+                emptyRoom.controlEpoch == 0,
+            "ended media session resets authoritative playback state"
+        );
+
+        RoomJoinResult nextJoin = room.joinClient(firstConnection, secondMedia);
+        RoomSnapshot nextSnapshot = room.getSnapshot();
+        expect(
+            nextJoin.accepted &&
+                nextJoin.sessionStarted &&
+                nextJoin.sessionId != firstJoin.sessionId,
+            "next media establishes a distinct observable session"
+        );
+        expect(
+            nextSnapshot.mediaIdentity == secondMedia &&
+                nextSnapshot.state.state == PlaybackState::Stopped &&
+                nextSnapshot.state.positionMilliseconds == 0,
+            "new media starts from Stopped at position zero"
+        );
+        room.removeClient(firstConnection);
+    }
+
+    void testPlaybackControlClassification()
+    {
+        expect(isPlaybackControlMessage(MessageType::Play), "PLAY is a control");
+        expect(isPlaybackControlMessage(MessageType::Pause), "PAUSE is a control");
+        expect(isPlaybackControlMessage(MessageType::Seek), "SEEK is a control");
+        expect(
+            !isPlaybackControlMessage(MessageType::Snapshot),
+            "SNAPSHOT is not a client control"
+        );
+        expect(
+            !isPlaybackControlMessage(MessageType::Report),
+            "REPORT is not a client control"
+        );
+    }
+
+    void testProgressReportCarriesControlEpoch()
+    {
+        SyncMessage report;
+        report.type = MessageType::Report;
+        report.controlEpoch = 8;
+        report.positionMilliseconds = 65432;
+        report.positionSeconds = 65;
+        report.playbackState = PlaybackState::Playing;
+
+        std::string wireText = messageToString(report);
+        expect(
+            wireText == "REPORT 8 65432 Playing\n",
+            "REPORT serializes its authoritative control epoch"
+        );
+
+        SyncMessage parsed = stringToMessage(wireText);
+        expect(
+            parsed.type == MessageType::Report &&
+                parsed.controlEpoch == 8 &&
+                parsed.positionMilliseconds == 65432 &&
+                parsed.playbackState == PlaybackState::Playing,
+            "REPORT epoch, position and state round-trip"
+        );
+        expect(
+            stringToMessage("REPORT 65432 Playing").type ==
+                MessageType::Unknown,
+            "legacy REPORT without an epoch is rejected"
+        );
+        expect(
+            stringToMessage("REPORT -1 65432 Playing").type ==
+                MessageType::Unknown,
+            "REPORT rejects a negative control epoch"
+        );
+    }
+
+    void testAuthoritativeControlAndCorrectionProtocol()
+    {
+        SyncMessage authoritativeSeek;
+        authoritativeSeek.type = MessageType::Seek;
+        authoritativeSeek.controlEpoch = 9;
+        authoritativeSeek.positionMilliseconds = 123456;
+        authoritativeSeek.positionSeconds = 123;
+
+        std::string controlWire = messageToString(authoritativeSeek);
+        expect(
+            controlWire == "CONTROL 9 SEEK 123456\n",
+            "authoritative SEEK carries epoch and millisecond position"
+        );
+        SyncMessage parsedControl = stringToMessage(controlWire);
+        expect(
+            parsedControl.type == MessageType::Seek &&
+                parsedControl.controlEpoch == 9 &&
+                parsedControl.positionMilliseconds == 123456,
+            "authoritative CONTROL round-trips"
+        );
+
+        SyncMessage correction;
+        correction.type = MessageType::Correction;
+        correction.commandId = 42;
+        correction.controlEpoch = 9;
+        correction.playbackState = PlaybackState::Playing;
+        correction.correctionForwardMilliseconds = 875;
+        SyncMessage parsedCorrection = stringToMessage(
+            messageToString(correction)
+        );
+        expect(
+            parsedCorrection.type == MessageType::Correction &&
+                parsedCorrection.commandId == 42 &&
+                parsedCorrection.controlEpoch == 9 &&
+                parsedCorrection.playbackState == PlaybackState::Playing &&
+                parsedCorrection.correctionForwardMilliseconds == 875,
+            "CORRECT round-trips with command, epoch, state and offset"
+        );
+
+        SyncMessage result;
+        result.type = MessageType::CorrectionResult;
+        result.commandId = 42;
+        result.controlEpoch = 9;
+        result.correctionResultStatus = CorrectionResultStatus::Applied;
+        result.positionMilliseconds = 124331;
+        result.correctionReason = "OK";
+        SyncMessage parsedResult = stringToMessage(messageToString(result));
+        expect(
+            parsedResult.type == MessageType::CorrectionResult &&
+                parsedResult.commandId == 42 &&
+                parsedResult.correctionResultStatus ==
+                    CorrectionResultStatus::Applied &&
+                parsedResult.positionMilliseconds == 124331 &&
+                parsedResult.correctionReason == "OK",
+            "CORRECT_RESULT round-trips an applied acknowledgement"
+        );
+
+        expect(
+            stringToMessage("CONTROL 0 PLAY").type == MessageType::Unknown,
+            "CONTROL rejects a non-positive epoch"
+        );
+        expect(
+            stringToMessage("CORRECT 1 2 Stopped 800").type ==
+                MessageType::Unknown,
+            "CORRECT rejects inactive playback"
+        );
+        expect(
+            stringToMessage("CORRECT_RESULT 1 2 APPLIED 1000 FAILED").type ==
+                MessageType::Unknown,
+            "applied CORRECT_RESULT requires the OK reason"
+        );
+    }
+
+    void testExperienceObservationProtocol()
+    {
+        SyncMessage firstFrame;
+        firstFrame.type = MessageType::FirstFrame;
+        firstFrame.controlEpoch = 3;
+        firstFrame.firstFrameTrigger = FirstFrameTrigger::Startup;
+        firstFrame.firstFrameMilliseconds = 1875;
+
+        const std::string firstFrameWire = messageToString(firstFrame);
+        expect(
+            firstFrameWire == "FIRST_FRAME 3 STARTUP 1875\n",
+            "FIRST_FRAME serializes startup latency"
+        );
+        const SyncMessage parsedFirstFrame = stringToMessage(firstFrameWire);
+        expect(
+            parsedFirstFrame.type == MessageType::FirstFrame &&
+                parsedFirstFrame.controlEpoch == 3 &&
+                parsedFirstFrame.firstFrameTrigger ==
+                    FirstFrameTrigger::Startup &&
+                parsedFirstFrame.firstFrameMilliseconds == 1875,
+            "FIRST_FRAME round-trips epoch, trigger and duration"
+        );
+
+        SyncMessage controlResult;
+        controlResult.type = MessageType::ControlResult;
+        controlResult.controlEpoch = 4;
+        controlResult.relatedControlType = MessageType::Seek;
+        controlResult.controlResultStatus = ControlResultStatus::Applied;
+        controlResult.positionMilliseconds = 120250;
+        controlResult.controlApplyMilliseconds = 12;
+        controlResult.controlResultReason = "OK";
+
+        const std::string controlResultWire = messageToString(controlResult);
+        expect(
+            controlResultWire ==
+                "CONTROL_RESULT 4 SEEK APPLIED 120250 12 OK\n",
+            "CONTROL_RESULT serializes the authoritative control outcome"
+        );
+        const SyncMessage parsedResult = stringToMessage(controlResultWire);
+        expect(
+            parsedResult.type == MessageType::ControlResult &&
+                parsedResult.controlEpoch == 4 &&
+                parsedResult.relatedControlType == MessageType::Seek &&
+                parsedResult.controlResultStatus ==
+                    ControlResultStatus::Applied &&
+                parsedResult.positionMilliseconds == 120250 &&
+                parsedResult.controlApplyMilliseconds == 12 &&
+                parsedResult.controlResultReason == "OK",
+            "CONTROL_RESULT round-trips status, position and apply latency"
+        );
+
+        expect(
+            stringToMessage("FIRST_FRAME 3 UNKNOWN 10").type ==
+                MessageType::Unknown,
+            "FIRST_FRAME rejects unknown triggers"
+        );
+        expect(
+            stringToMessage("CONTROL_RESULT 0 PLAY APPLIED 0 1 OK").type ==
+                MessageType::Unknown,
+            "CONTROL_RESULT rejects a non-positive control epoch"
+        );
+        expect(
+            stringToMessage("CONTROL_RESULT 4 PLAY APPLIED 0 1 FAILED").type ==
+                MessageType::Unknown,
+            "CONTROL_RESULT requires OK for an applied result"
+        );
+        expect(
+            stringToMessage("CONTROL_RESULT 4 PLAY REJECTED 0 1 OK").type ==
+                MessageType::Unknown,
+            "CONTROL_RESULT requires a stable reason for rejection"
+        );
+    }
+
+    void testExperienceMetricsSessionSummary()
+    {
+        using Collector = ExperienceMetricsCollector;
+        const Collector::Clock::time_point startedAt{};
+        Collector collector;
+        collector.beginSession("session-test");
+        collector.recordClientJoined(1, true);
+        collector.recordClientJoined(2, true);
+        collector.recordClientJoined(3, false);
+
+        SyncMessage firstFrame;
+        firstFrame.type = MessageType::FirstFrame;
+        firstFrame.controlEpoch = 0;
+        firstFrame.firstFrameTrigger = FirstFrameTrigger::Startup;
+        firstFrame.firstFrameMilliseconds = 1200;
+        expect(
+            collector.recordFirstFrame(1, firstFrame).status ==
+                FirstFrameRecordStatus::Recorded,
+            "first frame is recorded once per joined client"
+        );
+        expect(
+            collector.recordFirstFrame(1, firstFrame).status ==
+                FirstFrameRecordStatus::Duplicate,
+            "duplicate first-frame observations are ignored"
+        );
+        firstFrame.firstFrameMilliseconds = 2100;
+        expect(
+            collector.recordFirstFrame(2, firstFrame).status ==
+                FirstFrameRecordStatus::Recorded,
+            "second client contributes its first-frame sample"
+        );
+
+        expect(
+            collector.recordControlDispatched(
+                1,
+                MessageType::Play,
+                { 1, 2 },
+                startedAt
+            ),
+            "control dispatch starts ACK correlation"
+        );
+        SyncMessage result;
+        result.type = MessageType::ControlResult;
+        result.controlEpoch = 1;
+        result.relatedControlType = MessageType::Play;
+        result.controlResultStatus = ControlResultStatus::Applied;
+        result.positionMilliseconds = 1000;
+        result.controlApplyMilliseconds = 18;
+        result.controlResultReason = "OK";
+        expect(
+            collector.recordControlResult(
+                1,
+                result,
+                startedAt + std::chrono::milliseconds(120)
+            ).matchStatus == ControlAckMatchStatus::Matched,
+            "matching control result records end-to-end ACK latency"
+        );
+        expect(
+            collector.recordControlResult(
+                1,
+                result,
+                startedAt + std::chrono::milliseconds(125)
+            ).matchStatus == ControlAckMatchStatus::Duplicate,
+            "duplicate control results do not inflate success counts"
+        );
+        result.controlResultStatus = ControlResultStatus::Rejected;
+        result.controlApplyMilliseconds = 25;
+        result.controlResultReason = "PLAYER_COMMAND_FAILED";
+        expect(
+            collector.recordControlResult(
+                2,
+                result,
+                startedAt + std::chrono::milliseconds(300)
+            ).matchStatus == ControlAckMatchStatus::Matched,
+            "rejected control results are correlated and counted"
+        );
+
+        collector.recordCorrectionDispatched(9, 1, 2, 1, startedAt);
+        collector.recordCorrectionResult(9, true, true);
+
+        ExperiencePairSample pairSample;
+        pairSample.clientAId = 1;
+        pairSample.clientBId = 2;
+        pairSample.controlEpoch = 1;
+        pairSample.playbackState = PlaybackState::Playing;
+        pairSample.valid = true;
+        pairSample.absoluteDifferenceMilliseconds = 400;
+        expect(
+            collector.recordPairSample(
+                pairSample,
+                startedAt + std::chrono::milliseconds(200)
+            ).empty(),
+            "large skew does not prematurely mark correction converged"
+        );
+        pairSample.absoluteDifferenceMilliseconds = 120;
+        expect(
+            collector.recordPairSample(
+                pairSample,
+                startedAt + std::chrono::milliseconds(500)
+            ).empty(),
+            "correction waits for consecutive good samples"
+        );
+        pairSample.absoluteDifferenceMilliseconds = 80;
+        const std::vector<CorrectionConvergenceRecord> converged =
+            collector.recordPairSample(
+                pairSample,
+                startedAt + std::chrono::milliseconds(800)
+            );
+        expect(
+            converged.size() == 1 &&
+                converged.front().commandId == 9 &&
+                converged.front().convergenceMilliseconds == 800,
+            "correction converges after two consecutive samples within 250 ms"
+        );
+
+        expect(
+            collector.recordControlDispatched(
+                2,
+                MessageType::Pause,
+                { 1 },
+                startedAt + std::chrono::seconds(1)
+            ),
+            "unanswered control is retained as a missing ACK"
+        );
+
+        const ExperienceSessionSummary summary = collector.endSession(
+            startedAt + std::chrono::seconds(2)
+        );
+        expect(
+            summary.sessionId == "session-test" &&
+                summary.joinedClients == 3 &&
+                summary.firstFrameExpected == 2 &&
+                summary.firstFrameReports == 2 &&
+                summary.firstFrameMissing == 0 &&
+                summary.firstFrameP95BucketMilliseconds == 3000,
+            "session summary reports join and first-frame coverage"
+        );
+        expect(
+            summary.controlExpectedAcks == 3 &&
+                summary.controlMatchedAcks == 2 &&
+                summary.controlAppliedAcks == 1 &&
+                summary.controlRejectedAcks == 1 &&
+                summary.controlMissingAcks == 1 &&
+                summary.controlAckP95BucketMilliseconds == 500,
+            "session summary reports applied, rejected and missing control ACKs"
+        );
+        expect(
+            summary.validPairSamples == 3 &&
+                summary.goodPairSamples == 2 &&
+                summary.syncGoodRatio > 0.66 &&
+                summary.syncGoodRatio < 0.67 &&
+                summary.pairSkewP95BucketMilliseconds == 500 &&
+                summary.maximumPairSkewMilliseconds == 400,
+            "session summary reports sync quality without storing every sample"
+        );
+        expect(
+            summary.correctionsDispatched == 1 &&
+                summary.correctionsApplied == 1 &&
+                summary.correctionsConverged == 1 &&
+                summary.correctionsNotConverged == 0 &&
+                summary.correctionConvergenceP95BucketMilliseconds == 1000,
+            "session summary measures correction outcome and convergence time"
+        );
+    }
+
+    void testPrometheusMetricsEndpoint()
+    {
+        PrometheusMetrics metrics;
+        metrics.setServerUp(true);
+        metrics.recordSessionStarted();
+        metrics.setConnectedClients(2);
+        metrics.recordJoinResult(JoinMetricReason::Ok, 42);
+
+        FirstFrameRecord firstFrame;
+        firstFrame.status = FirstFrameRecordStatus::Recorded;
+        firstFrame.durationMilliseconds = 1800;
+        metrics.recordFirstFrame(firstFrame);
+
+        metrics.recordControlDispatched(MessageType::Play, 2);
+        ControlAckRecord controlResult;
+        controlResult.matchStatus = ControlAckMatchStatus::Matched;
+        controlResult.resultStatus = ControlResultStatus::Applied;
+        controlResult.acknowledgementLatencyMilliseconds = 120;
+        controlResult.clientApplyMilliseconds = 8;
+        metrics.recordControlResult(controlResult);
+
+        ExperiencePairSample pair;
+        pair.clientAId = 1;
+        pair.clientBId = 2;
+        pair.valid = true;
+        pair.absoluteDifferenceMilliseconds = 100;
+        metrics.recordPairSample(pair);
+        pair.absoluteDifferenceMilliseconds = 400;
+        metrics.recordPairSample(pair);
+
+        metrics.recordCorrectionDispatched(true);
+        metrics.recordCorrectionResult(true, true);
+        CorrectionConvergenceRecord convergence;
+        convergence.convergenceMilliseconds = 700;
+        metrics.recordCorrectionConverged(convergence);
+
+        ExperienceSessionSummary summary;
+        summary.firstFrameMissing = 1;
+        summary.controlMissingAcks = 1;
+        metrics.recordSessionSummary(summary);
+
+        const std::string rendered = metrics.render();
+        expect(
+            rendered.find("synccinema_server_up 1\n") != std::string::npos &&
+                rendered.find(
+                    "synccinema_join_results_total{outcome=\"accepted\",reason=\"OK\"} 1\n"
+                ) != std::string::npos,
+            "Prometheus snapshot exposes server and bounded JOIN metrics"
+        );
+        expect(
+            rendered.find(
+                "synccinema_time_to_first_frame_ms_bucket{le=\"1000\"} 0\n"
+            ) != std::string::npos &&
+                rendered.find(
+                    "synccinema_time_to_first_frame_ms_bucket{le=\"2000\"} 1\n"
+                ) != std::string::npos,
+            "Prometheus histogram buckets are cumulative"
+        );
+        expect(
+            rendered.find(
+                "synccinema_sync_pair_samples_total{quality=\"good\"} 1\n"
+            ) != std::string::npos &&
+                rendered.find(
+                    "synccinema_sync_pair_samples_total{quality=\"bad\"} 1\n"
+                ) != std::string::npos,
+            "Prometheus snapshot separates good and bad sync samples"
+        );
+        expect(
+            rendered.find("session_id") == std::string::npos &&
+                rendered.find("media_id") == std::string::npos,
+            "Prometheus output excludes high-cardinality identifiers"
+        );
+
+        expect(initializeSockets(), "metrics endpoint initializes sockets");
+        MetricsHttpServer endpoint(metrics);
+        std::string startError;
+        const bool started = endpoint.start(0, startError);
+        expect(started, "metrics endpoint starts on an ephemeral loopback port");
+        if (started)
+        {
+            SocketHandle client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(endpoint.port());
+            const bool connected = client != kInvalidSocket &&
+                connect(
+                    client,
+                    reinterpret_cast<sockaddr*>(&address),
+                    sizeof(address)
+                ) != kSocketError;
+            expect(connected, "metrics endpoint accepts a loopback connection");
+            if (connected)
+            {
+                const std::string request =
+                    "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+                const int sent = sendSocket(
+                    client,
+                    request.data(),
+                    static_cast<int>(request.size())
+                );
+                std::string response;
+                std::array<char, 2048> buffer{};
+                int received = 0;
+                while ((received = recv(
+                            client,
+                            buffer.data(),
+                            static_cast<int>(buffer.size()),
+                            0)) > 0)
+                {
+                    response.append(
+                        buffer.data(),
+                        static_cast<std::size_t>(received)
+                    );
+                }
+                expect(
+                    sent == static_cast<int>(request.size()) &&
+                        response.starts_with("HTTP/1.1 200 OK\r\n") &&
+                        response.find("synccinema_server_up 1\n") !=
+                            std::string::npos,
+                    "GET /metrics returns Prometheus text over real TCP"
+                );
+            }
+            if (client != kInvalidSocket)
+            {
+                closeSocket(client);
+            }
+        }
+        endpoint.stop();
+        cleanupSockets();
+    }
+
+    void testPlayerEventAbstraction()
+    {
+        ConsoleMockPlayer player;
+        std::vector<PlayerEventType> receivedEvents;
+        player.setEventCallback(
+            [&receivedEvents](const PlayerEvent& event)
+            {
+                receivedEvents.push_back(event.type);
+            }
+        );
+
+        expect(player.openMedia("movie.mp4"), "MockPlayer opens test media");
+        expect(player.play(), "MockPlayer starts playback");
+        expect(player.pause(), "MockPlayer pauses playback");
+        expect(
+            receivedEvents == std::vector<PlayerEventType>{
+                PlayerEventType::Opening,
+                PlayerEventType::Playing,
+                PlayerEventType::Paused
+            },
+            "player events stay independent from the libVLC implementation"
+        );
+    }
+
+    void testRoomSnapshotAndEpoch()
+    {
+        Room room;
+
+        RoomSnapshot initial = room.getSnapshot();
+        expect(initial.controlEpoch == 0, "new Room starts at epoch 0");
+        expect(
+            initial.state.state == PlaybackState::Stopped,
+            "new Room starts stopped"
+        );
+        expect(
+            initial.state.positionMilliseconds == 0,
+            "new Room starts at position 0"
+        );
+
+        SyncMessage seek;
+        seek.type = MessageType::Seek;
+        seek.positionSeconds = 12;
+        seek.positionMilliseconds = 12000;
+        expect(
+            room.applyControlMessage(seek).has_value(),
+            "Room accepts SEEK without connected clients"
+        );
+
+        RoomSnapshot afterSeek = room.getSnapshot();
+        expect(afterSeek.controlEpoch == 1, "SEEK increments Room epoch");
+        expect(
+            afterSeek.state.positionMilliseconds == 12000,
+            "SEEK updates Room position"
+        );
+
+        SyncMessage play;
+        play.type = MessageType::Play;
+        expect(
+            room.applyControlMessage(play).has_value(),
+            "Room accepts PLAY without connected clients"
+        );
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        RoomSnapshot whilePlaying = room.getSnapshot();
+        expect(whilePlaying.controlEpoch == 2, "PLAY increments Room epoch");
+        expect(
+            whilePlaying.state.state == PlaybackState::Playing,
+            "PLAY updates Room state"
+        );
+        expect(
+            whilePlaying.state.positionMilliseconds >= 12000,
+            "playing Room snapshot advances with steady_clock"
+        );
+
+        SyncMessage pause;
+        pause.type = MessageType::Pause;
+        expect(
+            room.applyControlMessage(pause).has_value(),
+            "Room accepts PAUSE without connected clients"
+        );
+
+        RoomSnapshot afterPause = room.getSnapshot();
+        expect(afterPause.controlEpoch == 3, "PAUSE increments Room epoch");
+        expect(
+            afterPause.state.state == PlaybackState::Paused,
+            "PAUSE updates Room state"
+        );
+
+        SyncMessage forgedSnapshot;
+        forgedSnapshot.type = MessageType::Snapshot;
+        forgedSnapshot.controlEpoch = 999;
+        forgedSnapshot.playbackState = PlaybackState::Playing;
+        forgedSnapshot.positionMilliseconds = 999000;
+
+        expect(
+            !room.applyControlMessage(forgedSnapshot),
+            "Room refuses a forged SNAPSHOT as a control"
+        );
+        expect(
+            room.getSnapshot().controlEpoch == 3,
+            "refused messages do not advance Room epoch"
+        );
+    }
+
+    SyncCorrectionInput makePersistentSkewInput()
+    {
+        SyncCorrectionInput input;
+        input.clientAId = 1;
+        input.clientBId = 2;
+        input.controlEpoch = 4;
+        input.playbackState = PlaybackState::Playing;
+        input.windowReady = true;
+        input.windowSamples = 12;
+        input.medianDiffMs = 900;
+        input.medianAbsDiffMs = 900;
+        input.p95AbsDiffMs = 1050;
+        input.consecutiveSevereSamples = 4;
+        input.directionAgreementPercent = 83;
+        input.hasRttA = true;
+        input.hasRttB = true;
+        return input;
+    }
+
+    void testCorrectionPolicySafetyGates()
+    {
+        SyncCorrectionInput input = makePersistentSkewInput();
+        input.settling = true;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::Settling,
+            "correction advice waits for the control settling period"
+        );
+
+        input = makePersistentSkewInput();
+        input.windowReady = false;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::WindowNotReady,
+            "correction advice requires a ready robust window"
+        );
+
+        input = makePersistentSkewInput();
+        input.playbackState = PlaybackState::Stopped;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::PlaybackInactive,
+            "correction advice does not seek stopped playback"
+        );
+
+        input = makePersistentSkewInput();
+        input.hasRttB = false;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::MissingNetworkEstimate,
+            "playing correction advice requires RTT for both clients"
+        );
+
+        input = makePersistentSkewInput();
+        input.medianDiffMs = 180;
+        input.medianAbsDiffMs = 180;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::WithinTolerance,
+            "small skew remains inside the no-correction tolerance"
+        );
+
+        input = makePersistentSkewInput();
+        input.medianDiffMs = 500;
+        input.medianAbsDiffMs = 500;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::BelowSeekThreshold,
+            "moderate skew is observed without suggesting a hard seek"
+        );
+
+        input = makePersistentSkewInput();
+        input.medianDiffMs = 750;
+        input.medianAbsDiffMs = 750;
+        expect(
+            evaluateSyncCorrection(input).action ==
+                SyncCorrectionAction::SeekForward,
+            "the hard-seek entry threshold uses an inclusive boundary"
+        );
+
+        input = makePersistentSkewInput();
+        input.directionAgreementPercent = 66;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::UnstableDirection,
+            "correction advice rejects a direction that keeps changing"
+        );
+
+        input = makePersistentSkewInput();
+        input.consecutiveSevereSamples = 2;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::InsufficientPersistence,
+            "correction advice requires consecutive severe samples"
+        );
+
+        input = makePersistentSkewInput();
+        input.cooldownActive = true;
+        input.cooldownRemainingMs = 2400;
+        expect(
+            evaluateSyncCorrection(input).reason ==
+                SyncCorrectionReason::Cooldown,
+            "correction advice respects the simulated cooldown"
+        );
+
+        input = makePersistentSkewInput();
+        input.playbackState = PlaybackState::Paused;
+        input.hasRttA = false;
+        input.hasRttB = false;
+        expect(
+            evaluateSyncCorrection(input).action ==
+                SyncCorrectionAction::SeekForward,
+            "paused positions can be compared without an RTT projection"
+        );
+    }
+
+    void testCorrectionPolicySelectsLaggingClient()
+    {
+        SyncCorrectionInput input = makePersistentSkewInput();
+        SyncCorrectionDecision decision = evaluateSyncCorrection(input);
+        expect(
+            decision.action == SyncCorrectionAction::SeekForward,
+            "persistent stable skew produces a forward seek decision"
+        );
+        expect(
+            decision.reason == SyncCorrectionReason::PersistentSkew,
+            "persistent skew explains the seek suggestion"
+        );
+        expect(
+            decision.targetClientId == 2 && decision.referenceClientId == 1,
+            "positive pair diff selects client B as the lagging target"
+        );
+        expect(
+            decision.suggestedForwardMs == 900,
+            "positive pair diff preserves the suggested forward offset"
+        );
+
+        input.medianDiffMs = -1250;
+        input.medianAbsDiffMs = 1250;
+        decision = evaluateSyncCorrection(input);
+        expect(
+            decision.targetClientId == 1 && decision.referenceClientId == 2,
+            "negative pair diff selects client A as the lagging target"
+        );
+        expect(
+            decision.suggestedForwardMs == 1250,
+            "negative pair diff becomes a positive forward offset"
+        );
+    }
+
+    SyncCorrectionProposal makeCorrectionProposal()
+    {
+        SyncCorrectionProposal proposal;
+        proposal.targetClientId = 2;
+        proposal.referenceClientId = 1;
+        proposal.controlEpoch = 7;
+        proposal.playbackState = PlaybackState::Playing;
+        proposal.forwardMilliseconds = 900;
+        proposal.medianAbsDiffMs = 900;
+        proposal.p95AbsDiffMs = 1050;
+        return proposal;
+    }
+
+    SyncMessage makeAppliedCorrectionResult(const SyncMessage& command)
+    {
+        SyncMessage result;
+        result.type = MessageType::CorrectionResult;
+        result.commandId = command.commandId;
+        result.controlEpoch = command.controlEpoch;
+        result.correctionResultStatus = CorrectionResultStatus::Applied;
+        result.positionMilliseconds = 120900;
+        result.correctionReason = "OK";
+        return result;
+    }
+
+    void testCorrectionCoordinatorLifecycle()
+    {
+        SyncCorrectionCoordinator coordinator;
+        SyncCorrectionCoordinator::Clock::time_point startedAt{};
+        std::optional<SyncMessage> command = coordinator.createCommand(
+            makeCorrectionProposal(),
+            startedAt
+        );
+        expect(command.has_value(), "coordinator creates a valid command");
+        expect(
+            command->commandId == 1 && command->type == MessageType::Correction,
+            "coordinator assigns a monotonic command id"
+        );
+        expect(
+            coordinator.pendingCommandCount() == 1,
+            "created correction remains pending until acknowledgement"
+        );
+        expect(
+            !coordinator.createCommand(
+                makeCorrectionProposal(),
+                startedAt + std::chrono::milliseconds(1)
+            ).has_value(),
+            "one client cannot have two pending correction commands"
+        );
+
+        SyncMessage result = makeAppliedCorrectionResult(*command);
+        CorrectionResultRecord wrongClient = coordinator.recordResult(
+            3,
+            result,
+            startedAt + std::chrono::milliseconds(10)
+        );
+        expect(
+            wrongClient.matchStatus == CorrectionResultMatchStatus::WrongClient &&
+                coordinator.pendingCommandCount() == 1,
+            "wrong client cannot consume another client's command"
+        );
+
+        result.controlEpoch = 8;
+        CorrectionResultRecord wrongEpoch = coordinator.recordResult(
+            2,
+            result,
+            startedAt + std::chrono::milliseconds(20)
+        );
+        expect(
+            wrongEpoch.matchStatus == CorrectionResultMatchStatus::EpochMismatch &&
+                coordinator.pendingCommandCount() == 1,
+            "wrong epoch cannot consume the pending command"
+        );
+
+        result.controlEpoch = command->controlEpoch;
+        CorrectionResultRecord matched = coordinator.recordResult(
+            2,
+            result,
+            startedAt + std::chrono::milliseconds(37)
+        );
+        expect(
+            matched.matchStatus == CorrectionResultMatchStatus::Matched &&
+                matched.acknowledgementLatencyMs == 37 &&
+                coordinator.pendingCommandCount() == 0,
+            "matching result completes the command and records latency"
+        );
+        expect(
+            coordinator.recordResult(2, result).matchStatus ==
+                CorrectionResultMatchStatus::UnknownCommand,
+            "duplicate acknowledgement is reported as unknown"
+        );
+
+        std::optional<SyncMessage> failedDispatch = coordinator.createCommand(
+            makeCorrectionProposal()
+        );
+        expect(
+            failedDispatch.has_value() &&
+                coordinator.markDispatchFailed(failedDispatch->commandId) &&
+                coordinator.pendingCommandCount() == 0,
+            "failed socket dispatch removes the pending command"
+        );
+
+        std::optional<SyncMessage> removedClientCommand =
+            coordinator.createCommand(makeCorrectionProposal());
+        coordinator.removeClient(1);
+        expect(
+            removedClientCommand.has_value() &&
+                coordinator.pendingCommandCount() == 0,
+            "disconnecting either endpoint clears related commands"
+        );
+    }
+
+    void testCorrectionCoordinatorWaitsForSocketWrite()
+    {
+        SyncCorrectionCoordinator coordinator;
+        const SyncCorrectionCoordinator::Clock::time_point queuedAt{};
+        const auto proposal = makeCorrectionProposal();
+        const auto command = coordinator.createCommand(proposal, queuedAt, true);
+        expect(command.has_value(), "a queued correction reserves a command ID");
+        if (!command)
+        {
+            return;
+        }
+
+        const auto sentAt = queuedAt + std::chrono::seconds(12);
+        const SyncMessage result = makeAppliedCorrectionResult(*command);
+        expect(
+            coordinator.recordResult(proposal.targetClientId, result, sentAt).matchStatus ==
+                CorrectionResultMatchStatus::UnknownCommand &&
+                coordinator.isPending(command->commandId),
+            "a queued correction cannot match an ACK and has no write-based timeout"
+        );
+        expect(coordinator.markDispatched(command->commandId, sentAt),
+            "writing the frame starts its acknowledgement timer");
+        const auto matched = coordinator.recordResult(
+            proposal.targetClientId, result, sentAt + std::chrono::milliseconds(20)
+        );
+        expect(
+            matched.matchStatus == CorrectionResultMatchStatus::Matched &&
+                matched.acknowledgementLatencyMs == 20,
+            "correction ACK latency starts when the frame was written"
+        );
+    }
+
+    void testCorrectionCoordinatorInvalidatesOldEpochs()
+    {
+        SyncCorrectionCoordinator coordinator;
+        SyncCorrectionProposal epochSeven = makeCorrectionProposal();
+        SyncCorrectionProposal epochEight = epochSeven;
+        epochEight.controlEpoch = 8;
+        epochEight.targetClientId = 3;
+
+        expect(
+            coordinator.createCommand(epochSeven).has_value() &&
+                coordinator.createCommand(epochEight).has_value(),
+            "coordinator accepts commands from test epochs"
+        );
+        coordinator.retainControlEpoch(8);
+        expect(
+            coordinator.pendingCommandCount() == 1,
+            "new authoritative control invalidates older correction commands"
+        );
+
+        SyncCorrectionCoordinator timeoutCoordinator;
+        SyncCorrectionCoordinator::Clock::time_point startedAt{};
+        expect(
+            timeoutCoordinator.createCommand(epochSeven, startedAt).has_value(),
+            "timeout test creates an initial command"
+        );
+        expect(
+            timeoutCoordinator.createCommand(
+                epochSeven,
+                startedAt + std::chrono::seconds(11)
+            ).has_value(),
+            "expired unacknowledged command no longer blocks retry"
+        );
+    }
+
+    void testCorrectionExecutorSafetyAndApplication()
+    {
+        ConsoleMockPlayer player;
+        expect(player.openMedia("movie.mp4"), "executor test opens media");
+
+        SyncState localState;
+        localState.state = PlaybackState::Playing;
+
+        SyncMessage command;
+        command.type = MessageType::Correction;
+        command.commandId = 1;
+        command.controlEpoch = 4;
+        command.playbackState = PlaybackState::Playing;
+        command.correctionForwardMilliseconds = 900;
+
+        SyncCorrectionExecution applied = executeSyncCorrection(
+            command,
+            4,
+            localState,
+            player
+        );
+        expect(
+            applied.applied &&
+                applied.resultMessage.correctionResultStatus ==
+                    CorrectionResultStatus::Applied &&
+                applied.resultMessage.positionMilliseconds == 900,
+            "matching correction seeks the lagging player forward"
+        );
+
+        command.commandId = 2;
+        command.controlEpoch = 3;
+        SyncCorrectionExecution stale = executeSyncCorrection(
+            command,
+            4,
+            localState,
+            player
+        );
+        expect(
+            !stale.applied &&
+                stale.resultMessage.correctionReason == "EPOCH_MISMATCH" &&
+                player.getPositionMilliseconds() == 900,
+            "stale correction cannot move the player"
+        );
+
+        ConsoleMockPlayer unopenedPlayer;
+        command.commandId = 3;
+        command.controlEpoch = 4;
+        SyncCorrectionExecution notSeekable = executeSyncCorrection(
+            command,
+            4,
+            localState,
+            unopenedPlayer
+        );
+        expect(
+            !notSeekable.applied &&
+                notSeekable.resultMessage.correctionReason == "NOT_SEEKABLE",
+            "correction reports a stable reason when media is not seekable"
+        );
+    }
+}
+
+int main()
+{
+    testSnapshotProtocolRoundTrip();
+    testStructuredTelemetrySerialization();
+    testTelemetryLoggerKeepsConcurrentEventsOnSeparateLines();
+    testTelemetryLoggerWritesJsonlFile();
+    testTelemetrySessionIdsAreUuidV4();
+    testPlaybackPositionConvergence();
+    testRollingRttEstimator();
+    testMetricsSessionReset();
+    testClosedPeerSendDoesNotTerminateProcess();
+    testSnapshotProtocolRejectsMalformedInput();
+    testMediaJoinProtocol();
+    testPlaybackControlClassification();
+    testProgressReportCarriesControlEpoch();
+    testAuthoritativeControlAndCorrectionProtocol();
+    testExperienceObservationProtocol();
+    testExperienceMetricsSessionSummary();
+    testPrometheusMetricsEndpoint();
+    testPlayerEventAbstraction();
+    testRoomSnapshotAndEpoch();
+    testRoomMediaSessionLifecycle();
+    testCorrectionPolicySafetyGates();
+    testCorrectionPolicySelectsLaggingClient();
+    testCorrectionCoordinatorLifecycle();
+    testCorrectionCoordinatorWaitsForSocketWrite();
+    testCorrectionCoordinatorInvalidatesOldEpochs();
+    testCorrectionExecutorSafetyAndApplication();
+
+    if (failureCount != 0)
+    {
+        std::cout << failureCount << " test(s) failed\n";
+        return 1;
+    }
+
+    std::cout << "All SyncCinema core tests passed\n";
+    return 0;
+}

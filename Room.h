@@ -1,0 +1,95 @@
+#pragma once
+
+#include <chrono>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "Protocol.h"
+#include "ServerTransport.h"
+
+struct ClientConnection
+{
+    int id = 0;
+    ConnectionId connectionId = 0;
+};
+
+// 房间快照把“当前播放状态”和“它属于哪个控制周期”放在一起返回。
+// 如果分别读取 state 和 epoch，两个 client 线程可能在两次读取之间插入一条控制命令，
+// 从而得到互相不匹配的数据。一个结构体快照可以避免这种撕裂读取。
+struct RoomSnapshot
+{
+    SyncState state;
+    long long controlEpoch = 0;
+    std::string mediaIdentity;
+    std::string sessionId;
+};
+
+struct RoomJoinResult
+{
+    bool accepted = false;
+    bool sessionStarted = false;
+    int clientId = 0;
+    std::string activeMediaIdentity;
+    std::string sessionId;
+};
+
+struct RoomRemovalResult
+{
+    bool clientRemoved = false;
+    bool sessionEnded = false;
+    std::string sessionId;
+    std::size_t remainingClients = 0;
+    long long sessionDurationMilliseconds = 0;
+};
+
+// Room 表示一个同步观影房间。
+//
+// 新架构里 server 不再打开视频文件，所以 server 不能直接向播放器询问“现在播到第几秒”。
+// Room 使用一个轻量的估算模型维护房间进度：
+//   1. state_.positionSeconds 保存“上一次状态基准点”的播放位置。
+//   2. lastStateUpdateTime_ 保存这个基准点对应的服务器时间。
+//   3. 如果房间处于 Playing，getState() 会用“当前时间 - 基准时间”推算实时进度。
+//
+// 这个模型足够支撑后续 Qt 进度条：UI 可以定时调用 getState()，拿到随时间推进的房间状态。
+class Room
+{
+public:
+    RoomJoinResult joinClient(
+        ConnectionId connectionId,
+        const std::string& mediaIdentity
+    );
+    // 返回移除结果和对应 session_id。调用方可以准确区分“未知连接”与
+    // “最后一位观众离开”，避免重复产生 session_ended 事件。
+    RoomRemovalResult removeClient(ConnectionId connectionId);
+
+    // server 为控制命令分配 epoch 后回显给所有 client（包括发起者）。
+    // 所有人都按同一条权威消息执行，才能维护完全一致的控制顺序。
+    std::optional<SyncMessage> applyControlMessage(const SyncMessage& message);
+    std::optional<ConnectionId> findConnection(int clientId) const;
+
+    SyncState getState() const;
+    RoomSnapshot getSnapshot() const;
+    std::size_t getClientCount() const;
+    std::vector<ClientConnection> getClientSnapshot() const;
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    SyncState getEstimatedStateLocked(Clock::time_point now) const;
+    void applyControlMessageLocked(const SyncMessage& message, Clock::time_point now);
+
+    // clients_、state_、lastStateUpdateTime_ 会被多个 client 线程同时访问，
+    // 所以所有读写都必须用 mutex_ 保护。
+    mutable std::mutex mutex_;
+    std::vector<ClientConnection> clients_;
+    SyncState state_;
+    std::string mediaIdentity_;
+    std::string sessionId_;
+    Clock::time_point sessionStartedAt_{};
+    Clock::time_point lastStateUpdateTime_ = Clock::now();
+    long long controlEpoch_ = 0;
+    int nextClientId_ = 1;
+};
+

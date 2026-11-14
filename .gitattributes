@@ -1,0 +1,10 @@
+# Keep source files stable when edited from both Windows and Linux/WSL.
+* text=auto eol=lf
+
+# Binary artifacts should never be line-ending normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
