@@ -468,12 +468,12 @@ namespace
     void testRoomMediaSessionLifecycle()
     {
         Room room;
-        const SocketHandle firstSocket = static_cast<SocketHandle>(101);
-        const SocketHandle secondSocket = static_cast<SocketHandle>(102);
+        const ConnectionId firstConnection = 101;
+        const ConnectionId secondConnection = 102;
         const std::string firstMedia = makeMediaIdentity("movie-a.mp4");
         const std::string secondMedia = makeMediaIdentity("movie-b.mp4");
 
-        RoomJoinResult firstJoin = room.joinClient(firstSocket, firstMedia);
+        RoomJoinResult firstJoin = room.joinClient(firstConnection, firstMedia);
         expect(firstJoin.accepted, "first client establishes the room media");
         expect(
             firstJoin.sessionStarted && !firstJoin.sessionId.empty(),
@@ -489,9 +489,7 @@ namespace
         seek.type = MessageType::Seek;
         seek.positionSeconds = 95;
         seek.positionMilliseconds = 95000;
-        // 这里使用的是测试用伪 socket，权威 CONTROL 回显会发送失败；
-        // Room 的状态更新和网络写入是两个独立结果，生命周期测试只验证前者。
-        room.broadcastControlMessage(seek);
+        room.applyControlMessage(seek);
         RoomSnapshot afterSeek = room.getSnapshot();
         expect(
             afterSeek.controlEpoch == 1 &&
@@ -500,7 +498,7 @@ namespace
         );
 
         RoomJoinResult mismatchedJoin = room.joinClient(
-            secondSocket,
+            secondConnection,
             secondMedia
         );
         expect(
@@ -514,7 +512,7 @@ namespace
         );
 
         RoomJoinResult matchingJoin = room.joinClient(
-            secondSocket,
+            secondConnection,
             firstMedia
         );
         expect(
@@ -524,14 +522,14 @@ namespace
             "Room accepts another client with the same media"
         );
 
-        RoomRemovalResult firstRemoval = room.removeClient(secondSocket);
+        RoomRemovalResult firstRemoval = room.removeClient(secondConnection);
         expect(
             firstRemoval.clientRemoved &&
                 !firstRemoval.sessionEnded &&
                 firstRemoval.remainingClients == 1,
             "removing one of two clients keeps the room session active"
         );
-        RoomRemovalResult finalRemoval = room.removeClient(firstSocket);
+        RoomRemovalResult finalRemoval = room.removeClient(firstConnection);
         expect(
             finalRemoval.clientRemoved &&
                 finalRemoval.sessionEnded &&
@@ -555,7 +553,7 @@ namespace
             "ended media session resets authoritative playback state"
         );
 
-        RoomJoinResult nextJoin = room.joinClient(firstSocket, secondMedia);
+        RoomJoinResult nextJoin = room.joinClient(firstConnection, secondMedia);
         RoomSnapshot nextSnapshot = room.getSnapshot();
         expect(
             nextJoin.accepted &&
@@ -569,7 +567,7 @@ namespace
                 nextSnapshot.state.positionMilliseconds == 0,
             "new media starts from Stopped at position zero"
         );
-        room.removeClient(firstSocket);
+        room.removeClient(firstConnection);
     }
 
     void testPlaybackControlClassification()
@@ -946,7 +944,7 @@ namespace
         firstFrame.durationMilliseconds = 1800;
         metrics.recordFirstFrame(firstFrame);
 
-        metrics.recordControlDispatched(MessageType::Play, 2, true);
+        metrics.recordControlDispatched(MessageType::Play, 2);
         ControlAckRecord controlResult;
         controlResult.matchStatus = ControlAckMatchStatus::Matched;
         controlResult.resultStatus = ControlResultStatus::Applied;
@@ -1109,7 +1107,7 @@ namespace
         seek.positionSeconds = 12;
         seek.positionMilliseconds = 12000;
         expect(
-            room.broadcastControlMessage(seek),
+            room.applyControlMessage(seek).has_value(),
             "Room accepts SEEK without connected clients"
         );
 
@@ -1123,7 +1121,7 @@ namespace
         SyncMessage play;
         play.type = MessageType::Play;
         expect(
-            room.broadcastControlMessage(play),
+            room.applyControlMessage(play).has_value(),
             "Room accepts PLAY without connected clients"
         );
 
@@ -1142,7 +1140,7 @@ namespace
         SyncMessage pause;
         pause.type = MessageType::Pause;
         expect(
-            room.broadcastControlMessage(pause),
+            room.applyControlMessage(pause).has_value(),
             "Room accepts PAUSE without connected clients"
         );
 
@@ -1160,7 +1158,7 @@ namespace
         forgedSnapshot.positionMilliseconds = 999000;
 
         expect(
-            !room.broadcastControlMessage(forgedSnapshot),
+            !room.applyControlMessage(forgedSnapshot),
             "Room refuses a forged SNAPSHOT as a control"
         );
         expect(
@@ -1431,6 +1429,38 @@ namespace
         );
     }
 
+    void testCorrectionCoordinatorWaitsForSocketWrite()
+    {
+        SyncCorrectionCoordinator coordinator;
+        const SyncCorrectionCoordinator::Clock::time_point queuedAt{};
+        const auto proposal = makeCorrectionProposal();
+        const auto command = coordinator.createCommand(proposal, queuedAt, true);
+        expect(command.has_value(), "a queued correction reserves a command ID");
+        if (!command)
+        {
+            return;
+        }
+
+        const auto sentAt = queuedAt + std::chrono::seconds(12);
+        const SyncMessage result = makeAppliedCorrectionResult(*command);
+        expect(
+            coordinator.recordResult(proposal.targetClientId, result, sentAt).matchStatus ==
+                CorrectionResultMatchStatus::UnknownCommand &&
+                coordinator.isPending(command->commandId),
+            "a queued correction cannot match an ACK and has no write-based timeout"
+        );
+        expect(coordinator.markDispatched(command->commandId, sentAt),
+            "writing the frame starts its acknowledgement timer");
+        const auto matched = coordinator.recordResult(
+            proposal.targetClientId, result, sentAt + std::chrono::milliseconds(20)
+        );
+        expect(
+            matched.matchStatus == CorrectionResultMatchStatus::Matched &&
+                matched.acknowledgementLatencyMs == 20,
+            "correction ACK latency starts when the frame was written"
+        );
+    }
+
     void testCorrectionCoordinatorInvalidatesOldEpochs()
     {
         SyncCorrectionCoordinator coordinator;
@@ -1551,6 +1581,7 @@ int main()
     testCorrectionPolicySafetyGates();
     testCorrectionPolicySelectsLaggingClient();
     testCorrectionCoordinatorLifecycle();
+    testCorrectionCoordinatorWaitsForSocketWrite();
     testCorrectionCoordinatorInvalidatesOldEpochs();
     testCorrectionExecutorSafetyAndApplication();
 

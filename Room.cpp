@@ -2,47 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
-#include <iostream>
 #include <string>
 
 #include "Telemetry.h"
 
-namespace
-{
-    bool sendAll(SocketHandle socket, const std::string& data)
-    {
-        int totalSent = 0;
-        const int totalSize = static_cast<int>(data.size());
-
-        while (totalSent < totalSize)
-        {
-            int bytesSent = sendSocket(
-                socket,
-                data.c_str() + totalSent,
-                totalSize - totalSent
-            );
-
-            if (bytesSent == kSocketError)
-            {
-                std::cout << "broadcast send failed: " << getSocketError() << "\n";
-                return false;
-            }
-
-            if (bytesSent == 0)
-            {
-                std::cout << "broadcast send failed: no bytes sent\n";
-                return false;
-            }
-
-            totalSent += bytesSent;
-        }
-
-        return true;
-    }
-}
-
 RoomJoinResult Room::joinClient(
-    SocketHandle clientSocket,
+    ConnectionId connectionId,
     const std::string& mediaIdentity)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -75,7 +40,7 @@ RoomJoinResult Room::joinClient(
 
     int clientId = nextClientId_;
     ++nextClientId_;
-    clients_.push_back(ClientConnection{ clientId, clientSocket });
+    clients_.push_back(ClientConnection{ clientId, connectionId });
 
     result.accepted = true;
     result.clientId = clientId;
@@ -84,7 +49,7 @@ RoomJoinResult Room::joinClient(
     return result;
 }
 
-RoomRemovalResult Room::removeClient(SocketHandle clientSocket)
+RoomRemovalResult Room::removeClient(ConnectionId connectionId)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -96,9 +61,9 @@ RoomRemovalResult Room::removeClient(SocketHandle clientSocket)
     auto newEnd = std::remove_if(
         clients_.begin(),
         clients_.end(),
-        [clientSocket](const ClientConnection& client)
+        [connectionId](const ClientConnection& client)
         {
-            return client.socket == clientSocket;
+            return client.connectionId == connectionId;
         }
     );
     clients_.erase(newEnd, clients_.end());
@@ -126,80 +91,33 @@ RoomRemovalResult Room::removeClient(SocketHandle clientSocket)
     return result;
 }
 
-bool Room::broadcastControlMessage(const SyncMessage& message)
+std::optional<SyncMessage> Room::applyControlMessage(const SyncMessage& message)
 {
     if (!isPlaybackControlMessage(message.type))
     {
-        std::cout << "broadcast refused: message is not a playback control\n";
-        return false;
+        return std::nullopt;
     }
 
-    std::vector<ClientConnection> targets;
-    SyncState stateSnapshot;
+    std::lock_guard<std::mutex> lock(mutex_);
+    applyControlMessageLocked(message, Clock::now());
     SyncMessage authoritativeMessage = message;
-
-    {
-        // 只在访问共享数据时持有锁。
-        // 真正 send 网络数据前先复制目标列表，再释放锁，避免一个慢 client 卡住整个房间。
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        Clock::time_point now = Clock::now();
-        applyControlMessageLocked(message, now);
-        ++controlEpoch_;
-        authoritativeMessage.controlEpoch = controlEpoch_;
-        stateSnapshot = getEstimatedStateLocked(now);
-        targets = clients_;
-    }
-
-    std::string tcpMessage = messageToString(authoritativeMessage);
-
-    std::cout << "room state: " << syncStateToString(stateSnapshot) << "\n";
-    std::cout << "broadcasting to " << targets.size() << " client(s): " << tcpMessage;
-
-    bool allSucceeded = true;
-    for (const ClientConnection& target : targets)
-    {
-        if (!sendRawMessage(target.socket, tcpMessage))
-        {
-            allSucceeded = false;
-        }
-    }
-
-    return allSucceeded;
+    authoritativeMessage.controlEpoch = ++controlEpoch_;
+    return authoritativeMessage;
 }
 
-bool Room::sendMessageToClient(SocketHandle clientSocket, const SyncMessage& message)
+std::optional<ConnectionId> Room::findConnection(int clientId) const
 {
-    std::string tcpMessage = messageToString(message);
-    if (tcpMessage == "UNKNOWN\n")
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto target = std::find_if(
+        clients_.begin(),
+        clients_.end(),
+        [clientId](const ClientConnection& client) { return client.id == clientId; }
+    );
+    if (target == clients_.end())
     {
-        return false;
+        return std::nullopt;
     }
-
-    return sendRawMessage(clientSocket, tcpMessage);
-}
-
-bool Room::sendMessageToClientId(int clientId, const SyncMessage& message)
-{
-    SocketHandle targetSocket = kInvalidSocket;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto target = std::find_if(
-            clients_.begin(),
-            clients_.end(),
-            [clientId](const ClientConnection& client)
-            {
-                return client.id == clientId;
-            }
-        );
-        if (target == clients_.end())
-        {
-            return false;
-        }
-        targetSocket = target->socket;
-    }
-
-    return sendMessageToClient(targetSocket, message);
+    return target->connectionId;
 }
 
 SyncState Room::getState() const
@@ -230,15 +148,6 @@ std::vector<ClientConnection> Room::getClientSnapshot() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return clients_;
-}
-
-bool Room::sendRawMessage(SocketHandle clientSocket, const std::string& tcpMessage)
-{
-    // server 侧有多个线程可能同时给同一个 client 发消息：
-    // 例如一个 client 发 PLAY 触发广播，同时 heartbeat 线程也在发 PING。
-    // TCP 是字节流，如果没有发送锁，"PLAY\n" 和 "PING 12\n" 可能在字节层交错。
-    std::lock_guard<std::mutex> lock(sendMutex_);
-    return sendAll(clientSocket, tcpMessage);
 }
 
 SyncState Room::getEstimatedStateLocked(Clock::time_point now) const

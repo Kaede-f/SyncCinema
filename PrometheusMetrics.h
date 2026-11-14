@@ -7,6 +7,7 @@
 
 #include "ExperienceMetrics.h"
 #include "Protocol.h"
+#include "ServerTransport.h"
 
 enum class JoinMetricReason
 {
@@ -27,6 +28,7 @@ public:
     void recordSessionStarted();
     void recordSessionEnded();
     void setConnectedClients(std::size_t count);
+    void setTransportStats(const ServerTransportStats& stats);
 
     void recordJoinResult(
         JoinMetricReason reason,
@@ -35,9 +37,9 @@ public:
     void recordFirstFrame(const FirstFrameRecord& record);
     void recordControlDispatched(
         MessageType command,
-        std::size_t targetClients,
-        bool broadcastSucceeded
+        std::size_t targetClients
     );
+    void recordControlBroadcastFailure();
     void recordControlResult(const ControlAckRecord& record);
     void recordPairSample(const ExperiencePairSample& sample);
     void recordCorrectionDispatched(bool sent);
@@ -68,6 +70,7 @@ private:
     unsigned long long connectedClients_ = 0;
     unsigned long long sessionsStarted_ = 0;
     unsigned long long sessionsEnded_ = 0;
+    ServerTransportStats transportStats_;
 
     std::array<unsigned long long,
         static_cast<std::size_t>(JoinMetricReason::Count)> joinsByReason_{};

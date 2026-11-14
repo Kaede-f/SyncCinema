@@ -11,7 +11,8 @@ namespace
 
 std::optional<SyncMessage> SyncCorrectionCoordinator::createCommand(
     const SyncCorrectionProposal& proposal,
-    Clock::time_point now)
+    Clock::time_point now,
+    bool awaitingWrite)
 {
     if (proposal.targetClientId <= 0 ||
         proposal.referenceClientId <= 0 ||
@@ -45,7 +46,9 @@ std::optional<SyncMessage> SyncCorrectionCoordinator::createCommand(
     }
 
     const long long commandId = nextCommandId_++;
-    pendingByCommandId_[commandId] = PendingCommand{ proposal, now };
+    pendingByCommandId_.emplace(commandId, PendingCommand{
+        proposal, awaitingWrite ? std::nullopt : std::optional{now}
+    });
 
     SyncMessage command;
     command.type = MessageType::Correction;
@@ -54,6 +57,26 @@ std::optional<SyncMessage> SyncCorrectionCoordinator::createCommand(
     command.playbackState = proposal.playbackState;
     command.correctionForwardMilliseconds = proposal.forwardMilliseconds;
     return command;
+}
+
+bool SyncCorrectionCoordinator::isPending(long long commandId) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pendingByCommandId_.contains(commandId);
+}
+
+bool SyncCorrectionCoordinator::markDispatched(
+    long long commandId,
+    Clock::time_point sentAt)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto pending = pendingByCommandId_.find(commandId);
+    if (pending == pendingByCommandId_.end() || pending->second.sentAt)
+    {
+        return false;
+    }
+    pending->second.sentAt = sentAt;
+    return true;
 }
 
 bool SyncCorrectionCoordinator::markDispatchFailed(long long commandId)
@@ -86,7 +109,7 @@ CorrectionResultRecord SyncCorrectionCoordinator::recordResult(
     pruneExpiredLocked(now);
 
     auto pendingIt = pendingByCommandId_.find(result.commandId);
-    if (pendingIt == pendingByCommandId_.end())
+    if (pendingIt == pendingByCommandId_.end() || !pendingIt->second.sentAt)
     {
         record.matchStatus = CorrectionResultMatchStatus::UnknownCommand;
         return record;
@@ -113,7 +136,7 @@ CorrectionResultRecord SyncCorrectionCoordinator::recordResult(
     record.matchStatus = CorrectionResultMatchStatus::Matched;
     long long acknowledgementLatencyMs = static_cast<long long>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - pendingIt->second.sentAt
+            now - *pendingIt->second.sentAt
         ).count()
     );
     record.acknowledgementLatencyMs = (std::max)(
@@ -170,7 +193,7 @@ void SyncCorrectionCoordinator::pruneExpiredLocked(Clock::time_point now)
     for (auto it = pendingByCommandId_.begin();
         it != pendingByCommandId_.end();)
     {
-        if (now - it->second.sentAt >= kPendingCommandTimeout)
+        if (it->second.sentAt && now - *it->second.sentAt >= kPendingCommandTimeout)
         {
             it = pendingByCommandId_.erase(it);
         }
