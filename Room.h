@@ -2,16 +2,17 @@
 
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include "NetSocket.h"
 #include "Protocol.h"
+#include "ServerTransport.h"
 
 struct ClientConnection
 {
     int id = 0;
-    SocketHandle socket = kInvalidSocket;
+    ConnectionId connectionId = 0;
 };
 
 // 房间快照把“当前播放状态”和“它属于哪个控制周期”放在一起返回。
@@ -56,18 +57,17 @@ class Room
 {
 public:
     RoomJoinResult joinClient(
-        SocketHandle clientSocket,
+        ConnectionId connectionId,
         const std::string& mediaIdentity
     );
-    // 返回移除结果和对应 session_id。调用方可以准确区分“未知 socket”与
+    // 返回移除结果和对应 session_id。调用方可以准确区分“未知连接”与
     // “最后一位观众离开”，避免重复产生 session_ended 事件。
-    RoomRemovalResult removeClient(SocketHandle clientSocket);
+    RoomRemovalResult removeClient(ConnectionId connectionId);
 
     // server 为控制命令分配 epoch 后回显给所有 client（包括发起者）。
     // 所有人都按同一条权威消息执行，才能维护完全一致的控制顺序。
-    bool broadcastControlMessage(const SyncMessage& message);
-    bool sendMessageToClient(SocketHandle clientSocket, const SyncMessage& message);
-    bool sendMessageToClientId(int clientId, const SyncMessage& message);
+    std::optional<SyncMessage> applyControlMessage(const SyncMessage& message);
+    std::optional<ConnectionId> findConnection(int clientId) const;
 
     SyncState getState() const;
     RoomSnapshot getSnapshot() const;
@@ -79,12 +79,10 @@ private:
 
     SyncState getEstimatedStateLocked(Clock::time_point now) const;
     void applyControlMessageLocked(const SyncMessage& message, Clock::time_point now);
-    bool sendRawMessage(SocketHandle clientSocket, const std::string& tcpMessage);
 
     // clients_、state_、lastStateUpdateTime_ 会被多个 client 线程同时访问，
     // 所以所有读写都必须用 mutex_ 保护。
     mutable std::mutex mutex_;
-    mutable std::mutex sendMutex_;
     std::vector<ClientConnection> clients_;
     SyncState state_;
     std::string mediaIdentity_;

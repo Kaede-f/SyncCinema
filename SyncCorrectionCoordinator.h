@@ -42,9 +42,12 @@ public:
 
     std::optional<SyncMessage> createCommand(
         const SyncCorrectionProposal& proposal,
-        Clock::time_point now = Clock::now()
+        Clock::time_point now = Clock::now(),
+        bool awaitingWrite = false
     );
 
+    bool isPending(long long commandId) const;
+    bool markDispatched(long long commandId, Clock::time_point sentAt);
     bool markDispatchFailed(long long commandId);
 
     CorrectionResultRecord recordResult(
@@ -61,7 +64,7 @@ private:
     struct PendingCommand
     {
         SyncCorrectionProposal proposal;
-        Clock::time_point sentAt{};
+        std::optional<Clock::time_point> sentAt;
     };
 
     void pruneExpiredLocked(Clock::time_point now);

@@ -2,13 +2,14 @@
 
 #include <iostream>
 #include <string>
-#include <thread>
+#include <string_view>
 #include <chrono>
-#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <limits>
+#include <system_error>
 #include <utility>
 
 #include "ExperienceMetrics.h"
@@ -26,11 +27,8 @@ namespace
 {
     constexpr unsigned short kServerPort = 9000;
     constexpr unsigned short kDefaultMetricsPort = 9100;
-    constexpr auto kHeartbeatInterval = std::chrono::milliseconds(1000);
-    constexpr auto kJoinTimeout = std::chrono::seconds(5);
-    constexpr std::size_t kMaxHandshakeBytes = 4096;
 
-    using Clock = std::chrono::steady_clock;
+    using Clock = ServerClock;
 
     unsigned short metricsPortFromEnvironment(std::string& warning)
     {
@@ -178,122 +176,53 @@ namespace
         return message;
     }
 
-    bool tryTakeProtocolLine(std::string& receiveBuffer, std::string& line)
+    struct ControlBroadcast
     {
-        std::size_t lineEnd = receiveBuffer.find('\n');
-        if (lineEnd == std::string::npos)
-        {
-            return false;
-        }
+        TelemetryEvent event;
+        std::size_t remaining;
+        bool succeeded = true;
+        bool ackTrackingStarted;
+    };
 
-        line = receiveBuffer.substr(0, lineEnd);
-        receiveBuffer.erase(0, lineEnd + 1);
-        if (!line.empty() && line.back() == '\r')
-        {
-            line.pop_back();
-        }
-        return true;
-    }
-
-    bool receiveJoinMessage(
-        SocketHandle clientSocket,
-        std::string& receiveBuffer,
-        SyncMessage& joinMessage)
+    class SyncServer final : public ServerEvents
     {
-        Clock::time_point deadline = Clock::now() + kJoinTimeout;
-        char buffer[512]{};
+    public:
+        SyncServer() : telemetry(&std::cout, TelemetryLogger::pathFromEnvironment()) {}
 
-        while (Clock::now() < deadline)
-        {
-            std::string line;
-            while (tryTakeProtocolLine(receiveBuffer, line))
-            {
-                if (line.empty())
-                {
-                    continue;
-                }
+        void started() override;
+        void receivedLine(ServerTransport&, ServerPeer&, const std::string&) override;
+        void joinTimedOut(ServerTransport&, ServerPeer&) override;
+        void disconnected(ServerPeer&, const char*, int) override;
+        void heartbeat(ServerTransport&) override;
+        void stopped() override;
+        void transportStats(const ServerTransportStats& stats) override;
 
-                SyncMessage message = stringToMessage(line);
-                if (message.type != MessageType::Join)
-                {
-                    return false;
-                }
+    private:
+        void join(ServerTransport&, ServerPeer&, const SyncMessage&);
+        void reject(ServerTransport&, ServerPeer&, const char*);
+        void recordJoin(ServerPeer&, JoinMetricReason, const char*,
+            const RoomJoinResult* = nullptr, const RoomSnapshot* = nullptr,
+            const std::string& requestedMedia = {});
+        void processLine(ServerTransport&, const ServerPeer&, const SyncMessage&);
 
-                joinMessage = std::move(message);
-                return true;
-            }
+        Room room;
+        SyncMetricsCollector metrics;
+        ExperienceMetricsCollector experienceMetrics;
+        PrometheusMetrics prometheus;
+        MetricsHttpServer metricsHttpServer{prometheus};
+        SyncCorrectionCoordinator correctionCoordinator;
+        TelemetryLogger telemetry;
+        std::size_t connectedClients = 0;
+        int nextPingSequence = 1;
+    };
 
-            fd_set readSet;
-            FD_ZERO(&readSet);
-            FD_SET(clientSocket, &readSet);
-
-            timeval timeout{};
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 100000;
-
-#ifdef _WIN32
-            int selectResult = select(0, &readSet, nullptr, nullptr, &timeout);
-#else
-            int selectResult = select(
-                clientSocket + 1,
-                &readSet,
-                nullptr,
-                nullptr,
-                &timeout
-            );
-#endif
-            if (selectResult == kSocketError)
-            {
-                return false;
-            }
-            if (selectResult == 0)
-            {
-                continue;
-            }
-
-            int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
-            if (bytesReceived <= 0)
-            {
-                return false;
-            }
-
-            receiveBuffer.append(
-                buffer,
-                static_cast<std::size_t>(bytesReceived)
-            );
-            if (receiveBuffer.size() > kMaxHandshakeBytes)
-            {
-                return false;
-            }
-        }
-
-        return false;
-    }
-
-    void processLine(
-        int clientId,
-        const std::string& sessionId,
-        Room& room,
-        SyncMetricsCollector& metrics,
-        ExperienceMetricsCollector& experienceMetrics,
-        PrometheusMetrics& prometheus,
-        SyncCorrectionCoordinator& correctionCoordinator,
-        std::mutex& controlCommandMutex,
-        TelemetryLogger& telemetry,
-        const std::string& line)
+    void SyncServer::processLine(
+        ServerTransport& transport,
+        const ServerPeer& peer,
+        const SyncMessage& message)
     {
-        if (line.empty())
-        {
-            return;
-        }
-
-        SyncMessage message = stringToMessage(line);
-        if (message.type == MessageType::Unknown)
-        {
-            std::cout << "server ignored unknown message: " << line << "\n";
-            return;
-        }
-
+        const int clientId = peer.clientId;
+        const std::string& sessionId = peer.sessionId;
         if (message.type == MessageType::Pong)
         {
             metrics.recordPongReceived(clientId, message.sequenceNumber, Clock::now());
@@ -336,7 +265,6 @@ namespace
 
         if (message.type == MessageType::ControlResult)
         {
-            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
             ControlAckRecord record = experienceMetrics.recordControlResult(
                 clientId,
                 message,
@@ -399,11 +327,6 @@ namespace
 
         if (message.type == MessageType::Report)
         {
-            // 控制命令会同时修改 Room 状态并开启新的 metrics epoch。
-            // REPORT 也使用同一把锁读取这两个对象，避免采到“新 Room + 旧 epoch”
-            // 或“旧 Room + 新 epoch”这种不一致快照。
-            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-
             RoomSnapshot roomSnapshot = room.getSnapshot();
             if (message.controlEpoch != roomSnapshot.controlEpoch)
             {
@@ -494,60 +417,60 @@ namespace
                 return;
             }
 
-            std::optional<SyncMessage> command =
-                correctionCoordinator.createCommand(*proposal);
-            if (!command.has_value())
+            const auto target = room.findConnection(proposal->targetClientId);
+            if (!target)
             {
-                std::lock_guard<std::mutex> logLock(metricLogMutex());
-                std::cout << "[metric] type=correction_command"
-                    << " status=create_failed"
-                    << " target_client=" << proposal->targetClientId
-                    << " epoch=" << proposal->controlEpoch
-                    << "\n";
+                return;
+            }
+            const auto command = correctionCoordinator.createCommand(
+                *proposal, Clock::now(), true
+            );
+            if (!command)
+            {
                 return;
             }
 
-            bool sent = room.sendMessageToClientId(
-                proposal->targetClientId,
-                *command
-            );
-            if (sent)
-            {
-                metrics.recordCorrectionDispatched(*proposal);
-                experienceMetrics.recordCorrectionDispatched(
-                    command->commandId,
-                    command->controlEpoch,
-                    proposal->targetClientId,
-                    proposal->referenceClientId,
-                    Clock::now()
-                );
-            }
-            else
-            {
-                correctionCoordinator.markDispatchFailed(command->commandId);
-            }
-            prometheus.recordCorrectionDispatched(sent);
-
-            {
-                std::lock_guard<std::mutex> logLock(metricLogMutex());
-                std::cout << "[metric] type=correction_command"
-                    << " command_id=" << command->commandId
-                    << " epoch=" << command->controlEpoch
-                    << " target_client=" << proposal->targetClientId
-                    << " reference_client=" << proposal->referenceClientId
-                    << " state=" << stateToString(proposal->playbackState)
-                    << " forward_ms=" << proposal->forwardMilliseconds
-                    << " median_abs_diff_ms=" << proposal->medianAbsDiffMs
-                    << " p95_abs_diff_ms=" << proposal->p95AbsDiffMs
-                    << " sent=" << (sent ? 1 : 0)
-                    << "\n";
-            }
+            const long long commandId = command->commandId;
+            transport.write(*target, {
+                std::make_shared<const std::string>(messageToString(*command)),
+                [this, commandId, proposal = *proposal](bool sent)
+                {
+                    const auto now = Clock::now();
+                    if (sent && correctionCoordinator.markDispatched(commandId, now))
+                    {
+                        metrics.recordCorrectionDispatched(proposal);
+                        experienceMetrics.recordCorrectionDispatched(
+                            commandId,
+                            proposal.controlEpoch,
+                            proposal.targetClientId,
+                            proposal.referenceClientId,
+                            now
+                        );
+                    }
+                    if (!sent)
+                    {
+                        correctionCoordinator.markDispatchFailed(commandId);
+                    }
+                    prometheus.recordCorrectionDispatched(sent);
+                    std::lock_guard<std::mutex> logLock(metricLogMutex());
+                    std::cout << "[metric] type=correction_command"
+                        << " command_id=" << commandId
+                        << " epoch=" << proposal.controlEpoch
+                        << " target_client=" << proposal.targetClientId
+                        << " reference_client=" << proposal.referenceClientId
+                        << " state=" << stateToString(proposal.playbackState)
+                        << " forward_ms=" << proposal.forwardMilliseconds
+                        << " median_abs_diff_ms=" << proposal.medianAbsDiffMs
+                        << " p95_abs_diff_ms=" << proposal.p95AbsDiffMs
+                        << " sent=" << (sent ? 1 : 0) << "\n";
+                },
+                [this, commandId] { return correctionCoordinator.isPending(commandId); }
+            });
             return;
         }
 
         if (message.type == MessageType::CorrectionResult)
         {
-            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
             CorrectionResultRecord result = correctionCoordinator.recordResult(
                 clientId,
                 message
@@ -611,24 +534,16 @@ namespace
         if (!isPlaybackControlMessage(message.type) ||
             message.controlEpoch != 0)
         {
-            std::cout << "server ignored invalid client control: " << line << "\n";
+            std::cout << "server ignored invalid client control\n";
             return;
         }
 
-        std::cout << "server received control: " << line << "\n";
-
-        // server 不再控制本地播放器。
-        // 新架构里 server 是“房间协调者”：更新房间状态，然后把控制命令广播给其他 client。
-        //
-        // 多个 client 可能同时发控制命令。这把锁保证 Room 应用顺序、广播顺序和
-        // metrics epoch 顺序完全一致，后续同步算法才有稳定的“先后”语义。
-        std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-        std::vector<ClientConnection> targets = room.getClientSnapshot();
-        const Clock::time_point broadcastStartedAt = Clock::now();
-        const bool broadcastSucceeded = room.broadcastControlMessage(message);
-        RoomSnapshot snapshot = room.getSnapshot();
-        metrics.beginControlEpoch(snapshot.controlEpoch, message);
-        correctionCoordinator.retainControlEpoch(snapshot.controlEpoch);
+        const auto authoritative = room.applyControlMessage(message);
+        const long long epoch = authoritative->controlEpoch;
+        const auto targets = room.getClientSnapshot();
+        const auto startedAt = Clock::now();
+        metrics.beginControlEpoch(epoch, message);
+        correctionCoordinator.retainControlEpoch(epoch);
 
         std::vector<int> targetClientIds;
         targetClientIds.reserve(targets.size());
@@ -636,550 +551,325 @@ namespace
         {
             targetClientIds.push_back(target.id);
         }
-        const bool ackTrackingStarted =
-            experienceMetrics.recordControlDispatched(
-                snapshot.controlEpoch,
-                message.type,
-                targetClientIds,
-                broadcastStartedAt
-            );
-        prometheus.recordControlDispatched(
-            message.type,
-            targetClientIds.size(),
-            broadcastSucceeded
+        const bool ackTrackingStarted = experienceMetrics.recordControlDispatched(
+            epoch, message.type, targetClientIds, startedAt
         );
+        // Count the authoritative command and its intended ACKs at commit.
+        // Count broadcast failures separately when all writes have resolved.
+        prometheus.recordControlDispatched(message.type, targets.size());
 
-        TelemetryEvent event;
-        event.name = "control_dispatched";
-        event.sessionId = sessionId;
-        event.clientId = clientId;
-        event.controlEpoch = snapshot.controlEpoch;
-        event
+        auto broadcast = std::make_shared<ControlBroadcast>();
+        broadcast->event.name = "control_dispatched";
+        broadcast->event.sessionId = sessionId;
+        broadcast->event.clientId = clientId;
+        broadcast->event.controlEpoch = epoch;
+        broadcast->event
             .addString("command", messageTypeToString(message.type))
-            .addInteger(
-                "target_clients",
-                static_cast<long long>(targetClientIds.size())
-            )
-            .addBoolean("broadcast_success", broadcastSucceeded)
-            .addBoolean("ack_tracking_started", ackTrackingStarted);
-        telemetry.emit(event);
+            .addInteger("target_clients", static_cast<long long>(targets.size()));
+        broadcast->remaining = targets.size();
+        broadcast->ackTrackingStarted = ackTrackingStarted;
+
+        const auto frame = std::make_shared<const std::string>(
+            messageToString(*authoritative)
+        );
+        for (const ClientConnection& target : targets)
+        {
+            transport.write(target.connectionId, {
+                frame,
+                [this, broadcast](bool sent)
+                {
+                    broadcast->succeeded &= sent;
+                    if (--broadcast->remaining != 0)
+                    {
+                        return;
+                    }
+                    if (!broadcast->succeeded)
+                    {
+                        prometheus.recordControlBroadcastFailure();
+                    }
+                    broadcast->event
+                        .addBoolean("broadcast_success", broadcast->succeeded)
+                        .addBoolean("ack_tracking_started", broadcast->ackTrackingStarted);
+                    telemetry.emit(broadcast->event);
+                },
+                {}
+            });
+        }
     }
 
-    void handleClient(
-        SocketHandle clientSocket,
-        int clientId,
-        std::string sessionId,
-        Room& room,
-        SyncMetricsCollector& metrics,
-        ExperienceMetricsCollector& experienceMetrics,
-        PrometheusMetrics& prometheus,
-        SyncCorrectionCoordinator& correctionCoordinator,
-        std::mutex& controlCommandMutex,
-        TelemetryLogger& telemetry,
-        std::string receiveBuffer)
+    void SyncServer::recordJoin(
+        ServerPeer& peer,
+        JoinMetricReason result,
+        const char* reason,
+        const RoomJoinResult* joinResult,
+        const RoomSnapshot* snapshot,
+        const std::string& requestedMedia)
     {
-        char buffer[512]{};
-        const Clock::time_point connectedAt = Clock::now();
-        std::string disconnectReason = "peer_closed";
-        int disconnectError = 0;
-
-        while (true)
+        peer.joinResultRecorded = true;
+        const long long duration = elapsedMilliseconds(peer.acceptedAt);
+        const bool success = result == JoinMetricReason::Ok;
+        TelemetryEvent event;
+        event.name = "join_result";
+        event.sessionId = joinResult ? joinResult->sessionId : peer.sessionId;
+        event.clientId = peer.clientId;
+        event.addBoolean("success", success)
+            .addString("reason", reason)
+            .addInteger("duration_ms", duration);
+        if (snapshot && success)
         {
-            std::string line;
-            while (tryTakeProtocolLine(receiveBuffer, line))
-            {
-                processLine(
-                    clientId,
-                    sessionId,
-                    room,
-                    metrics,
-                    experienceMetrics,
-                    prometheus,
-                    correctionCoordinator,
-                    controlCommandMutex,
-                    telemetry,
-                    line
-                );
-            }
+            event.controlEpoch = snapshot->controlEpoch;
+            event.addString("media_id", snapshot->mediaIdentity)
+                .addInteger("online_clients", static_cast<long long>(connectedClients));
+        }
+        if (result == JoinMetricReason::MediaMismatch)
+        {
+            event.addString("requested_media_id", requestedMedia)
+                .addString("active_media_id", joinResult->activeMediaIdentity);
+        }
+        telemetry.emit(event);
+        prometheus.recordJoinResult(result, duration);
+    }
 
-            int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+    void SyncServer::reject(
+        ServerTransport& transport, ServerPeer& peer, const char* reason)
+    {
+        SyncMessage message;
+        message.type = MessageType::JoinRejected;
+        message.rejectionReason = reason;
+        transport.write(peer.connectionId, {
+            std::make_shared<const std::string>(messageToString(message)), {}, {}
+        });
+        transport.closeAfterWrites(peer.connectionId);
+    }
 
-            if (bytesReceived > 0)
-            {
-                receiveBuffer.append(buffer, bytesReceived);
+    void SyncServer::joinTimedOut(ServerTransport& transport, ServerPeer& peer)
+    {
+        recordJoin(peer, JoinMetricReason::JoinRequired, "JOIN_REQUIRED");
+        reject(transport, peer, "JOIN_REQUIRED");
+    }
 
-                // TCP 是字节流，没有天然消息边界。下一轮会继续按行拆分，
-                // JOIN 与后续消息即使在一次 recv 中到达也不会丢失。
-            }
-            else if (bytesReceived == 0)
-            {
-                std::cout << "client disconnected\n";
-                break;
-            }
-            else
-            {
-                disconnectError = getSocketError();
-                disconnectReason = "recv_error";
-                std::cout << "recv failed: " << disconnectError << "\n";
-                break;
-            }
+    void SyncServer::join(
+        ServerTransport& transport, ServerPeer& peer, const SyncMessage& message)
+    {
+        const auto result = room.joinClient(peer.connectionId, message.mediaIdentity);
+        if (!result.accepted)
+        {
+            recordJoin(peer, JoinMetricReason::MediaMismatch, "MEDIA_MISMATCH",
+                &result, nullptr, message.mediaIdentity);
+            reject(transport, peer, "MEDIA_MISMATCH");
+            return;
         }
 
-        RoomRemovalResult removal;
+        peer.clientId = result.clientId;
+        peer.sessionId = result.sessionId;
+        if (result.sessionStarted)
+        {
+            experienceMetrics.beginSession(result.sessionId);
+            prometheus.recordSessionStarted();
+            TelemetryEvent event;
+            event.name = "session_started";
+            event.sessionId = result.sessionId;
+            event.addString("media_id", result.activeMediaIdentity);
+            telemetry.emit(event);
+        }
+
+        // Membership and queueing the snapshot are one serialized operation.
+        const RoomSnapshot snapshot = room.getSnapshot();
+        transport.write(peer.connectionId, {
+            std::make_shared<const std::string>(messageToString(makeSnapshotMessage(snapshot))),
+            [this, &peer, snapshot](bool sent)
+            {
+                if (sent)
+                {
+                    peer.snapshotWritten = true;
+                    experienceMetrics.recordClientJoined(
+                        peer.clientId, snapshot.state.state == PlaybackState::Playing
+                    );
+                    prometheus.setConnectedClients(++connectedClients);
+                    recordJoin(peer, JoinMetricReason::Ok, "OK", nullptr, &snapshot);
+                }
+                else
+                {
+                    recordJoin(peer, JoinMetricReason::SnapshotSendFailed, "SNAPSHOT_SEND_FAILED");
+                }
+            },
+            {}
+        });
+    }
+
+    void SyncServer::receivedLine(
+        ServerTransport& transport, ServerPeer& peer, const std::string& line)
+    {
+        if (line.empty())
+        {
+            return;
+        }
+        const SyncMessage message = stringToMessage(line);
+        if (peer.clientId != 0)
+        {
+            processLine(transport, peer, message);
+        }
+        else if (message.type == MessageType::Join)
+        {
+            join(transport, peer, message);
+        }
+        else
+        {
+            joinTimedOut(transport, peer);
+        }
+    }
+
+    void SyncServer::disconnected(ServerPeer& peer, const char* reason, int error)
+    {
+        if (peer.clientId == 0)
+        {
+            if (!peer.joinResultRecorded && std::string_view(reason) != "server_shutdown")
+            {
+                recordJoin(peer, JoinMetricReason::JoinRequired, "JOIN_REQUIRED");
+            }
+            return;
+        }
+
+        const auto removal = room.removeClient(peer.connectionId);
         std::optional<ExperienceSessionSummary> sessionSummary;
+        if (removal.sessionEnded)
         {
-            // client 移除与 server 主动发送校正共用顺序锁，避免通过旧 id
-            // 找到一个正被关闭、甚至已被系统复用的 socket。
-            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-            removal = room.removeClient(clientSocket);
-            if (removal.sessionEnded)
-            {
-                sessionSummary = experienceMetrics.endSession(Clock::now());
-                metrics.resetSession();
-            }
-            else
-            {
-                experienceMetrics.removeClient(clientId);
-                metrics.removeClient(clientId);
-            }
-            correctionCoordinator.removeClient(clientId);
+            sessionSummary = experienceMetrics.endSession(Clock::now());
+            metrics.resetSession();
         }
-        closeSocket(clientSocket);
-        prometheus.setConnectedClients(removal.remainingClients);
-        if (sessionSummary.has_value())
+        else
+        {
+            experienceMetrics.removeClient(peer.clientId);
+            metrics.removeClient(peer.clientId);
+        }
+        correctionCoordinator.removeClient(peer.clientId);
+        if (peer.snapshotWritten)
+        {
+            prometheus.setConnectedClients(--connectedClients);
+        }
+        if (sessionSummary)
         {
             prometheus.recordSessionSummary(*sessionSummary);
             prometheus.recordSessionEnded();
         }
-
-        TelemetryEvent disconnected;
-        disconnected.name = "client_disconnected";
-        disconnected.sessionId = std::move(sessionId);
-        disconnected.clientId = clientId;
-        disconnected
-            .addString("reason", disconnectReason)
-            .addInteger("socket_error", disconnectError)
-            .addInteger(
-                "connection_duration_ms",
-                elapsedMilliseconds(connectedAt)
-            )
-            .addInteger(
-                "remaining_clients",
-                static_cast<long long>(removal.remainingClients)
-            );
-        telemetry.emit(disconnected);
-        if (sessionSummary.has_value())
+        TelemetryEvent event;
+        event.name = "client_disconnected";
+        event.sessionId = peer.sessionId;
+        event.clientId = peer.clientId;
+        event.addString("reason", reason)
+            .addInteger("socket_error", error)
+            .addInteger("connection_duration_ms", elapsedMilliseconds(peer.acceptedAt))
+            .addInteger("remaining_clients", static_cast<long long>(removal.remainingClients));
+        telemetry.emit(event);
+        if (sessionSummary)
         {
             emitSessionSummary(telemetry, *sessionSummary);
         }
         emitSessionEnded(telemetry, removal);
-
-        std::cout << "client removed. online clients: "
-            << removal.remainingClients << "\n";
     }
 
-    void handleClientConnection(
-        SocketHandle clientSocket,
-        Room& room,
-        SyncMetricsCollector& metrics,
-        ExperienceMetricsCollector& experienceMetrics,
-        PrometheusMetrics& prometheus,
-        SyncCorrectionCoordinator& correctionCoordinator,
-        std::mutex& controlCommandMutex,
-        TelemetryLogger& telemetry)
+    void SyncServer::heartbeat(ServerTransport& transport)
     {
-        const Clock::time_point joinStartedAt = Clock::now();
-        std::string receiveBuffer;
-        SyncMessage joinMessage;
-        if (!receiveJoinMessage(clientSocket, receiveBuffer, joinMessage))
+        const auto clients = room.getClientSnapshot();
+        if (clients.empty())
         {
-            SyncMessage rejection;
-            rejection.type = MessageType::JoinRejected;
-            rejection.rejectionReason = "JOIN_REQUIRED";
-            room.sendMessageToClient(clientSocket, rejection);
-            closeSocket(clientSocket);
-            std::cout << "client rejected: valid JOIN was not received\n";
-
-            const long long joinDurationMs =
-                elapsedMilliseconds(joinStartedAt);
-            TelemetryEvent rejected;
-            rejected.name = "join_result";
-            rejected
-                .addBoolean("success", false)
-                .addString("reason", "JOIN_REQUIRED")
-                .addInteger(
-                    "duration_ms",
-                    joinDurationMs
-                );
-            telemetry.emit(rejected);
-            prometheus.recordJoinResult(
-                JoinMetricReason::JoinRequired,
-                joinDurationMs
-            );
             return;
         }
-
-        RoomJoinResult joinResult;
-        RoomSnapshot initialSnapshot;
-        bool snapshotSent = false;
-
+        const int sequence = nextPingSequence;
+        nextPingSequence = sequence == (std::numeric_limits<int>::max)() ? 1 : sequence + 1;
+        SyncMessage ping;
+        ping.type = MessageType::Ping;
+        ping.sequenceNumber = sequence;
+        const auto frame = std::make_shared<const std::string>(messageToString(ping));
+        for (const auto& client : clients)
         {
-            // 加入列表、读取快照和发送快照与控制命令串行化，避免新 client
-            // 在完成握手前漏掉一条播放控制。
-            std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-            joinResult = room.joinClient(
-                clientSocket,
-                joinMessage.mediaIdentity
-            );
-
-            if (joinResult.sessionStarted)
-            {
-                experienceMetrics.beginSession(joinResult.sessionId);
-                prometheus.recordSessionStarted();
-            }
-
-            if (joinResult.accepted)
-            {
-                initialSnapshot = room.getSnapshot();
-                snapshotSent = room.sendMessageToClient(
-                    clientSocket,
-                    makeSnapshotMessage(initialSnapshot)
-                );
-                if (snapshotSent)
+            transport.write(client.connectionId, {
+                frame,
+                [this, id = client.id, sequence](bool sent)
                 {
-                    experienceMetrics.recordClientJoined(
-                        joinResult.clientId,
-                        initialSnapshot.state.state == PlaybackState::Playing
-                    );
-                }
-            }
-        }
-
-        if (joinResult.sessionStarted)
-        {
-            TelemetryEvent started;
-            started.name = "session_started";
-            started.sessionId = joinResult.sessionId;
-            started.addString("media_id", joinResult.activeMediaIdentity);
-            telemetry.emit(started);
-        }
-
-        if (!joinResult.accepted)
-        {
-            SyncMessage rejection;
-            rejection.type = MessageType::JoinRejected;
-            rejection.rejectionReason = "MEDIA_MISMATCH";
-            room.sendMessageToClient(clientSocket, rejection);
-            closeSocket(clientSocket);
-            std::cout << "client rejected: room media does not match\n";
-
-            const long long joinDurationMs =
-                elapsedMilliseconds(joinStartedAt);
-            TelemetryEvent rejected;
-            rejected.name = "join_result";
-            rejected.sessionId = joinResult.sessionId;
-            rejected
-                .addBoolean("success", false)
-                .addString("reason", "MEDIA_MISMATCH")
-                .addString("requested_media_id", joinMessage.mediaIdentity)
-                .addString(
-                    "active_media_id",
-                    joinResult.activeMediaIdentity
-                )
-                .addInteger(
-                    "duration_ms",
-                    joinDurationMs
-                );
-            telemetry.emit(rejected);
-            prometheus.recordJoinResult(
-                JoinMetricReason::MediaMismatch,
-                joinDurationMs
-            );
-            return;
-        }
-
-        if (!snapshotSent)
-        {
-            std::cout << "initial snapshot send failed for client #"
-                << joinResult.clientId << "\n";
-            RoomRemovalResult removal;
-            std::optional<ExperienceSessionSummary> sessionSummary;
-            {
-                std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-                removal = room.removeClient(clientSocket);
-                if (removal.sessionEnded)
-                {
-                    sessionSummary = experienceMetrics.endSession(
-                        Clock::now()
-                    );
-                    metrics.resetSession();
-                }
-                else
-                {
-                    experienceMetrics.removeClient(joinResult.clientId);
-                    metrics.removeClient(joinResult.clientId);
-                }
-                correctionCoordinator.removeClient(joinResult.clientId);
-            }
-            closeSocket(clientSocket);
-            prometheus.setConnectedClients(removal.remainingClients);
-
-            const long long joinDurationMs =
-                elapsedMilliseconds(joinStartedAt);
-            TelemetryEvent rejected;
-            rejected.name = "join_result";
-            rejected.sessionId = joinResult.sessionId;
-            rejected.clientId = joinResult.clientId;
-            rejected
-                .addBoolean("success", false)
-                .addString("reason", "SNAPSHOT_SEND_FAILED")
-                .addInteger(
-                    "duration_ms",
-                    joinDurationMs
-                );
-            telemetry.emit(rejected);
-            prometheus.recordJoinResult(
-                JoinMetricReason::SnapshotSendFailed,
-                joinDurationMs
-            );
-            if (sessionSummary.has_value())
-            {
-                prometheus.recordSessionSummary(*sessionSummary);
-                prometheus.recordSessionEnded();
-                emitSessionSummary(telemetry, *sessionSummary);
-            }
-            emitSessionEnded(telemetry, removal);
-            return;
-        }
-
-        const long long joinDurationMs = elapsedMilliseconds(joinStartedAt);
-        TelemetryEvent joined;
-        joined.name = "join_result";
-        joined.sessionId = joinResult.sessionId;
-        joined.clientId = joinResult.clientId;
-        joined.controlEpoch = initialSnapshot.controlEpoch;
-        joined
-            .addBoolean("success", true)
-            .addString("reason", "OK")
-            .addString("media_id", joinResult.activeMediaIdentity)
-            .addInteger(
-                "duration_ms",
-                joinDurationMs
-            )
-            .addInteger(
-                "online_clients",
-                static_cast<long long>(room.getClientCount())
-            );
-        telemetry.emit(joined);
-        prometheus.recordJoinResult(JoinMetricReason::Ok, joinDurationMs);
-        prometheus.setConnectedClients(room.getClientCount());
-
-        std::cout << "client #" << joinResult.clientId
-            << " joined media=" << joinResult.activeMediaIdentity
-            << ". online clients: " << room.getClientCount() << "\n";
-        std::cout << "initial snapshot sent: epoch="
-            << initialSnapshot.controlEpoch << ", "
-            << syncStateToString(initialSnapshot.state) << "\n";
-
-        handleClient(
-            clientSocket,
-            joinResult.clientId,
-            joinResult.sessionId,
-            room,
-            metrics,
-            experienceMetrics,
-            prometheus,
-            correctionCoordinator,
-            controlCommandMutex,
-            telemetry,
-            std::move(receiveBuffer)
-        );
-    }
-
-    void heartbeatLoop(
-        Room& room,
-        SyncMetricsCollector& metrics,
-        std::mutex& controlCommandMutex,
-        std::atomic_bool& running)
-    {
-        int nextSeq = 1;
-
-        while (running)
-        {
-            {
-                // 与 JOIN/断开/校正发送串行化，避免旧 socket 在关闭并被
-                // 操作系统复用后，心跳误发给一条新连接。
-                std::lock_guard<std::mutex> controlLock(controlCommandMutex);
-                std::vector<ClientConnection> clients = room.getClientSnapshot();
-                if (!clients.empty())
-                {
-                    SyncMessage ping;
-                    ping.type = MessageType::Ping;
-                    ping.sequenceNumber = nextSeq++;
-
-                    for (const ClientConnection& client : clients)
+                    if (sent)
                     {
-                        // 先登记 pending，再发送 PING。即使 client 很快回 PONG，
-                        // server 也一定能找到对应的发送时间。
-                        Clock::time_point sentAt = Clock::now();
-                        metrics.recordPingSent(
-                            client.id,
-                            ping.sequenceNumber,
-                            sentAt
-                        );
-
-                        if (!room.sendMessageToClient(client.socket, ping))
-                        {
-                            std::cout << "heartbeat send failed for client #"
-                                << client.id << "\n";
-                        }
+                        metrics.recordPingSent(id, sequence, Clock::now());
                     }
-                }
-            }
-
-            std::this_thread::sleep_for(kHeartbeatInterval);
+                },
+                {}
+            });
         }
+    }
+
+    void SyncServer::started()
+    {
+        std::string metricsPortWarning;
+        const unsigned short requestedMetricsPort =
+            metricsPortFromEnvironment(metricsPortWarning);
+        if (!metricsPortWarning.empty())
+        {
+            std::cerr << metricsPortWarning << "\n";
+        }
+        std::string metricsError;
+        const bool metricsEndpointEnabled = metricsHttpServer.start(
+            requestedMetricsPort,
+            metricsError
+        );
+        prometheus.setServerUp(true);
+
+        std::cout << "SyncServer listening on port " << kServerPort << "...\n";
+        std::cout << "Server role: accept clients and broadcast playback commands.\n";
+        std::cout << "Press Ctrl+C to stop the server.\n";
+        if (metricsEndpointEnabled)
+        {
+            std::cout << "Metrics endpoint: http://127.0.0.1:"
+                << metricsHttpServer.port() << "/metrics\n";
+        }
+        else
+        {
+            std::cerr << "metrics endpoint disabled: " << metricsError << "\n";
+        }
+        if (!telemetry.initializationError().empty())
+        {
+            std::cerr << "telemetry file disabled: "
+                << telemetry.initializationError() << "\n";
+        }
+
+        TelemetryEvent started;
+        started.name = "server_started";
+        started
+            .addInteger("listen_port", kServerPort)
+            .addBoolean("jsonl_file_enabled", telemetry.fileEnabled())
+            .addBoolean("metrics_endpoint_enabled", metricsEndpointEnabled)
+            .addInteger(
+                "metrics_port",
+                metricsEndpointEnabled ? metricsHttpServer.port() : 0
+            );
+        telemetry.emit(started);
+    }
+
+    void SyncServer::transportStats(const ServerTransportStats& stats)
+    {
+        prometheus.setTransportStats(stats);
+    }
+
+    void SyncServer::stopped()
+    {
+        prometheus.setServerUp(false);
+        metricsHttpServer.stop();
     }
 }
 
 void runSyncServer()
 {
-    if (!initializeSockets()) return;
-
-    SocketHandle listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSocket == kInvalidSocket)
+    if (!initializeSockets())
     {
-        std::cout << "socket failed: " << getSocketError() << "\n";
-        cleanupSockets();
         return;
     }
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(kServerPort);
-
-    int result = bind(
-        listenSocket,
-        reinterpret_cast<sockaddr*>(&serverAddr),
-        sizeof(serverAddr)
-    );
-
-    if (result == kSocketError)
+    SyncServer server;
+    try
     {
-        std::cout << "bind failed: " << getSocketError() << "\n";
-        closeSocket(listenSocket);
-        cleanupSockets();
-        return;
+        runServerTransport(kServerPort, server);
     }
-
-    result = listen(listenSocket, SOMAXCONN);
-    if (result == kSocketError)
+    catch (const std::system_error& error)
     {
-        std::cout << "listen failed: " << getSocketError() << "\n";
-        closeSocket(listenSocket);
-        cleanupSockets();
-        return;
+        std::cerr << "SyncServer: " << error.what() << "\n";
     }
-
-    Room room;
-    SyncMetricsCollector metrics;
-    ExperienceMetricsCollector experienceMetrics;
-    PrometheusMetrics prometheus;
-    MetricsHttpServer metricsHttpServer(prometheus);
-    SyncCorrectionCoordinator correctionCoordinator;
-    const std::string telemetryPath = TelemetryLogger::pathFromEnvironment();
-    TelemetryLogger telemetry(&std::cout, telemetryPath);
-    std::mutex controlCommandMutex;
-    std::atomic_bool serverRunning{ true };
-
-    std::string metricsPortWarning;
-    const unsigned short requestedMetricsPort =
-        metricsPortFromEnvironment(metricsPortWarning);
-    if (!metricsPortWarning.empty())
-    {
-        std::cerr << metricsPortWarning << "\n";
-    }
-    std::string metricsError;
-    const bool metricsEndpointEnabled = metricsHttpServer.start(
-        requestedMetricsPort,
-        metricsError
-    );
-    prometheus.setServerUp(true);
-
-    std::cout << "SyncServer listening on port " << kServerPort << "...\n";
-    std::cout << "Server role: accept clients and broadcast playback commands.\n";
-    std::cout << "Press Ctrl+C to stop the server.\n";
-    if (metricsEndpointEnabled)
-    {
-        std::cout << "Metrics endpoint: http://127.0.0.1:"
-            << metricsHttpServer.port() << "/metrics\n";
-    }
-    else
-    {
-        std::cerr << "metrics endpoint disabled: " << metricsError << "\n";
-    }
-    if (!telemetry.initializationError().empty())
-    {
-        std::cerr << "telemetry file disabled: "
-            << telemetry.initializationError() << "\n";
-    }
-
-    TelemetryEvent started;
-    started.name = "server_started";
-    started
-        .addInteger("listen_port", kServerPort)
-        .addBoolean("jsonl_file_enabled", telemetry.fileEnabled())
-        .addBoolean("metrics_endpoint_enabled", metricsEndpointEnabled)
-        .addInteger(
-            "metrics_port",
-            metricsEndpointEnabled ? metricsHttpServer.port() : 0
-        );
-    telemetry.emit(started);
-
-    std::thread heartbeatThread(
-        heartbeatLoop,
-        std::ref(room),
-        std::ref(metrics),
-        std::ref(controlCommandMutex),
-        std::ref(serverRunning)
-    );
-
-    while (true)
-    {
-        std::cout << "Waiting for client...\n";
-
-        SocketHandle clientSocket = accept(listenSocket, nullptr, nullptr);
-        if (clientSocket == kInvalidSocket)
-        {
-            std::cout << "accept failed: " << getSocketError() << "\n";
-            break;
-        }
-
-        // 每个连接先在自己的线程中完成 JOIN 握手，慢连接不会阻塞 accept。
-        std::thread clientThread(
-            handleClientConnection,
-            clientSocket,
-            std::ref(room),
-            std::ref(metrics),
-            std::ref(experienceMetrics),
-            std::ref(prometheus),
-            std::ref(correctionCoordinator),
-            std::ref(controlCommandMutex),
-            std::ref(telemetry)
-        );
-        clientThread.detach();
-    }
-
-    serverRunning = false;
-    if (heartbeatThread.joinable())
-    {
-        heartbeatThread.join();
-    }
-
-    prometheus.setServerUp(false);
-    closeSocket(listenSocket);
-    metricsHttpServer.stop();
     cleanupSockets();
 }
-

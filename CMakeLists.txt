@@ -11,6 +11,8 @@ endif()
 
 project ("SyncCinema")
 
+find_package(Threads REQUIRED)
+
 option(USE_LIBVLC "Use libVLC as the real local video player" OFF)
 option(BUILD_QT_CLIENT "Build the Qt Widgets desktop client" OFF)
 
@@ -102,9 +104,13 @@ add_executable(SyncCinemaServer
   "SyncCorrectionCoordinator.cpp"
   "SyncServer.h"
   "SyncServer.cpp"
+  "ServerTransport.h"
+  "ServerReactor.cpp"
   "NetSocket.h"
   "NetSocket.cpp"
 )
+
+target_link_libraries(SyncCinemaServer PRIVATE Threads::Threads)
 
 if (WIN32)
   target_link_libraries(SyncCinemaServer PRIVATE ws2_32)
@@ -144,6 +150,8 @@ if (WIN32)
     "SyncCorrectionCoordinator.cpp"
     "SyncServer.h"
     "SyncServer.cpp"
+    "ServerTransport.h"
+    "ServerReactor.cpp"
     "NetSocket.h"
     "NetSocket.cpp"
     "Client.h"
@@ -157,7 +165,7 @@ if (WIN32)
   )
 
   # Link Windows socket library.
-  target_link_libraries(SyncCinema PRIVATE ws2_32)
+  target_link_libraries(SyncCinema PRIVATE ws2_32 Threads::Threads)
 endif()
 
 if (USE_LIBVLC AND TARGET SyncCinema)
@@ -296,10 +304,7 @@ endif()
 include(CTest)
 
 if (BUILD_TESTING)
-  find_package(Threads REQUIRED)
-
-  # 核心协议/房间测试不依赖 libVLC，也不创建真实网络连接。
-  # 因此 Windows 和 Linux 都能快速运行，用来锁住跨平台协议行为。
+  # 核心测试不依赖 libVLC，可在 Windows 和 Linux 验证共享协议与指标行为。
   add_executable(SyncCinemaCoreTests
     "tests/SyncCinemaCoreTests.cpp"
     "Protocol.h"
@@ -351,6 +356,23 @@ if (BUILD_TESTING)
   endif()
 
   add_test(NAME SyncCinemaCoreTests COMMAND SyncCinemaCoreTests)
+
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if (CMAKE_VERSION VERSION_LESS 3.12)
+      find_package(PythonInterp 3.8 QUIET)
+      set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}")
+      set(Python3_Interpreter_FOUND "${PYTHONINTERP_FOUND}")
+    else()
+      find_package(Python3 3.8 QUIET COMPONENTS Interpreter)
+    endif()
+    if (Python3_Interpreter_FOUND)
+      add_test(NAME SyncCinemaReactorTests
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/server_reactor_test.py"
+          --server "$<TARGET_FILE:SyncCinemaServer>"
+      )
+      set_tests_properties(SyncCinemaReactorTests PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+    endif()
+  endif()
 
   if (WIN32 AND USE_LIBVLC)
     add_executable(SyncCinemaPlayerEventTests

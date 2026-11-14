@@ -184,8 +184,7 @@ void PrometheusMetrics::recordFirstFrame(const FirstFrameRecord& record)
 
 void PrometheusMetrics::recordControlDispatched(
     MessageType command,
-    std::size_t targetClients,
-    bool broadcastSucceeded)
+    std::size_t targetClients)
 {
     if (!isPlaybackControlMessage(command))
     {
@@ -195,10 +194,12 @@ void PrometheusMetrics::recordControlDispatched(
     std::lock_guard<std::mutex> lock(mutex_);
     ++controlsByCommand_[commandIndex(command)];
     controlExpectedAcks_ += static_cast<unsigned long long>(targetClients);
-    if (!broadcastSucceeded)
-    {
-        ++controlBroadcastFailures_;
-    }
+}
+
+void PrometheusMetrics::recordControlBroadcastFailure()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++controlBroadcastFailures_;
 }
 
 void PrometheusMetrics::recordControlResult(const ControlAckRecord& record)
@@ -297,6 +298,12 @@ void PrometheusMetrics::recordSessionSummary(
     );
 }
 
+void PrometheusMetrics::setTransportStats(const ServerTransportStats& stats)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    transportStats_ = stats;
+}
+
 std::string PrometheusMetrics::render() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -325,6 +332,23 @@ std::string PrometheusMetrics::render() const
         "Current clients that completed the JOIN handshake."
     );
     output << "synccinema_connected_clients " << connectedClients_ << '\n';
+
+    writeTypeAndHelp(output, "synccinema_transport_queued_bytes", "gauge",
+        "Unwritten playback data in user-space queues at the last heartbeat.");
+    output << "synccinema_transport_queued_bytes " << transportStats_.queuedBytes << '\n';
+    writeTypeAndHelp(output, "synccinema_transport_peak_queued_bytes", "gauge",
+        "Process high-water mark of unwritten playback data in user-space queues.");
+    output << "synccinema_transport_peak_queued_bytes " << transportStats_.peakQueuedBytes << '\n';
+    writeTypeAndHelp(output, "synccinema_transport_queue_limit_disconnects_total", "counter",
+        "Playback connections closed after exceeding the output queue limit.");
+    output << "synccinema_transport_queue_limit_disconnects_total "
+        << transportStats_.queueLimitDisconnects << '\n';
+    writeTypeAndHelp(output, "synccinema_transport_send_would_block_total", "counter",
+        "Nonblocking playback sends that could not currently make progress.");
+    output << "synccinema_transport_send_would_block_total " << transportStats_.sendWouldBlock << '\n';
+    writeTypeAndHelp(output, "synccinema_transport_partial_sends_total", "counter",
+        "Playback sends that wrote only part of the requested bytes.");
+    output << "synccinema_transport_partial_sends_total " << transportStats_.partialSends << '\n';
 
     writeTypeAndHelp(
         output,

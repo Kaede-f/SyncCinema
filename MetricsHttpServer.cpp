@@ -5,14 +5,23 @@
 #include <chrono>
 #include <sstream>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <poll.h>
+#endif
+
 namespace
 {
     constexpr std::size_t kMaxRequestBytes = 4096;
+    constexpr auto kRequestDeadline = std::chrono::seconds(2);
+    constexpr auto kSocketTimeout = std::chrono::milliseconds(250);
+    using Clock = std::chrono::steady_clock;
 
-    bool sendComplete(SocketHandle socket, const std::string& payload)
+    bool sendComplete(SocketHandle socket, const std::string& payload, const std::atomic_bool& running)
     {
         std::size_t sentTotal = 0;
-        while (sentTotal < payload.size())
+        const auto deadline = Clock::now() + kRequestDeadline;
+        while (sentTotal < payload.size() && running && Clock::now() < deadline)
         {
             const std::size_t remaining = payload.size() - sentTotal;
             const int chunkSize = static_cast<int>((std::min)(
@@ -30,7 +39,7 @@ namespace
             }
             sentTotal += static_cast<std::size_t>(sent);
         }
-        return true;
+        return sentTotal == payload.size();
     }
 
     std::string makeResponse(
@@ -48,27 +57,38 @@ namespace
         return response.str();
     }
 
-    void setReceiveTimeout(SocketHandle socket)
+    bool setSocketTimeouts(SocketHandle socket)
     {
 #ifdef _WIN32
-        DWORD timeoutMilliseconds = 2000;
-        setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            reinterpret_cast<const char*>(&timeoutMilliseconds),
-            sizeof(timeoutMilliseconds)
-        );
+        const auto value = static_cast<DWORD>(kSocketTimeout.count());
+        const auto* timeout = reinterpret_cast<const char*>(&value);
 #else
-        timeval timeout{};
-        timeout.tv_sec = 2;
-        setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &timeout,
-            sizeof(timeout)
-        );
+        const timeval value{0, kSocketTimeout.count() * 1000};
+        const auto* timeout = &value;
+#endif
+        return setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, timeout, sizeof(value)) == 0 &&
+            setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, timeout, sizeof(value)) == 0;
+    }
+
+    int waitForConnection(SocketHandle socket)
+    {
+#ifdef _WIN32
+        WSAPOLLFD fd{socket, POLLRDNORM, 0};
+        return WSAPoll(&fd, 1, static_cast<int>(kSocketTimeout.count()));
+#else
+        pollfd fd{socket, POLLIN, 0};
+        return poll(&fd, 1, static_cast<int>(kSocketTimeout.count()));
+#endif
+    }
+
+    bool setListenerNonblocking(SocketHandle socket)
+    {
+#ifdef _WIN32
+        u_long enabled = 1;
+        return ioctlsocket(socket, FIONBIO, &enabled) == 0;
+#else
+        const int flags = fcntl(socket, F_GETFL);
+        return flags != -1 && fcntl(socket, F_SETFL, flags | O_NONBLOCK) == 0;
 #endif
     }
 }
@@ -98,6 +118,13 @@ bool MetricsHttpServer::start(
     {
         errorMessage = "metrics socket failed: " +
             std::to_string(getSocketError());
+        return false;
+    }
+    if (!setListenerNonblocking(candidate))
+    {
+        errorMessage = "metrics nonblocking listener failed: " +
+            std::to_string(getSocketError());
+        closeSocket(candidate);
         return false;
     }
 
@@ -176,21 +203,15 @@ bool MetricsHttpServer::start(
 void MetricsHttpServer::stop()
 {
     running_ = false;
-    const SocketHandle socketToClose = listenSocket_;
-    if (socketToClose != kInvalidSocket)
-    {
-#ifdef _WIN32
-        shutdown(socketToClose, SD_BOTH);
-#else
-        shutdown(socketToClose, SHUT_RDWR);
-#endif
-        closeSocket(socketToClose);
-    }
+    // The worker owns all listener operations until it has stopped using the fd.
     if (thread_.joinable())
     {
         thread_.join();
     }
-    // worker 退出前保持句柄数值不变，避免 stop 与 serveLoop 并发读写。
+    if (listenSocket_ != kInvalidSocket)
+    {
+        closeSocket(listenSocket_);
+    }
     listenSocket_ = kInvalidSocket;
     port_ = 0;
 }
@@ -209,24 +230,7 @@ void MetricsHttpServer::serveLoop()
 {
     while (running_)
     {
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        FD_SET(listenSocket_, &readSet);
-
-        timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 500000;
-#ifdef _WIN32
-        const int selected = select(0, &readSet, nullptr, nullptr, &timeout);
-#else
-        const int selected = select(
-            listenSocket_ + 1,
-            &readSet,
-            nullptr,
-            nullptr,
-            &timeout
-        );
-#endif
+        const int selected = waitForConnection(listenSocket_);
         if (!running_)
         {
             break;
@@ -248,16 +252,27 @@ void MetricsHttpServer::serveLoop()
 
 void MetricsHttpServer::handleClient(SocketHandle clientSocket)
 {
-    setReceiveTimeout(clientSocket);
+#ifdef _WIN32
+    // accept inherits the listener's nonblocking mode on Winsock.
+    u_long nonblocking = 0;
+    if (ioctlsocket(clientSocket, FIONBIO, &nonblocking) != 0)
+    {
+        return;
+    }
+#endif
+    if (!setSocketTimeouts(clientSocket))
+    {
+        return;
+    }
+    const auto deadline = Clock::now() + kRequestDeadline;
     std::string request;
     std::array<char, 1024> buffer{};
-    while (request.size() < kMaxRequestBytes &&
-        request.find("\r\n\r\n") == std::string::npos)
+    while (running_ && Clock::now() < deadline && request.size() < kMaxRequestBytes)
     {
         const int received = recv(
             clientSocket,
             buffer.data(),
-            static_cast<int>(buffer.size()),
+            static_cast<int>((std::min)(buffer.size(), kMaxRequestBytes - request.size())),
             0
         );
         if (received <= 0)
@@ -265,6 +280,14 @@ void MetricsHttpServer::handleClient(SocketHandle clientSocket)
             return;
         }
         request.append(buffer.data(), static_cast<std::size_t>(received));
+        if (request.find("\r\n\r\n") != std::string::npos)
+        {
+            break;
+        }
+    }
+    if (!running_ || request.find("\r\n\r\n") == std::string::npos)
+    {
+        return;
     }
 
     const std::size_t lineEnd = request.find("\r\n");
@@ -277,7 +300,8 @@ void MetricsHttpServer::handleClient(SocketHandle clientSocket)
                 "200 OK",
                 "text/plain; version=0.0.4; charset=utf-8",
                 metrics_.render()
-            )
+            ),
+            running_
         );
         return;
     }
@@ -285,13 +309,15 @@ void MetricsHttpServer::handleClient(SocketHandle clientSocket)
     {
         sendComplete(
             clientSocket,
-            makeResponse("200 OK", "text/plain; charset=utf-8", "ok\n")
+            makeResponse("200 OK", "text/plain; charset=utf-8", "ok\n"),
+            running_
         );
         return;
     }
 
     sendComplete(
         clientSocket,
-        makeResponse("404 Not Found", "text/plain; charset=utf-8", "not found\n")
+        makeResponse("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
+        running_
     );
 }
