@@ -17,8 +17,10 @@
 #include <vector>
 
 #ifdef __linux__
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/signalfd.h>
 #elif defined(_WIN32)
 #include <windows.h>
@@ -229,6 +231,20 @@ namespace
         return Socket(accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
     }
 
+    void reserveDescriptorTable(SocketHandle listener)
+    {
+        rlimit limits{};
+        if (getrlimit(RLIMIT_NOFILE, &limits) != 0 || limits.rlim_cur == 0)
+        {
+            return;
+        }
+
+        // Include the listener, reactor, metrics and log descriptors alongside
+        // playback connections. Linux keeps the larger table after the dup closes.
+        constexpr rlim_t target = kMaxConnections + 16;
+        const auto slot = static_cast<int>((std::min)(target, limits.rlim_cur - 1));
+        const Socket reservation(fcntl(listener, F_DUPFD_CLOEXEC, slot));
+    }
 #else
     static_assert(std::atomic_bool::is_always_lock_free);
     std::atomic_bool stopRequested{false};
@@ -459,6 +475,11 @@ namespace
             : events_(events), listener_(openListener(port))
         {
             readiness_.add(listener_.get(), kListener, Read);
+#ifdef __linux__
+            // Grow the fd table before started() launches the metrics thread.
+            // Once it is shared, Linux can wait for RCU during accept4 growth.
+            reserveDescriptorTable(listener_.get());
+#endif
         }
 
         void run()

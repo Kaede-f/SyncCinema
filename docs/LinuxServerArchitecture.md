@@ -191,6 +191,52 @@ ctest --test-dir out/build/reactor-windows-qt --output-on-failure
 原始结果保存在 `out/build/reactor-benchmark-final.json` 和 `out/build/reactor-hold-120s.json`。驻留复现可将对照参数换为 `--connections 1000 --idle-seconds 120`，省略慢端参数。
 
 
+## 批量 JOIN 长尾专项分析
+
+原报告的旧版 2.110 ms、新版 25.594 ms 来自同一份 `reactor-benchmark-final.json`。两版每批 32 个连接，TCP connect 完成后开始计时，随后发送 JOIN，读完并验证 SNAPSHOT 再停止。P95 用成功样本的最近秩法，1,000 个连接全部成功。该计时含客户端 asyncio 调度、逐字节读取和验证，也可能覆盖 TCP 已连通、应用尚未 accept 的时间。它与服务端从 accept 后开始记录的 JOIN 指标使用不同的起点。原始 JSON 没有逐连接时间戳和服务端分段。
+
+使用同一 WSL 回环环境和原负载重跑，在临时 Release 副本中按客户端源端口关联 Python `perf_counter_ns` 和 C++ `steady_clock`，各阶段单独计算 P95。一次带分段数据的 1,000 连接实验如下。
+
+| 阶段 | P95 |
+| --- | ---: |
+| accept4 调用 | 6 μs |
+| accept 返回后到 epoll 注册和设定截止时间 | 5 μs |
+| 客户端发完 JOIN 到服务端开始 recv | 30.414 ms |
+| recv、分帧、协议解析 | 分别约 1、<1、1 μs |
+| Room 登记、快照状态读取、状态编码 | 分别 <1、<1、约 1 μs |
+| SNAPSHOT 加入 FIFO 并刷新写兴趣 | 1 μs |
+| SNAPSHOT 入队到开始写 | 0.252 ms |
+| 开始写到整帧交给内核 | 5 μs |
+| 整帧写完后的 JOIN 完成回调及日志 | 10 μs |
+
+分位数针对各阶段独立统计。该轮端到端 JOIN P95 为 32.092 ms。改为客户端整块读后，Reactor 三轮中位 JOIN P50 从 1.594 ms 降到 0.513 ms，而三轮 P95 仍为 21.911–26.796 ms。每次只连一个的带探针实验中，旧版和 Reactor P95 分别为 0.192 和 0.138 ms。启用内存文件 JSONL 的实验仍出现同类读前延迟，正常控制台和日志格式化从微秒级写入完成回调可见。这个结果不评估慢磁盘或阻塞 stdout。
+
+### 触发条件与处理
+
+- 冷启动追踪连续三轮在 fd 64、128、256、512 处发现慢 `accept4`。12 次成功调用的 wall time 为 17.72–31.48 ms，线程实际 CPU 时间约 20–43 μs。`/proc/<pid>/status` 的 `FDSize` 从 64 增到 1024。受影响的批次中，已注册连接也停在 recv 之前。调用次数经常只有 2 次就出现长延迟。
+- 内核源码给出了与观察一致的机制。共享 fd 表扩容时，Linux 在替换表前调用 `synchronize_rcu()`。旧版有专用 accept 线程，扩容期间已有连接线程还可以处理 JOIN。Reactor 的监听和播放读写共用一个线程，内核等待会延迟整个就绪批次。本实验通过阈值和预扩容 A/B 验证了 fd 表扩容归因，未直接采集 RCU 内核栈。[WSL 6.6 内核 fd 表实现](https://raw.githubusercontent.com/microsoft/WSL2-Linux-Kernel/linux-msft-wsl-6.6.y/fs/file.c)
+- 临时把 accept 事件预算从 64 降为 16、8 或 1，依然出现同样的扩容等待。快照立即尝试写消除了约 0.25 ms 的写等待，却保留了 20–26 ms 的 JOIN P95。调整 CPU 亲和性也没有消除长尾。
+- Linux 启动监听时，在 metrics 线程启动前用一次 `F_DUPFD_CLOEXEC` 触发 fd 表扩容，然后立刻关闭临时描述符。目标容量根据服务端连接上限加基础设施余量计算，并限制在 `RLIMIT_NOFILE` 软上限内。这一步失败时继续正常启动，现有 accept 预算、房间顺序和收发队列保持原有配置。常规压测看到 8192 个 fd 表槽位、7 个已打开 fd。软上限为 128 的验证中，槽位为 128、临时 fd 未留存，JOIN 正常。
+
+诊断脚本与逐连接 JSON 在本地 `out/build/join-study`。后续对照脚本也采集 `FDSize`，区分表容量与实际打开的 fd。
+
+### 未插桩 Release 复验
+
+两种 Reactor 二进制用原压测客户端、同一隔离回环环境跑了五组成对实验，交替启动顺序。每次冷启动连满 1,000 个客户端，等 2 秒后发送 160 条控制，逐连接验证回显顺序，再检查 ACK。表中数值为五次同类统计量的中位数，方括号给出五轮范围。
+
+| 指标 | 原 Reactor | fd 表预扩容 |
+| --- | ---: | ---: |
+| JOIN P50（ms） | 1.350 | 1.340 |
+| JOIN P95（ms） | 23.709 [17.154–40.813] | 1.729 [1.583–1.845] |
+| JOIN P99（ms） | 25.582 | 1.919 |
+| 控制回显 P99（ms） | 63.307 [49.967–70.494] | 58.303 [50.659–69.949] |
+| 控制回显（条/秒） | 84,435 [76,471–86,990] | 84,080 [82,271–86,115] |
+| 每轮匹配的控制 ACK | 160,000 | 160,000 |
+
+控制吞吐的中位数相差 0.42%，两组测量范围重叠，未观察到系统性的回退。另一次用最早的每连接线程基线复验，1,000 连接 JOIN P95 从 2.768 ms 到 1.523 ms。默认限制下，预扩容后的 Linux fd 表较大，实际打开 fd 仍为 7，断开全部连接后仍回到该数值。Release 和 ASan/UBSan/泄漏检测的 C++ 与 TCP 集成目标均通过。
+
+原始数据见 `out/build/join-study/ab-1.json` 至 `ab-5.json` 和 `legacy-final.json`。复跑时将保留的 `SyncCinemaServer-before` 与当前 Release 二进制传给上面的压测器，限定 `--connections 1000 --idle-seconds 2`，交替交换两个二进制的位置。控制阶段从批量 JOIN 完成后开始，结果涵盖冷启动批量接入和后续控制性能。持续混合接入与控制、原生 Linux 和生产日志负载的尾延迟仍待测量。
+
 ## 待验证与技术债
 
 - Release 的 Socket 压测未自然观测到短写和 EAGAIN。本地另外用临时 `LD_PRELOAD` 夹具让播放端口每七次 send 返回一次 EAGAIN，其余发送请求最多写半帧。确认 16 次短写、3 次 EAGAIN 后仍按序收到完整快照和三条控制。该夹具下的 TCP 半关闭及并发重连用例也通过，夹具保存在本机 `out/build`，常规 CTest 不依赖它。

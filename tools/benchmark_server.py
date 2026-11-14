@@ -39,6 +39,7 @@ def resources(pid):
     return {
         "threads": int(status["Threads"]),
         "rss_kib": int(status["VmRSS"].split()[0]),
+        "fd_table_slots": int(status["FDSize"]),
         "fds": len(list((proc / "fd").iterdir())),
         "cpu_ticks": int(stat[11]) + int(stat[12]),
     }
